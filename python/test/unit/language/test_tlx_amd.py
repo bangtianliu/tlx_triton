@@ -7,6 +7,7 @@ an explicit GPUTarget and verify the generated TTGIR/AMDGCN. No AMD hardware is
 required for the compilation checks. Correctness checks (actual execution) run
 only when the corresponding hardware is available.
 """
+import dataclasses
 import importlib.util
 import re
 import sys
@@ -72,6 +73,343 @@ def compile_for_target(fn, signature, constexprs, target):
 def compile_for_gfx950(fn, signature, constexprs):
     """Compile a TLX kernel for gfx950 and return the compiled object."""
     return compile_for_target(fn, signature, constexprs, GFX950)
+
+
+@pytest.mark.parametrize(
+    ("q_shape", "k_shape", "causal", "dispatch_kwargs", "message"),
+    [
+        pytest.param(
+            (1, 1, 256, 128),
+            (1, 1, 256, 128),
+            False,
+            {
+                "family": "noncausal_direct_n256",
+                "owner_rows": 32,
+                "key_rows": 256,
+                "kv_splits": 1,
+            },
+            "unsupported D64 dispatch shapes",
+            id="shape",
+        ),
+        pytest.param(
+            (1, 1, 4096, 64),
+            (1, 1, 4096, 64),
+            True,
+            {
+                "family": "noncausal_direct_n256",
+                "owner_rows": 32,
+                "key_rows": 256,
+                "kv_splits": 1,
+            },
+            "requires noncausal attention",
+            id="causal-family",
+        ),
+        pytest.param(
+            (1, 8, 4096, 64),
+            (1, 1, 4096, 64),
+            True,
+            {
+                "family": "causal_gluon_gqa8",
+                "owner_rows": 192,
+                "key_rows": 128,
+                "kv_splits": 1,
+                "selected_causal": True,
+                "stat_mode": 1,
+                "dq_logical_n": 32,
+            },
+            "kv_splits",
+            id="gqa-splits",
+        ),
+        pytest.param(
+            (1, 1, 4096, 64),
+            (1, 1, 4096, 64),
+            True,
+            {
+                "family": "causal_gluon_mha",
+                "owner_rows": 192,
+                "key_rows": 64,
+                "kv_splits": 1,
+                "selected_causal": True,
+                "stat_mode": 1,
+                "dq_logical_n": 32,
+            },
+            "stat_mode",
+            id="mha-stat-mode",
+        ),
+        pytest.param(
+            (1, 1, 4096, 64),
+            (1, 1, 4096, 64),
+            False,
+            {
+                "family": "unknown",
+                "owner_rows": 32,
+                "key_rows": 256,
+                "kv_splits": 1,
+            },
+            "unknown D64 dispatch family",
+            id="unknown-family",
+        ),
+    ],
+)
+def test_d64_dispatch_validation_rejects_invalid_contracts(q_shape, k_shape, causal, dispatch_kwargs, message):
+    from triton.language.extra.tlx.tutorials import amd_fa_bwd
+
+    assert hasattr(amd_fa_bwd,
+                   "_validate_d64_dispatch"), ("D64 dispatch validation must not depend on removable Python asserts")
+    dispatch = amd_fa_bwd._D64Dispatch(**dispatch_kwargs)
+
+    with pytest.raises(ValueError, match=message):
+        amd_fa_bwd._validate_d64_dispatch(q_shape, k_shape, causal, dispatch)
+
+
+def test_d64_dispatch_validation_rejects_incomplete_dq_launch_plan():
+    from triton.language.extra.tlx.tutorials import amd_fa_bwd
+
+    q_shape = (4, 48, 4096, 64)
+    k_shape = (4, 6, 4096, 64)
+    dispatch = amd_fa_bwd._select_d64_dispatch(
+        q_shape,
+        k_shape,
+        True,
+        arch="gfx950:sramecc+:xnack-",
+        cu_count=256,
+        sm_scale=0.125,
+        bases_aligned_16=True,
+    )
+    malformed = dataclasses.replace(
+        dispatch,
+        dq_launches=(amd_fa_bwd._D64DQLaunch(1, False, 0, 0, 3, 0), ),
+    )
+
+    with pytest.raises(ValueError, match="dq_launches must match"):
+        amd_fa_bwd._validate_d64_dispatch(q_shape, k_shape, True, malformed)
+
+
+@pytest.mark.parametrize(
+    ("q_shape", "k_shape", "changes", "message"),
+    [
+        pytest.param(
+            (1, 25, 4096, 64),
+            (1, 25, 4096, 64),
+            {"dq_use_xcd": True},
+            "dq_use_xcd",
+            id="dq-xcd",
+        ),
+        pytest.param(
+            (4, 40, 4096, 64),
+            (4, 5, 4096, 64),
+            {"gqa_grid_mode": "xcd"},
+            "GQA XCD grid requires",
+            id="gqa-xcd-grid",
+        ),
+        pytest.param(
+            (4, 48, 1024, 64),
+            (4, 6, 2048, 64),
+            {"dkdv_lifetime": "independent_d32"},
+            "dkdv_lifetime",
+            id="gqa-lifetime",
+        ),
+        pytest.param(
+            (4, 48, 4096, 64),
+            (4, 6, 4096, 64),
+            {"cyclic_query_split": True},
+            "cyclic_query_split",
+            id="gqa-cyclic",
+        ),
+    ],
+)
+def test_d64_dispatch_validation_rejects_incompatible_selected_modes(q_shape, k_shape, changes, message):
+    from triton.language.extra.tlx.tutorials import amd_fa_bwd
+
+    dispatch = amd_fa_bwd._select_d64_dispatch(
+        q_shape,
+        k_shape,
+        True,
+        arch="gfx950:sramecc+:xnack-",
+        cu_count=256,
+        sm_scale=0.125,
+        bases_aligned_16=True,
+    )
+    assert dispatch.selected_causal
+    malformed = dataclasses.replace(dispatch, **changes)
+
+    with pytest.raises(ValueError, match=message):
+        amd_fa_bwd._validate_d64_dispatch(q_shape, k_shape, True, malformed)
+
+
+@pytest.mark.parametrize(
+    ("q_shape", "k_shape", "causal", "family"),
+    [
+        pytest.param(
+            (2, 32, 16384, 64),
+            (2, 32, 16384, 64),
+            False,
+            "noncausal_fused_n256",
+            id="t01",
+        ),
+        pytest.param(
+            (2, 32, 16384, 64),
+            (2, 32, 16384, 64),
+            True,
+            "causal_gluon_mha",
+            id="t02",
+        ),
+        pytest.param(
+            (2, 32, 16384, 64),
+            (2, 4, 16384, 64),
+            False,
+            "noncausal_fused_n256",
+            id="t03",
+        ),
+        pytest.param(
+            (2, 32, 16384, 64),
+            (2, 4, 16384, 64),
+            True,
+            "causal_gluon_gqa8",
+            id="t04",
+        ),
+        pytest.param(
+            (4, 48, 4096, 64),
+            (4, 6, 4096, 64),
+            True,
+            "causal_gluon_gqa8",
+            id="t05",
+        ),
+        pytest.param(
+            (4, 48, 4096, 64),
+            (4, 6, 16384, 64),
+            True,
+            "causal_gluon_gqa8",
+            id="t06",
+        ),
+        pytest.param(
+            (4, 48, 4096, 64),
+            (4, 6, 8192, 64),
+            True,
+            "causal_gluon_gqa8",
+            id="t07",
+        ),
+        pytest.param(
+            (4, 48, 4096, 64),
+            (4, 6, 12288, 64),
+            True,
+            "causal_gluon_gqa8",
+            id="t08",
+        ),
+    ],
+)
+def test_d64_ticket_dispatch_contract_is_ci_discovered(q_shape, k_shape, causal, family):
+    from triton.language.extra.tlx.tutorials import amd_fa_bwd
+
+    dispatch = amd_fa_bwd._select_d64_dispatch(
+        q_shape,
+        k_shape,
+        causal,
+        arch="gfx950:sramecc+:xnack-",
+        cu_count=256,
+        sm_scale=0.125,
+        bases_aligned_16=True,
+    )
+
+    assert dispatch.family == family
+    assert dispatch.selected_causal is causal
+    amd_fa_bwd._validate_d64_dispatch(q_shape, k_shape, causal, dispatch)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(
+    ("shape", "causal", "family", "kernel_names"),
+    [
+        pytest.param(
+            (1, 16, 16, 4096, 4096, 64),
+            False,
+            "noncausal_fused_n256",
+            (
+                "_attn_bwd_d64_fused_n256_kernel",
+                "_attn_bwd_d64_fused_dq_convert_kernel",
+            ),
+            id="noncausal-mha",
+        ),
+        pytest.param(
+            (1, 16, 2, 4096, 4096, 64),
+            False,
+            "noncausal_fused_n256",
+            (
+                "_attn_bwd_d64_fused_n256_kernel",
+                "_attn_bwd_d64_fused_dq_convert_kernel",
+                "_attn_bwd_dkdv_d64_reduce_kernel",
+            ),
+            id="noncausal-gqa8",
+        ),
+        pytest.param(
+            (1, 24, 24, 4096, 4096, 64),
+            True,
+            "causal_gluon_mha",
+            (
+                "_attn_bwd_dq_d64_causal_mha_kernel",
+                "_attn_bwd_dkdv_d64_causal_mha_kernel",
+            ),
+            id="causal-mha",
+        ),
+        pytest.param(
+            (4, 48, 6, 1024, 1024, 64),
+            True,
+            "causal_gluon_gqa8",
+            (
+                "_attn_bwd_dq_d64_causal_gqa8_kernel",
+                "_attn_bwd_dkdv_d64_causal_gqa8_kernel",
+                "_attn_bwd_dkdv_d64_causal_gqa8_reduce_kernel",
+            ),
+            id="causal-gqa8",
+        ),
+        pytest.param(
+            (4, 48, 6, 1024, 2048, 64),
+            True,
+            "causal_gluon_gqa8",
+            (
+                "_attn_bwd_dq_d64_causal_gqa8_kernel",
+                "_attn_bwd_dkdv_d64_causal_gqa8_kernel",
+                "_attn_bwd_dkdv_d64_causal_gqa8_reduce_kernel",
+            ),
+            id="causal-gqa8-rectangular",
+        ),
+    ],
+)
+def test_d64_selected_routes_correct_and_scratch_free_gfx950(shape, causal, family, kernel_names):
+    from triton.language.extra.tlx.tutorials import amd_fa_bwd
+
+    case = amd_fa_bwd._make_d64_aten_case(shape, seed=311, causal=causal)
+    properties = torch.cuda.get_device_properties(case.q.device)
+    dispatch = amd_fa_bwd._select_d64_dispatch(
+        tuple(case.q.shape),
+        tuple(case.k.shape),
+        causal,
+        arch=properties.gcnArchName,
+        cu_count=properties.multi_processor_count,
+        sm_scale=case.sm_scale,
+        bases_aligned_16=True,
+    )
+    assert dispatch.family == family
+
+    kernels = [getattr(amd_fa_bwd, name) for name in kernel_names]
+    for kernel in kernels:
+        kernel.device_caches.clear()
+
+    actual = amd_fa_bwd.fa_backward(*case.kernel_args)
+    for name, result, expected in zip(("dq", "dk", "dv"), actual, case.grads, strict=True):
+        assert torch.isfinite(result).all(), name
+        relative_l2 = torch.linalg.vector_norm(result.float() - expected.float()) / torch.linalg.vector_norm(
+            expected.float())
+        assert relative_l2.item() < 5e-3, (name, relative_l2.item())
+
+    device = torch.cuda.current_device()
+    for kernel_name, kernel in zip(kernel_names, kernels, strict=True):
+        objects = tuple(kernel.device_caches[device][0].values())
+        assert objects, kernel_name
+        for index, obj in enumerate(objects):
+            amd_fa_bwd._assert_d64_code_object_scratch_free(f"{kernel_name}[{index}]", obj)
+            if causal:
+                assert not re.search(r"\b\w*atomic\w*\b", obj.asm["amdgcn"]), kernel_name
 
 
 @triton.jit

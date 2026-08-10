@@ -1,11 +1,14 @@
 """BF16 Flash-Attention backward kernel families for AMD gfx950.
 
-The public ``fa_backward`` wrapper supports the two validated equal-head
-configurations in ``SUPPORTED_SHAPES`` and the non-causal HipKittens GQA
-contract: positive B/Hq/Hkv, Hkv dividing Hq, N a positive multiple of 256,
-and D=128. ``GQA_BENCHMARK_SHAPES`` records the published performance series;
-it is not an allow-list. Other configurations are not part of this
-submission's public contract yet. Run this file with pytest for correctness.
+The public ``fa_backward`` wrapper supports dense contiguous BF16 D64 tensors
+with matching positive batches, Hkv dividing Hq, SQ/SKV at least 256 and
+aligned to 64, and bottom-right causal SQ no larger than SKV. It also supports
+the two validated equal-head configurations in ``SUPPORTED_SHAPES`` and the
+non-causal HipKittens GQA contract: positive B/Hq/Hkv, Hkv dividing Hq, N a
+positive multiple of 256, and D=128. ``GQA_BENCHMARK_SHAPES`` records the
+published performance series; it is not an allow-list. Other configurations
+are not part of this submission's public contract yet. Run this file with
+pytest for correctness.
 
 Each launch topology has one stable JIT entry.  Constexpr schedule kwargs pick
 the tuned split, persistent, staged, peeled, or hoisted implementation behind
@@ -20,8 +23,11 @@ experiments selected by ``TLX_FA_BWD_ENABLE_PERSISTENT_D128=1`` (combined) or
 not production dispatches and currently spill on the generic TLX lowering.
 """
 
+import ast
 import dataclasses
+import math
 import os
+import re
 
 import pytest
 import torch
@@ -47,8 +53,20 @@ GQA_BENCHMARK_SHAPES = {
     (16, 64, 8, 8192, 128),
     (15, 64, 8, 16384, 128),
 }
+D64_BENCHMARK_SHAPES = {
+    "t01": (2, 16384, 16384, 32, 32, 64, False),
+    "t02": (2, 16384, 16384, 32, 32, 64, True),
+    "t03": (2, 16384, 16384, 32, 4, 64, False),
+    "t04": (2, 16384, 16384, 32, 4, 64, True),
+    "t05": (4, 4096, 4096, 48, 6, 64, True),
+    "t06": (4, 4096, 16384, 48, 6, 64, True),
+    "t07": (4, 4096, 8192, 48, 6, 64, True),
+    "t08": (4, 4096, 12288, 48, 6, 64, True),
+}
 _GQA_SHAPE_CONSTRAINT = ("B >= 1, Hq >= 1, Hkv >= 1, Hq % Hkv == 0, "
                          "N >= 256, N % 256 == 0, and D == 128")
+_D64_SHAPE_CONSTRAINT = ("D64 shapes require matching positive batches, positive Hq/Hkv, "
+                         "Hq % Hkv == 0, SQ/SKV >= 256, SQ/SKV multiples of 64, and D == 64")
 
 
 def _is_supported_gqa_shape(shape):
@@ -58,6 +76,549 @@ def _is_supported_gqa_shape(shape):
     batch, hq, hk, n_ctx, head_dim = shape
     return (batch >= 1 and hq >= 1 and hk >= 1 and hq % hk == 0 and n_ctx >= 256 and n_ctx % 256 == 0
             and head_dim == 128)
+
+
+def _is_supported_d64_shape(q_shape, k_shape):
+    """Return whether dense BF16 D64 tensors match the gfx950 contract."""
+    if len(q_shape) != 4 or len(k_shape) != 4:
+        return False
+    batch, hq, sq, d = q_shape
+    k_batch, hkv, skv, k_d = k_shape
+    return (batch >= 1 and batch == k_batch and hq >= 1 and hkv >= 1 and hq % hkv == 0 and sq >= 256 and skv >= 256
+            and sq % 64 == 0 and skv % 64 == 0 and d == k_d == 64)
+
+
+def _is_d64_fused_n256_eligible(q_shape, k_shape, causal, *, arch, cu_count):
+    if not _is_supported_d64_shape(q_shape, k_shape):
+        return False
+    if causal or arch is None or not arch.startswith("gfx950"):
+        return False
+    if cu_count is None or cu_count < 1:
+        return False
+    batch, hq, sq, _d = q_shape
+    _k_batch, hkv, skv, _k_d = k_shape
+    group_size = hq // hkv
+    owner_ctas = batch * hq * triton.cdiv(skv, 256)
+    return (group_size in (1, 8) and sq >= 4096 and skv >= 4096 and sq % 64 == 0 and skv % 256 == 0
+            and owner_ctas >= cu_count)
+
+
+_D64_MHA_POSITIVE = 0
+_D64_GQA_SIGNED = 1
+_D64_LSE_NATURAL_LOG = 0
+_D64_LSE_NEG_INV_SCALE = 1
+_D64_DELTA_POSITIVE = 0
+_D64_DELTA_NEGATED = 1
+
+# With zero QK scores, selected dQ and the signed GQA ABI represent LSE as
+# -log(valid_keys) / scale. Keep that unavoidable entropy term within half
+# the FP32 range so the input-dependent score contribution retains headroom.
+_D64_RECIP_LSE_ENTROPY_LIMIT = torch.finfo(torch.float32).max / 2.0
+
+_D64_MHA_POSITIVE_JIT = tl.constexpr(_D64_MHA_POSITIVE)
+_D64_GQA_SIGNED_JIT = tl.constexpr(_D64_GQA_SIGNED)
+_D64_LSE_NATURAL_LOG_JIT = tl.constexpr(_D64_LSE_NATURAL_LOG)
+_D64_LSE_NEG_INV_SCALE_JIT = tl.constexpr(_D64_LSE_NEG_INV_SCALE)
+_D64_DELTA_POSITIVE_JIT = tl.constexpr(_D64_DELTA_POSITIVE)
+_D64_DELTA_NEGATED_JIT = tl.constexpr(_D64_DELTA_NEGATED)
+
+_D64_GQA_SPLIT_FAST = "split_fast"
+_D64_GQA_XCD = "xcd"
+_D64_GQA_XCD_N_FAST = "xcd_n_fast"
+
+_D64_GQA_INDEPENDENT_D32 = "independent_d32"
+_D64_GQA_INTERLEAVED_D32 = "interleaved_d32"
+_D64_GQA_DIRECT_D64 = "direct_d64"
+
+_D64_GQA_INDEPENDENT_D32_JIT = tl.constexpr(_D64_GQA_INDEPENDENT_D32)
+_D64_GQA_INTERLEAVED_D32_JIT = tl.constexpr(_D64_GQA_INTERLEAVED_D32)
+_D64_GQA_DIRECT_D64_JIT = tl.constexpr(_D64_GQA_DIRECT_D64)
+
+
+@dataclasses.dataclass(frozen=True)
+class _D64DQLaunch:
+    launch_tiles: int
+    skip_owner_tail: bool
+    owner_pid_base: int
+    launch_q_tiles: int
+    owner_fragments: int
+    grid_owner_m: int
+
+
+@dataclasses.dataclass(frozen=True)
+class _D64Dispatch:
+    family: str
+    owner_rows: int
+    key_rows: int
+    kv_splits: int
+    selected_causal: bool = False
+    stat_mode: int = _D64_MHA_POSITIVE
+    dq_logical_n: int = 64
+    dq_use_xcd: bool = False
+    dq_launches: tuple[_D64DQLaunch, ...] = ()
+    gqa_grid_mode: str | None = None
+    cyclic_query_split: bool = False
+    dkdv_lifetime: str | None = None
+
+
+_D64_NONCAUSAL_FAMILIES = frozenset({"noncausal_direct_n256", "noncausal_fused_n256"})
+_D64_RETAINED_CAUSAL_FAMILIES = frozenset({"causal_m192", "causal_m256"})
+_D64_SELECTED_CAUSAL_FAMILIES = frozenset({"causal_gluon_mha", "causal_gluon_gqa8"})
+_D64_DISPATCH_FAMILIES = (_D64_NONCAUSAL_FAMILIES | _D64_RETAINED_CAUSAL_FAMILIES | _D64_SELECTED_CAUSAL_FAMILIES)
+
+
+def _invalid_d64_dispatch(dispatch, reason):
+    raise ValueError(f"invalid D64 dispatch {dispatch.family!r}: {reason}")
+
+
+def _require_d64_dispatch_variant(dispatch, family, *, stat_mode=None, kv_splits=None):
+    if dispatch.family != family:
+        _invalid_d64_dispatch(dispatch, f"family must be {family!r} for this route")
+    if stat_mode is not None and dispatch.stat_mode != stat_mode:
+        _invalid_d64_dispatch(
+            dispatch,
+            f"stat_mode must be {stat_mode}, got {dispatch.stat_mode}",
+        )
+    if kv_splits is not None and dispatch.kv_splits != kv_splits:
+        _invalid_d64_dispatch(
+            dispatch,
+            f"kv_splits must be {kv_splits}, got {dispatch.kv_splits}",
+        )
+
+
+def _validate_d64_dispatch(q_shape, k_shape, causal, dispatch):
+    """Reject dispatch records that would violate a D64 kernel ABI."""
+    if not isinstance(dispatch, _D64Dispatch):
+        raise ValueError("D64 dispatch must be a _D64Dispatch record")
+    if not _is_supported_d64_shape(q_shape, k_shape):
+        raise ValueError(f"unsupported D64 dispatch shapes q={q_shape}, k={k_shape}")
+
+    family = dispatch.family
+    if family not in _D64_DISPATCH_FAMILIES:
+        raise ValueError(f"unknown D64 dispatch family {family!r}")
+    family_is_causal = family not in _D64_NONCAUSAL_FAMILIES
+    if causal != family_is_causal:
+        requirement = "causal" if family_is_causal else "noncausal"
+        _invalid_d64_dispatch(dispatch, f"family requires {requirement} attention")
+
+    _batch, hq, sq, _d = q_shape
+    _k_batch, hkv, skv, _k_d = k_shape
+    group_size = hq // hkv
+
+    def require_field(name, expected):
+        actual = getattr(dispatch, name)
+        if actual != expected:
+            _invalid_d64_dispatch(dispatch, f"{name} must be {expected!r}, got {actual!r}")
+
+    def require_unselected_defaults():
+        require_field("selected_causal", False)
+        require_field("stat_mode", _D64_MHA_POSITIVE)
+        require_field("dq_logical_n", 64)
+        require_field("dq_use_xcd", False)
+        require_field("dq_launches", ())
+        require_field("gqa_grid_mode", None)
+        require_field("cyclic_query_split", False)
+        require_field("dkdv_lifetime", None)
+
+    if family in _D64_NONCAUSAL_FAMILIES:
+        require_field("owner_rows", 32)
+        require_field("key_rows", 256)
+        require_field("kv_splits", 8 if group_size == 8 else 1)
+        require_unselected_defaults()
+        return
+
+    owner_rows = (256 if sq == skv and sq >= 16384 and sq % 256 == 0 else 192)
+    if family in _D64_RETAINED_CAUSAL_FAMILIES:
+        expected_family = "causal_m256" if owner_rows == 256 else "causal_m192"
+        require_field("family", expected_family)
+        require_field("owner_rows", owner_rows)
+        require_field("key_rows", 32 if sq == skv else 64)
+        require_field("kv_splits", 4 if group_size == 8 else 1)
+        require_unselected_defaults()
+        return
+
+    expected_family = ("causal_gluon_gqa8" if group_size == 8 else "causal_gluon_mha")
+    if group_size not in (1, 8):
+        _invalid_d64_dispatch(dispatch, "selected causal family requires MHA or GQA8")
+    require_field("family", expected_family)
+    require_field("owner_rows", owner_rows)
+    require_field("selected_causal", True)
+    require_field("dq_logical_n", 32 if sq == skv else 64)
+    require_field("dq_use_xcd", _d64_use_dq_xcd(_batch, hkv, sq, skv, owner_rows))
+
+    def require_valid_dq_launches():
+        owners = triton.cdiv(sq, owner_rows)
+        fragments = 4 if owner_rows == 256 else 3
+        valid_dq_launches = {
+            (_D64DQLaunch(owners, True, 0, 0, fragments, 0), ),
+        }
+        if (owner_rows == 192 and sq >= 8192 and dispatch.dq_use_xcd and sq % 192 == 128 and owners > 1):
+            valid_dq_launches.add((
+                _D64DQLaunch(owners - 1, False, 0, owners - 1, 3, 0),
+                _D64DQLaunch(1, False, owners - 1, 1, 2, 192),
+            ))
+        if dispatch.dq_launches not in valid_dq_launches:
+            _invalid_d64_dispatch(dispatch, "dq_launches must match a full or peeled owner plan")
+
+    if family == "causal_gluon_mha":
+        require_field("key_rows", 64)
+        require_field("kv_splits", 1)
+        require_field("stat_mode", _D64_MHA_POSITIVE)
+        require_field("gqa_grid_mode", None)
+        require_field("cyclic_query_split", False)
+        require_field("dkdv_lifetime", None)
+        require_valid_dq_launches()
+        return
+
+    require_field("key_rows", 128)
+    require_field("kv_splits", 4)
+    require_field("stat_mode", _D64_GQA_SIGNED)
+    if dispatch.gqa_grid_mode not in {
+            _D64_GQA_SPLIT_FAST,
+            _D64_GQA_XCD,
+            _D64_GQA_XCD_N_FAST,
+    }:
+        _invalid_d64_dispatch(dispatch, "unknown GQA grid mode")
+    if (dispatch.gqa_grid_mode != _D64_GQA_SPLIT_FAST and (_batch * hkv) % 8 != 0):
+        _invalid_d64_dispatch(dispatch, "GQA XCD grid requires B * Hkv divisible by 8")
+    require_field("dkdv_lifetime", _d64_gqa_lifetime(sq, skv))
+    if dispatch.cyclic_query_split and not (dispatch.gqa_grid_mode == _D64_GQA_XCD_N_FAST and sq == skv and skv >= 16384
+                                            and (_batch * hkv) % 8 == 0):
+        _invalid_d64_dispatch(dispatch, "cyclic_query_split requires a deep square XCD N-fast grid")
+    require_valid_dq_launches()
+
+
+def _validate_d64_sm_scale(sm_scale):
+    try:
+        value = float(sm_scale)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("D64 sm_scale must be finite and nonzero") from None
+    if not math.isfinite(value) or value == 0.0:
+        raise ValueError("D64 sm_scale must be finite and nonzero")
+    return value
+
+
+def _is_d64_causal_gluon_eligible(
+    q_shape,
+    k_shape,
+    causal,
+    *,
+    arch,
+    cu_count,
+    sm_scale,
+    bases_aligned_16,
+):
+    if not _is_supported_d64_shape(q_shape, k_shape) or not causal:
+        return False
+    if arch is None or not arch.startswith("gfx950"):
+        return False
+    if cu_count is None or cu_count < 1 or not bases_aligned_16:
+        return False
+    try:
+        scale = float(sm_scale)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not math.isfinite(scale) or scale <= 0.0:
+        return False
+
+    batch, hq, sq, _d = q_shape
+    _k_batch, hkv, skv, _k_d = k_shape
+    if sq > skv or sq % 64 != 0 or skv % 64 != 0:
+        return False
+    if math.log(skv) > scale * _D64_RECIP_LSE_ENTROPY_LIMIT:
+        return False
+    group_size = hq // hkv
+    if group_size == 1:
+        if sq < 4096 or skv < 4096:
+            return False
+    elif group_size == 8:
+        if sq < 1024 or skv < 1024 or skv % 128 != 0:
+            return False
+    else:
+        return False
+
+    owner_rows = (256 if sq == skv and sq >= 16384 and sq % 256 == 0 else 192)
+    if batch * hq * triton.cdiv(sq, owner_rows) < 2 * cu_count:
+        return False
+    if group_size == 8:
+        producer_owners = batch * hkv * 4 * triton.cdiv(skv, 128)
+    else:
+        producer_owners = batch * hkv * triton.cdiv(skv, 64)
+    return producer_owners >= 2 * cu_count
+
+
+def _select_d64_dispatch(
+    q_shape,
+    k_shape,
+    causal,
+    *,
+    arch=None,
+    cu_count=None,
+    sm_scale=None,
+    bases_aligned_16=False,
+):
+    """Select D64 ownership from shape structure, never ticket identifiers."""
+    if not _is_supported_d64_shape(q_shape, k_shape):
+        raise ValueError(f"unsupported D64 dispatch shapes q={q_shape}, k={k_shape}")
+    _batch, _hq, sq, _d = q_shape
+    _k_batch, hkv, skv, _k_d = k_shape
+    group_size = _hq // hkv
+    if not causal:
+        fused = _is_d64_fused_n256_eligible(q_shape, k_shape, causal, arch=arch, cu_count=cu_count)
+        return _D64Dispatch(
+            "noncausal_fused_n256" if fused else "noncausal_direct_n256",
+            owner_rows=32,
+            key_rows=256,
+            kv_splits=8 if group_size == 8 else 1,
+        )
+    if sq == skv and sq >= 16384 and sq % 256 == 0:
+        retained = _D64Dispatch(
+            "causal_m256",
+            owner_rows=256,
+            key_rows=32,
+            kv_splits=4 if group_size == 8 else 1,
+        )
+    else:
+        retained = _D64Dispatch(
+            "causal_m192",
+            owner_rows=192,
+            key_rows=32 if sq == skv else 64,
+            kv_splits=4 if group_size == 8 else 1,
+        )
+    if not _is_d64_causal_gluon_eligible(
+            q_shape,
+            k_shape,
+            causal,
+            arch=arch,
+            cu_count=cu_count,
+            sm_scale=sm_scale,
+            bases_aligned_16=bases_aligned_16,
+    ):
+        return retained
+
+    owner_rows = retained.owner_rows
+    dq_use_xcd = _d64_use_dq_xcd(_batch, hkv, sq, skv, owner_rows)
+    dq_launches = _d64_dq_launch_plan(
+        _batch,
+        _hq,
+        hkv,
+        sq,
+        skv,
+        owner_rows,
+        cu_count,
+        True,
+    )
+    if group_size == 8:
+        grid_mode, cyclic_query_split = _d64_gqa_grid_policy(_batch, hkv, sq, skv, cu_count)
+        return _D64Dispatch(
+            "causal_gluon_gqa8",
+            owner_rows=owner_rows,
+            key_rows=128,
+            kv_splits=4,
+            selected_causal=True,
+            stat_mode=_D64_GQA_SIGNED,
+            dq_logical_n=32 if sq == skv else 64,
+            dq_use_xcd=dq_use_xcd,
+            dq_launches=dq_launches,
+            gqa_grid_mode=grid_mode,
+            cyclic_query_split=cyclic_query_split,
+            dkdv_lifetime=_d64_gqa_lifetime(sq, skv),
+        )
+    return _D64Dispatch(
+        "causal_gluon_mha",
+        owner_rows=owner_rows,
+        key_rows=64,
+        kv_splits=1,
+        selected_causal=True,
+        stat_mode=_D64_MHA_POSITIVE,
+        dq_logical_n=32 if sq == skv else 64,
+        dq_use_xcd=dq_use_xcd,
+        dq_launches=dq_launches,
+    )
+
+
+def _d64_causal_stat_values(o, do, lse, sm_scale, stat_mode):
+    positive = torch.sum(o.float() * do.float(), dim=-1)
+    if stat_mode == _D64_MHA_POSITIVE:
+        return positive, None
+    if stat_mode == _D64_GQA_SIGNED:
+        return -positive, -lse.float() / float(sm_scale)
+    raise ValueError(f"unknown D64 stat mode {stat_mode!r}")
+
+
+def _d64_causal_owner_interval(physical_owner, sq, owner_rows):
+    owners = triton.cdiv(sq, owner_rows)
+    if not 0 <= physical_owner < owners:
+        raise ValueError("physical owner is outside the dQ grid")
+    pad = owners * owner_rows - sq
+    reverse_owner = owners - 1 - physical_owner
+    raw = reverse_owner * owner_rows
+    return max(raw - pad, 0), min(raw + owner_rows - pad, sq)
+
+
+def _d64_use_dq_xcd(batch, hkv, sq, skv, owner_rows):
+    single_fragment_tail = (owner_rows == 192 and sq == skv and sq % 192 == 64 and 4096 <= sq < 5120 and hkv % 8 == 0)
+    return (batch * hkv) % 8 == 0 and not single_fragment_tail
+
+
+def _d64_gqa_grid_policy(batch, hkv, sq, skv, cu_count):
+    repeated = hkv % 8 == 0 and sq == skv and skv >= 4096
+    cyclic = (sq == skv and skv >= 16384 and batch * hkv * 4 >= cu_count and (batch * hkv) % 8 == 0)
+    use_xcd = (batch * hkv) % 8 == 0 and (cyclic or (not repeated and (skv <= 8192 or skv >= 4 * sq)))
+    if not use_xcd:
+        return _D64_GQA_SPLIT_FAST, cyclic
+    if cyclic or skv >= 4 * sq:
+        return _D64_GQA_XCD_N_FAST, cyclic
+    return _D64_GQA_XCD, cyclic
+
+
+def _d64_decode_gqa_pid(pid, batch, hkv, skv, grid_mode):
+    nt = triton.cdiv(skv, 128)
+    value = pid
+    if grid_mode == _D64_GQA_SPLIT_FAST:
+        split = value % 4
+        value //= 4
+        out_hkv = value % hkv
+        value //= hkv
+        n = value % nt
+        out_batch = value // nt
+        return out_batch, out_hkv, split, n
+    xcd = value % 8
+    value //= 8
+    if grid_mode == _D64_GQA_XCD_N_FAST:
+        n = value % nt
+        value //= nt
+        split = value % 4
+        bkv_group = value // 4
+    elif grid_mode == _D64_GQA_XCD:
+        split = value % 4
+        value //= 4
+        n = value % nt
+        bkv_group = value // nt
+    else:
+        raise ValueError(f"unknown GQA grid mode {grid_mode!r}")
+    bkv = bkv_group * 8 + xcd
+    return bkv // hkv, bkv % hkv, split, n
+
+
+def _d64_causal_physical_frontier(n0, sq, skv, block_m, block_n):
+    diff = skv - sq
+    start_m_blk = max((n0 - diff) // block_m, 0)
+    masked = tuple(m_blk for m_blk in range(start_m_blk, triton.cdiv(sq, block_m))
+                   if n0 + block_n - 1 > m_blk * block_m + diff)
+    return start_m_blk, masked
+
+
+def _d64_gqa_split_ownership(split, query_blocks, cyclic):
+    if not 0 <= split < 4:
+        raise ValueError("GQA split must be in [0, 4)")
+    if cyclic:
+        return tuple((head, m_blk) for head in range(8) for m_blk in range(query_blocks) if m_blk % 4 == split)
+    return tuple((head, m_blk) for head in (2 * split, 2 * split + 1) for m_blk in range(query_blocks))
+
+
+def _d64_gqa_lifetime(sq, skv):
+    if sq == skv and 2048 <= sq <= 8192:
+        return _D64_GQA_INDEPENDENT_D32
+    if skv > sq:
+        return _D64_GQA_INTERLEAVED_D32
+    if sq == skv and sq >= 1024:
+        return _D64_GQA_DIRECT_D64
+    raise ValueError("selected GQA8 shape has no lifetime mode")
+
+
+def _d64_decode_dq_pid(
+    pid,
+    batch,
+    hq,
+    hkv,
+    launch_tiles,
+    use_xcd,
+    owner_pid_base=0,
+):
+    group = hq // hkv
+    value = pid
+    if use_xcd:
+        xcd = value % 8
+        value //= 8
+        q_in_group = value % group
+        value //= group
+        local_owner = value % launch_tiles
+        bkv_group = value // launch_tiles
+        bkv = bkv_group * 8 + xcd
+        out_hkv = bkv % hkv
+        out_batch = bkv // hkv
+    else:
+        out_hkv = value % hkv
+        value //= hkv
+        q_in_group = value % group
+        value //= group
+        local_owner = value % launch_tiles
+        out_batch = value // launch_tiles
+    return out_batch, out_hkv * group + q_in_group, owner_pid_base + local_owner
+
+
+def _d64_encode_dq_pid(
+    batch_id,
+    hq_id,
+    physical_owner,
+    batch,
+    hq,
+    hkv,
+    launch_tiles,
+    use_xcd,
+    owner_pid_base=0,
+):
+    group = hq // hkv
+    hkv_id, q_in_group = divmod(hq_id, group)
+    local_owner = physical_owner - owner_pid_base
+    if use_xcd:
+        bkv = batch_id * hkv + hkv_id
+        bkv_group, xcd = divmod(bkv, 8)
+        return (((bkv_group * launch_tiles + local_owner) * group + q_in_group) * 8 + xcd)
+    return ((batch_id * launch_tiles + local_owner) * group + q_in_group) * hkv + hkv_id
+
+
+def _d64_dq_launch_plan(
+    batch,
+    hq,
+    hkv,
+    sq,
+    skv,
+    owner_rows,
+    cu_count,
+    host_skip_owner_tail,
+):
+    owners = triton.cdiv(sq, owner_rows)
+    fragments = 4 if owner_rows == 256 else 3
+    use_xcd = _d64_use_dq_xcd(batch, hkv, sq, skv, owner_rows)
+    peel = (owner_rows == 192 and sq >= 8192 and use_xcd and batch * hq >= cu_count and host_skip_owner_tail
+            and sq % 192 == 128 and owners > 1)
+    if peel:
+        return (
+            _D64DQLaunch(owners - 1, False, 0, owners - 1, 3, 0),
+            _D64DQLaunch(1, False, owners - 1, 1, 2, 192),
+        )
+    return (_D64DQLaunch(owners, host_skip_owner_tail, 0, 0, fragments, 0), )
+
+
+# These intentionally duplicate the scalar formulas in the JIT kernels as
+# host-testable Python reference models.  Keep them separate: sharing helpers
+# across ordinary Python and TLX JIT control flow would blur that boundary.
+def _d64_causal_dq_key_blocks(owner_start, owner_rows, sq, skv, block_n):
+    """Python reference model for the JIT dQ bottom-right key frontier."""
+    return min(skv, owner_start + owner_rows + skv - sq + block_n - 1) // block_n
+
+
+def _d64_causal_dkdv_first_query_block(key_start, sq, skv, block_m):
+    """Python reference model for the JIT dK/dV bottom-right query frontier."""
+    return max(0, key_start - (skv - sq)) // block_m
+
+
+def _d64_causal_triangular_tail_schedule(owner_fragments, valid_fragments, tail_step):
+    """Python reference for one uniform causal-tail fragment visit."""
+    return tuple("skip" if fragment < tail_step or fragment >= valid_fragments else "masked" if fragment ==
+                 tail_step else "unmasked" for fragment in range(owner_fragments))
 
 
 # Gluon pins CDNA4's 16x16x32 MFMA for these BF16 tiles.  Leaving Triton to
@@ -197,8 +758,115 @@ def _make_gqa_smoke_case(shape=(1, 8, 1, 512, 128), seed=0):
     )
 
 
+def _make_d64_gqa_smoke_case(shape=(1, 1, 1, 256, 256, 64), causal=False, seed=0):
+    """Build a small D64 MHA/GQA reference with bottom-right causality."""
+    batch, hq, hkv, sq, skv, head_dim = shape
+    assert batch >= 1 and hq >= 1 and hkv >= 1 and hq % hkv == 0
+    assert head_dim == 64
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(seed)
+    q = torch.randn((batch, hq, sq, head_dim), generator=generator, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, hkv, skv, head_dim), generator=generator, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn((batch, hkv, skv, head_dim), generator=generator, device="cuda", dtype=torch.bfloat16)
+    do = torch.randn(q.shape, generator=generator, device="cuda", dtype=torch.bfloat16)
+    o = torch.empty_like(q)
+    lse = torch.empty(q.shape[:-1], device="cuda", dtype=torch.float32)
+    dq = torch.empty_like(q, dtype=torch.float32)
+    dk = torch.zeros_like(k, dtype=torch.float32)
+    dv = torch.zeros_like(v, dtype=torch.float32)
+    sm_scale = head_dim**-0.5
+    group_size = hq // hkv
+    causal_mask = None
+    if causal:
+        query_positions = torch.arange(sq, device="cuda")[:, None]
+        key_positions = torch.arange(skv, device="cuda")[None, :]
+        causal_mask = key_positions > query_positions + (skv - sq)
+
+    for batch_idx in range(batch):
+        for query_head in range(hq):
+            kv_head = query_head // group_size
+            q_ref = q[batch_idx, query_head].float().requires_grad_(True)
+            k_ref = k[batch_idx, kv_head].float().requires_grad_(True)
+            v_ref = v[batch_idx, kv_head].float().requires_grad_(True)
+            scores = torch.matmul(q_ref, k_ref.transpose(0, 1)) * sm_scale
+            if causal_mask is not None:
+                scores = scores.masked_fill(causal_mask, float("-inf"))
+            lse_ref = torch.logsumexp(scores, dim=-1)
+            o_ref = torch.matmul(torch.softmax(scores, dim=-1), v_ref)
+            grads = torch.autograd.grad(o_ref, (q_ref, k_ref, v_ref), do[batch_idx, query_head].float())
+            with torch.no_grad():
+                o[batch_idx, query_head].copy_(o_ref)
+                lse[batch_idx, query_head].copy_(lse_ref)
+                dq[batch_idx, query_head].copy_(grads[0])
+                dk[batch_idx, kv_head].add_(grads[1])
+                dv[batch_idx, kv_head].add_(grads[2])
+
+    return ReferenceCase(q, k, v, o, do, lse, sm_scale, causal, (dq, dk, dv))
+
+
+def _make_d64_aten_case(shape, seed, causal=False, sm_scale=None):
+    """Build a full-size D64 case without materializing a dense score matrix."""
+    batch, hq, hkv, sq, skv, head_dim = shape
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(seed)
+
+    def random(tensor_shape):
+        return torch.randn(
+            tensor_shape,
+            generator=generator,
+            device="cuda",
+            dtype=torch.bfloat16,
+        ).contiguous()
+
+    q = random((batch, hq, sq, head_dim))
+    k = random((batch, hkv, skv, head_dim))
+    v = random((batch, hkv, skv, head_dim))
+    do = random(q.shape)
+    if sm_scale is None:
+        sm_scale = head_dim**-0.5
+    state = torch.ops.aten._scaled_dot_product_flash_attention.default(q, k, v, 0.0, causal, False, scale=sm_scale)
+    out, lse, cum_q, cum_k, max_q, max_k, rng, unused, _debug = state
+    reference = torch.ops.aten._scaled_dot_product_flash_attention_backward.default(
+        do,
+        q,
+        k,
+        v,
+        out,
+        lse,
+        cum_q,
+        cum_k,
+        max_q,
+        max_k,
+        0.0,
+        causal,
+        rng,
+        unused,
+        scale=sm_scale,
+    )
+    return ReferenceCase(
+        q,
+        k,
+        v,
+        out.contiguous(),
+        do,
+        lse.contiguous(),
+        sm_scale,
+        causal,
+        tuple(reference),
+    )
+
+
 @triton.jit
-def _attn_bwd_preprocess_kernel(O, DO, Delta, N: tl.constexpr, D: tl.constexpr, BLOCK_M: tl.constexpr):
+def _attn_bwd_preprocess_kernel(
+    O,
+    DO,
+    Delta,
+    DQ_ACC,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    ZERO_DQ: tl.constexpr,
+):
     batch_head = tl.program_id(1)
     rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     cols = tl.arange(0, D)
@@ -212,13 +880,3444 @@ def _attn_bwd_preprocess_kernel(O, DO, Delta, N: tl.constexpr, D: tl.constexpr, 
     o = tl.load(O + tensor_base + offsets, mask=mask, other=0.0).to(tl.float32)
     do = tl.load(DO + tensor_base + offsets, mask=mask, other=0.0).to(tl.float32)
     tl.store(Delta + delta_base + rows, tl.sum(o * do, axis=1), mask=rows < N)
+    if ZERO_DQ:
+        tl.store(DQ_ACC + tensor_base + offsets, 0.0, mask=mask)
 
 
-def _run_bwd_preprocess(o, do, delta):
+def _run_bwd_preprocess(o, do, delta, dq_acc=None):
     batch, heads, n_ctx, head_dim = o.shape
     block_m = 64
     grid = (triton.cdiv(n_ctx, block_m), batch * heads)
-    _attn_bwd_preprocess_kernel[grid](o, do, delta, N=n_ctx, D=head_dim, BLOCK_M=block_m, num_warps=4)
+    _attn_bwd_preprocess_kernel[grid](
+        o,
+        do,
+        delta,
+        dq_acc if dq_acc is not None else delta,
+        N=n_ctx,
+        D=head_dim,
+        BLOCK_M=block_m,
+        ZERO_DQ=dq_acc is not None,
+        num_warps=4,
+    )
+
+
+@triton.jit
+def _attn_bwd_d64_fused_n256_update(
+    q_t,
+    do_t,
+    q_nd,
+    do_nd,
+    k_nm,
+    kt_dm,
+    v_nm,
+    lse,
+    delta,
+    dq_acc_base,
+    offs_m,
+    dk,
+    dv,
+    SM_SCALE: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    mma_nm: tl.constexpr,
+    mma_nd: tl.constexpr,
+    mma_dm: tl.constexpr,
+    p_op0_nd: tl.constexpr,
+    ds_op0_nd: tl.constexpr,
+    ds_op1_dm: tl.constexpr,
+):
+    log2e: tl.constexpr = 1.4426950408889634
+    dk = tlx.require_layout(dk, mma_nd, pin=False)
+    dv = tlx.require_layout(dv, mma_nd, pin=False)
+    scores = tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=mma_nm)
+    scores = tl.dot(k_nm, q_t, acc=scores, out_dtype=tl.float32)
+    scale_full = tlx.require_layout(
+        tl.full((BLOCK_N, BLOCK_M), SM_SCALE * log2e, tl.float32),
+        mma_nm,
+        pin=False,
+    )
+    lse_full = tlx.require_layout(
+        tl.broadcast_to(lse[None, :] * log2e, (BLOCK_N, BLOCK_M)),
+        mma_nm,
+        pin=False,
+    )
+    p = tlx.require_layout(tl.math.exp2(scores * scale_full - lse_full), mma_nm, pin=False)
+
+    p_nd = tl.reshape(p.to(tl.bfloat16), (2, 2, 2, 2, 16, BLOCK_M))
+    p_nd = tl.permute(p_nd, (0, 2, 3, 1, 4, 5))
+    p_nd = tl.reshape(p_nd, (BLOCK_N, BLOCK_M))
+    p_nd = tlx.require_layout(p_nd, p_op0_nd, pin=False)
+    dv = tl.dot(p_nd, do_nd, acc=dv, out_dtype=tl.float32)
+
+    dp = tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=mma_nm)
+    dp = tl.dot(v_nm, do_t, acc=dp, out_dtype=tl.float32)
+    delta_full = tlx.require_layout(
+        tl.broadcast_to(delta[None, :], (BLOCK_N, BLOCK_M)),
+        mma_nm,
+        pin=False,
+    )
+    ds = p * (dp - delta_full)
+    ds_bf16 = ds.to(tl.bfloat16)
+
+    ds_nd = tl.reshape(ds_bf16, (2, 2, 2, 2, 16, BLOCK_M))
+    ds_nd = tl.permute(ds_nd, (0, 2, 3, 1, 4, 5))
+    ds_nd = tl.reshape(ds_nd, (BLOCK_N, BLOCK_M))
+    ds_nd = tlx.require_layout(ds_nd, ds_op0_nd, pin=False)
+    dk = tl.dot(ds_nd, q_nd, acc=dk, out_dtype=tl.float32)
+
+    ds_dm = tlx.require_layout(ds_bf16, ds_op1_dm, pin=False)
+    dq = tlx.zeros((D, BLOCK_M), tl.float32, layout=mma_dm)
+    dq = tl.dot(kt_dm, ds_dm, acc=dq, out_dtype=tl.float32)
+    dq_scale = tlx.require_layout(tl.full((D, BLOCK_M), SM_SCALE, tl.float32), mma_dm, pin=False)
+    dq = dq * dq_scale
+    offs_d = tl.arange(0, D)
+    dq_offsets = offs_m[None, :] * D + offs_d[:, None]
+    dq_offsets = tlx.require_layout(dq_offsets.to(tl.int32), mma_dm, pin=False)
+    tlx.buffer_atomic_add(
+        dq_acc_base,
+        dq_offsets,
+        dq,
+        sem="relaxed",
+        contiguity=1,
+    )
+    dk = tlx.require_layout(dk, mma_nd, pin=False)
+    dv = tlx.require_layout(dv, mma_nd, pin=False)
+    return dk, dv
+
+
+@triton.jit
+def _attn_bwd_d64_fused_n256_kernel(
+    Q,
+    K,
+    V,
+    DO,
+    LSE,
+    Delta,
+    DQ_ACC,
+    DK_OWNER,
+    DV_OWNER,
+    SM_SCALE: tl.constexpr,
+    HQ: tl.constexpr,
+    HKV: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    KV_SPLITS: tl.constexpr,
+):
+    tl.static_assert(BLOCK_M == 32 and BLOCK_N == 256 and D == 64)
+    tl.static_assert(SQ % 64 == 0 and SKV % 256 == 0)
+    tl.static_assert(HQ % HKV == 0)
+    tl.static_assert((HQ // HKV == 1 and KV_SPLITS == 1) or (HQ // HKV == 8 and KV_SPLITS == 8))
+    pid_n = tl.program_id(0)
+    pid_hq = tl.program_id(1)
+    pid_b = tl.program_id(2)
+    group_size: tl.constexpr = HQ // HKV
+    pid_hkv = pid_hq // group_size
+    pid_split = pid_hq % group_size
+    q_head = (pid_b * HQ + pid_hq).to(tl.int64)
+    kv_head = (pid_b * HKV + pid_hkv).to(tl.int64)
+    q_base = q_head * SQ * D
+    kv_base = kv_head * SKV * D
+    stats_base = q_head * SQ
+    dq_acc_base = DQ_ACC + q_base
+
+    mma_nm: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[4, 1],
+    )
+    mma_nd: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[4, 1],
+    )
+    mma_dm: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[4, 1],
+    )
+    kv_async_layout: tl.constexpr = tlx.layout(
+        shape=(
+            (2, 2, 2, 2, 2, 2, 2, 2),
+            (2, 2, 2, 2, 2, 2),
+        ),
+        stride=(
+            (8, 16, 32, 64, 128, 256, 4096, 8192),
+            (1, 2, 4, 512, 1024, 2048),
+        ),
+    )
+    k_op0_nm: tl.constexpr = tlx.dot_operand_layout(0, mma_nm, k_width=8)
+    qt_op1_nm: tl.constexpr = tlx.dot_operand_layout(1, mma_nm, k_width=8)
+    v_op0_nm: tl.constexpr = tlx.dot_operand_layout(0, mma_nm, k_width=8)
+    do_t_op1_nm: tl.constexpr = tlx.dot_operand_layout(1, mma_nm, k_width=8)
+    p_op0_nd: tl.constexpr = tlx.dot_operand_layout(0, mma_nd, k_width=4)
+    do_op1_nd: tl.constexpr = tlx.dot_operand_layout(1, mma_nd, k_width=4)
+    ds_op0_nd: tl.constexpr = tlx.dot_operand_layout(0, mma_nd, k_width=4)
+    q_op1_nd: tl.constexpr = tlx.dot_operand_layout(1, mma_nd, k_width=4)
+    kt_op0_dm: tl.constexpr = tlx.dot_operand_layout(0, mma_dm, k_width=4)
+    ds_op1_dm: tl.constexpr = tlx.dot_operand_layout(1, mma_dm, k_width=4)
+
+    kv_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 32)],
+        [
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [0, 16],
+            [0, 32],
+            [16, 0],
+            [32, 0],
+            [64, 0],
+            [128, 0],
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+        ],
+        [BLOCK_N, D],
+    )
+    qdo_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 32)],
+        [
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [0, 16],
+            [0, 32],
+            [16, 0],
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+        ],
+        [BLOCK_M, D],
+    )
+    k_buffer = tlx.local_alloc((BLOCK_N, D), tl.bfloat16, 1, layout=kv_layout)
+    v_buffer = tlx.local_alloc((BLOCK_N, D), tl.bfloat16, 1, layout=kv_layout)
+    q_ring = tlx.local_alloc((BLOCK_M, D), tl.bfloat16, 8, layout=qdo_layout, reuse=k_buffer)
+    do_ring = tlx.local_alloc((BLOCK_M, D), tl.bfloat16, 8, layout=qdo_layout, reuse=v_buffer)
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, D)
+    key_ptrs = kv_base + offs_n[:, None] * D + offs_d[None, :]
+    key_mask = offs_n[:, None] < SKV
+    k_token = tlx.async_load(
+        K + key_ptrs,
+        tlx.local_view(k_buffer, 0),
+        mask=key_mask,
+        other=0.0,
+    )
+    v_token = tlx.async_load(
+        V + key_ptrs,
+        tlx.local_view(v_buffer, 0),
+        mask=key_mask,
+        other=0.0,
+    )
+    tlx.async_load_commit_group([k_token, v_token])
+    kv_wait = tlx.async_load_wait_group(0)
+    k_nm = tlx.local_load(tlx.local_view(k_buffer, 0), token=kv_wait, layout=k_op0_nm)
+    kt_dm = tlx.local_load(
+        tlx.local_trans(tlx.local_view(k_buffer, 0)),
+        token=kv_wait,
+        layout=kt_op0_dm,
+    )
+    v_nm = tlx.local_load(tlx.local_view(v_buffer, 0), token=kv_wait, layout=v_op0_nm)
+    tl.debug_barrier()
+
+    first_m = tl.arange(0, BLOCK_M)
+    first_ptrs = q_base + first_m[:, None] * D + offs_d[None, :]
+    first_q_token = tlx.async_load(Q + first_ptrs, tlx.local_view(q_ring, 0))
+    first_do_token = tlx.async_load(DO + first_ptrs, tlx.local_view(do_ring, 0))
+    tlx.async_load_commit_group([first_q_token, first_do_token])
+
+    dk = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
+    dv = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
+    num_m_blocks: tl.constexpr = SQ // BLOCK_M
+    for m_block in range(0, num_m_blocks):
+        current_slot = m_block % 2
+        next_slot = 1 - current_slot
+        if m_block + 1 < num_m_blocks:
+            next_m = (m_block + 1) * BLOCK_M + tl.arange(0, BLOCK_M)
+            next_ptrs = q_base + next_m[:, None] * D + offs_d[None, :]
+            next_q_token = tlx.async_load(Q + next_ptrs, tlx.local_view(q_ring, next_slot))
+            next_do_token = tlx.async_load(DO + next_ptrs, tlx.local_view(do_ring, next_slot))
+            tlx.async_load_commit_group([next_q_token, next_do_token])
+            qdo_wait = tlx.async_load_wait_group(1)
+        else:
+            qdo_wait = tlx.async_load_wait_group(0)
+
+        q_view = tlx.local_view(q_ring, current_slot)
+        do_view = tlx.local_view(do_ring, current_slot)
+        q_t = tlx.local_load(tlx.local_trans(q_view), token=qdo_wait, layout=qt_op1_nm)
+        do_t = tlx.local_load(tlx.local_trans(do_view), token=qdo_wait, layout=do_t_op1_nm)
+        q_nd = tlx.local_load(q_view, token=qdo_wait, layout=q_op1_nd)
+        do_nd = tlx.local_load(do_view, token=qdo_wait, layout=do_op1_nd)
+        offs_m = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
+        lse = tl.load(LSE + stats_base + offs_m)
+        delta = tl.load(Delta + stats_base + offs_m)
+        dk, dv = _attn_bwd_d64_fused_n256_update(
+            q_t,
+            do_t,
+            q_nd,
+            do_nd,
+            k_nm,
+            kt_dm,
+            v_nm,
+            lse,
+            delta,
+            dq_acc_base,
+            offs_m,
+            dk,
+            dv,
+            SM_SCALE,
+            D,
+            BLOCK_M,
+            BLOCK_N,
+            mma_nm,
+            mma_nd,
+            mma_dm,
+            p_op0_nd,
+            ds_op0_nd,
+            ds_op1_dm,
+        )
+        tl.debug_barrier()
+
+    output_offsets = offs_n[:, None] * D + offs_d[None, :]
+    output_offsets = tlx.require_layout(output_offsets.to(tl.int32), kv_async_layout, pin=False)
+    dk_scale = tlx.require_layout(tl.full((BLOCK_N, D), SM_SCALE, tl.float32), mma_nd, pin=False)
+    dk_out = (dk * dk_scale).to(tl.bfloat16)
+    dk_out = tl.reshape(dk_out, (2, 2, 2, 2, 16, D))
+    dk_out = tl.permute(dk_out, (0, 3, 1, 2, 4, 5))
+    dk_out = tl.reshape(dk_out, (BLOCK_N, D))
+    dk_out = tlx.require_layout(dk_out, kv_async_layout, pin=False)
+    dv_out = dv.to(tl.bfloat16)
+    dv_out = tl.reshape(dv_out, (2, 2, 2, 2, 16, D))
+    dv_out = tl.permute(dv_out, (0, 3, 1, 2, 4, 5))
+    dv_out = tl.reshape(dv_out, (BLOCK_N, D))
+    dv_out = tlx.require_layout(dv_out, kv_async_layout, pin=False)
+    if KV_SPLITS == 1:
+        output_head = (pid_b * HKV + pid_hkv).to(tl.int64)
+    else:
+        output_head = ((pid_b * HKV + pid_hkv) * KV_SPLITS + pid_split).to(tl.int64)
+    output_base = output_head * SKV * D
+    tlx.buffer_store(dk_out, DK_OWNER + output_base, output_offsets)
+    tlx.buffer_store(dv_out, DV_OWNER + output_base, output_offsets)
+
+
+@triton.jit
+def _attn_bwd_d64_fused_dq_convert_kernel(
+    DQ_ACC,
+    DQ,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    batch_head = tl.program_id(1)
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = tl.arange(0, D)
+    base = batch_head.to(tl.int64) * N * D
+    offsets = rows[:, None] * D + cols[None, :]
+    mask = rows[:, None] < N
+    values = tl.load(DQ_ACC + base + offsets, mask=mask, other=0.0)
+    tl.store(DQ + base + offsets, values.to(tl.bfloat16), mask=mask)
+
+
+@triton.jit
+def _attn_bwd_dq_d64_causal_load_q64(
+    Q,
+    O,
+    DO,
+    LSE,
+    DELTA,
+    LSE_TERM,
+    q_base,
+    stats_base,
+    row_start,
+    store_end,
+    SM_SCALE: tl.constexpr,
+    SQ: tl.constexpr,
+    D: tl.constexpr,
+    STAT_MODE: tl.constexpr,
+    q_op0_mn: tl.constexpr,
+):
+    rows = row_start + tl.arange(0, 64)
+    cols = tl.arange(0, D)
+    offsets = q_base + rows[:, None] * D + cols[None, :]
+    mask = rows[:, None] < store_end
+    q = tl.load(Q + offsets, mask=mask, other=0.0)
+    do = tl.load(DO + offsets, mask=mask, other=0.0)
+    o = tl.load(O + offsets, mask=mask, other=0.0)
+    lse = tl.load(LSE + stats_base + rows, mask=rows < store_end, other=0.0)
+    positive = tl.sum(o.to(tl.float32) * do.to(tl.float32), axis=1)
+    lse_term = -lse * (1.0 / SM_SCALE)
+    stat_mask = rows < store_end
+    if STAT_MODE == _D64_MHA_POSITIVE_JIT:
+        tl.store(DELTA + stats_base + rows, positive, mask=stat_mask)
+    else:
+        tl.static_assert(STAT_MODE == _D64_GQA_SIGNED_JIT)
+        signed = -positive
+        tl.store(DELTA + stats_base + rows, signed, mask=stat_mask)
+        tl.store(LSE_TERM + stats_base + rows, lse_term, mask=stat_mask)
+    q = tlx.require_layout(q, q_op0_mn, pin=False)
+    do = tlx.require_layout(do, q_op0_mn, pin=False)
+    return q, do, lse_term, positive, rows
+
+
+@triton.jit
+def _attn_bwd_dq_d64_causal_step(
+    dq,
+    q,
+    do,
+    row_lse,
+    row_delta,
+    rows,
+    k_view,
+    v_view,
+    kv_wait,
+    n0,
+    SM_SCALE: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    STAT_MODE: tl.constexpr,
+    N_OFFSET: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    APPLY_MASK: tl.constexpr,
+    mma_mn: tl.constexpr,
+    mma_md: tl.constexpr,
+    kt_op1_mn: tl.constexpr,
+    vt_op1_mn: tl.constexpr,
+    ds_op0_md: tl.constexpr,
+    k_op1_md: tl.constexpr,
+):
+    log2e: tl.constexpr = 1.4426950408889634
+    dq = tlx.require_layout(dq, mma_md, pin=False)
+    q = tlx.require_layout(q, tlx.dot_operand_layout(0, mma_mn, k_width=8), pin=False)
+    do = tlx.require_layout(do, tlx.dot_operand_layout(0, mma_mn, k_width=8), pin=False)
+    k_slice = tlx.local_slice(k_view, [N_OFFSET, 0], [BLOCK_N, D])
+    v_slice = tlx.local_slice(v_view, [N_OFFSET, 0], [BLOCK_N, D])
+    kt = tlx.local_load(tlx.local_trans(k_slice), token=kv_wait, layout=kt_op1_mn)
+    vt = tlx.local_load(tlx.local_trans(v_slice), token=kv_wait, layout=vt_op1_mn)
+    k_nd = tlx.local_load(k_slice, token=kv_wait, layout=k_op1_md)
+
+    row_lse_full = tlx.require_layout(
+        tl.broadcast_to(row_lse[:, None], (64, BLOCK_N)),
+        mma_mn,
+        pin=False,
+    )
+    scores = tlx.zeros((64, BLOCK_N), tl.float32, layout=mma_mn)
+    scores = scores + row_lse_full
+    scores = tl.dot(q, kt, acc=scores, out_dtype=tl.float32)
+    scale = tlx.require_layout(
+        tl.full((64, BLOCK_N), SM_SCALE * log2e, tl.float32),
+        mma_mn,
+        pin=False,
+    )
+    scores = scores * scale
+    if APPLY_MASK:
+        cols = n0 + N_OFFSET + tl.arange(0, BLOCK_N)
+        valid = cols[None, :] <= rows[:, None] + (SKV - SQ)
+        valid = tlx.require_layout(valid, mma_mn, pin=False)
+        negative_inf = tlx.require_layout(
+            tl.full((64, BLOCK_N), float("-inf"), tl.float32),
+            mma_mn,
+            pin=False,
+        )
+        scores = tl.where(valid, scores, negative_inf)
+    p = tlx.require_layout(tl.math.exp2(scores), mma_mn, pin=False)
+
+    row_delta_full = tlx.require_layout(
+        tl.broadcast_to(row_delta[:, None], (64, BLOCK_N)),
+        mma_mn,
+        pin=False,
+    )
+    dp = tlx.zeros((64, BLOCK_N), tl.float32, layout=mma_mn)
+    dp = dp - row_delta_full
+    dp = tl.dot(do, vt, acc=dp, out_dtype=tl.float32)
+    ds = p * dp
+    ds = tlx.require_layout(ds.to(tl.bfloat16), ds_op0_md, pin=False)
+    dq = tl.dot(ds, k_nd, acc=dq, out_dtype=tl.float32)
+    return tlx.require_layout(dq, mma_md, pin=False)
+
+
+@triton.jit
+def _attn_bwd_dq_d64_causal_nslice(
+    dq0,
+    dq1,
+    dq2,
+    dq3,
+    q0,
+    q1,
+    q2,
+    do0,
+    do1,
+    do2,
+    lse0,
+    lse1,
+    lse2,
+    lse3,
+    delta0,
+    delta1,
+    delta2,
+    delta3,
+    rows0,
+    rows1,
+    rows2,
+    rows3,
+    q3_view,
+    do3,
+    k_view,
+    v_view,
+    kv_wait,
+    valid_fragments,
+    tail_step,
+    n0,
+    SM_SCALE: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    STAT_MODE: tl.constexpr,
+    OWNER_FRAGMENTS: tl.constexpr,
+    SKIP_OWNER_TAIL: tl.constexpr,
+    N_OFFSET: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    APPLY_MASK: tl.constexpr,
+    TRIANGULAR_TAIL: tl.constexpr,
+    mma_mn: tl.constexpr,
+    mma_md: tl.constexpr,
+    q_op0_mn: tl.constexpr,
+    kt_op1_mn: tl.constexpr,
+    vt_op1_mn: tl.constexpr,
+    ds_op0_md: tl.constexpr,
+    k_op1_md: tl.constexpr,
+):
+    dq0 = tlx.require_layout(dq0, mma_md, pin=False)
+    dq1 = tlx.require_layout(dq1, mma_md, pin=False)
+    dq2 = tlx.require_layout(dq2, mma_md, pin=False)
+    dq3 = tlx.require_layout(dq3, mma_md, pin=False)
+    if TRIANGULAR_TAIL:
+        # Tail K/V block j intersects fragment j. Earlier fragments are
+        # wholly future and skipped; later valid fragments are fully causal.
+        if tail_step == 0:
+            dq0 = _attn_bwd_dq_d64_causal_step(
+                dq0,
+                q0,
+                do0,
+                lse0,
+                delta0,
+                rows0,
+                k_view,
+                v_view,
+                kv_wait,
+                n0,
+                SM_SCALE,
+                SQ,
+                SKV,
+                D,
+                STAT_MODE,
+                N_OFFSET,
+                BLOCK_N,
+                True,
+                mma_mn,
+                mma_md,
+                kt_op1_mn,
+                vt_op1_mn,
+                ds_op0_md,
+                k_op1_md,
+            )
+            dq0 = tlx.require_layout(dq0, mma_md, pin=False)
+        dq0 = tlx.require_layout(dq0, mma_md, pin=False)
+
+        if not SKIP_OWNER_TAIL or valid_fragments >= 2:
+            if tail_step == 0:
+                dq1 = _attn_bwd_dq_d64_causal_step(
+                    dq1,
+                    q1,
+                    do1,
+                    lse1,
+                    delta1,
+                    rows1,
+                    k_view,
+                    v_view,
+                    kv_wait,
+                    n0,
+                    SM_SCALE,
+                    SQ,
+                    SKV,
+                    D,
+                    STAT_MODE,
+                    N_OFFSET,
+                    BLOCK_N,
+                    False,
+                    mma_mn,
+                    mma_md,
+                    kt_op1_mn,
+                    vt_op1_mn,
+                    ds_op0_md,
+                    k_op1_md,
+                )
+                dq1 = tlx.require_layout(dq1, mma_md, pin=False)
+            elif tail_step == 1:
+                dq1 = _attn_bwd_dq_d64_causal_step(
+                    dq1,
+                    q1,
+                    do1,
+                    lse1,
+                    delta1,
+                    rows1,
+                    k_view,
+                    v_view,
+                    kv_wait,
+                    n0,
+                    SM_SCALE,
+                    SQ,
+                    SKV,
+                    D,
+                    STAT_MODE,
+                    N_OFFSET,
+                    BLOCK_N,
+                    True,
+                    mma_mn,
+                    mma_md,
+                    kt_op1_mn,
+                    vt_op1_mn,
+                    ds_op0_md,
+                    k_op1_md,
+                )
+                dq1 = tlx.require_layout(dq1, mma_md, pin=False)
+        dq1 = tlx.require_layout(dq1, mma_md, pin=False)
+
+        if OWNER_FRAGMENTS >= 3:
+            if not SKIP_OWNER_TAIL or valid_fragments >= 3:
+                if tail_step < 2:
+                    dq2 = _attn_bwd_dq_d64_causal_step(
+                        dq2,
+                        q2,
+                        do2,
+                        lse2,
+                        delta2,
+                        rows2,
+                        k_view,
+                        v_view,
+                        kv_wait,
+                        n0,
+                        SM_SCALE,
+                        SQ,
+                        SKV,
+                        D,
+                        STAT_MODE,
+                        N_OFFSET,
+                        BLOCK_N,
+                        False,
+                        mma_mn,
+                        mma_md,
+                        kt_op1_mn,
+                        vt_op1_mn,
+                        ds_op0_md,
+                        k_op1_md,
+                    )
+                    dq2 = tlx.require_layout(dq2, mma_md, pin=False)
+                elif tail_step == 2:
+                    dq2 = _attn_bwd_dq_d64_causal_step(
+                        dq2,
+                        q2,
+                        do2,
+                        lse2,
+                        delta2,
+                        rows2,
+                        k_view,
+                        v_view,
+                        kv_wait,
+                        n0,
+                        SM_SCALE,
+                        SQ,
+                        SKV,
+                        D,
+                        STAT_MODE,
+                        N_OFFSET,
+                        BLOCK_N,
+                        True,
+                        mma_mn,
+                        mma_md,
+                        kt_op1_mn,
+                        vt_op1_mn,
+                        ds_op0_md,
+                        k_op1_md,
+                    )
+                    dq2 = tlx.require_layout(dq2, mma_md, pin=False)
+        dq2 = tlx.require_layout(dq2, mma_md, pin=False)
+
+        if OWNER_FRAGMENTS == 4:
+            if not SKIP_OWNER_TAIL or valid_fragments >= 4:
+                if tail_step < 3:
+                    q3 = tlx.local_load(q3_view, layout=q_op0_mn)
+                    dq3 = _attn_bwd_dq_d64_causal_step(
+                        dq3,
+                        q3,
+                        do3,
+                        lse3,
+                        delta3,
+                        rows3,
+                        k_view,
+                        v_view,
+                        kv_wait,
+                        n0,
+                        SM_SCALE,
+                        SQ,
+                        SKV,
+                        D,
+                        STAT_MODE,
+                        N_OFFSET,
+                        BLOCK_N,
+                        False,
+                        mma_mn,
+                        mma_md,
+                        kt_op1_mn,
+                        vt_op1_mn,
+                        ds_op0_md,
+                        k_op1_md,
+                    )
+                    dq3 = tlx.require_layout(dq3, mma_md, pin=False)
+                elif tail_step == 3:
+                    q3 = tlx.local_load(q3_view, layout=q_op0_mn)
+                    dq3 = _attn_bwd_dq_d64_causal_step(
+                        dq3,
+                        q3,
+                        do3,
+                        lse3,
+                        delta3,
+                        rows3,
+                        k_view,
+                        v_view,
+                        kv_wait,
+                        n0,
+                        SM_SCALE,
+                        SQ,
+                        SKV,
+                        D,
+                        STAT_MODE,
+                        N_OFFSET,
+                        BLOCK_N,
+                        True,
+                        mma_mn,
+                        mma_md,
+                        kt_op1_mn,
+                        vt_op1_mn,
+                        ds_op0_md,
+                        k_op1_md,
+                    )
+                    dq3 = tlx.require_layout(dq3, mma_md, pin=False)
+        dq3 = tlx.require_layout(dq3, mma_md, pin=False)
+    else:
+        dq0 = _attn_bwd_dq_d64_causal_step(
+            dq0,
+            q0,
+            do0,
+            lse0,
+            delta0,
+            rows0,
+            k_view,
+            v_view,
+            kv_wait,
+            n0,
+            SM_SCALE,
+            SQ,
+            SKV,
+            D,
+            STAT_MODE,
+            N_OFFSET,
+            BLOCK_N,
+            APPLY_MASK,
+            mma_mn,
+            mma_md,
+            kt_op1_mn,
+            vt_op1_mn,
+            ds_op0_md,
+            k_op1_md,
+        )
+        dq0 = tlx.require_layout(dq0, mma_md, pin=False)
+        if not SKIP_OWNER_TAIL or valid_fragments >= 2:
+            dq1 = _attn_bwd_dq_d64_causal_step(
+                dq1,
+                q1,
+                do1,
+                lse1,
+                delta1,
+                rows1,
+                k_view,
+                v_view,
+                kv_wait,
+                n0,
+                SM_SCALE,
+                SQ,
+                SKV,
+                D,
+                STAT_MODE,
+                N_OFFSET,
+                BLOCK_N,
+                APPLY_MASK,
+                mma_mn,
+                mma_md,
+                kt_op1_mn,
+                vt_op1_mn,
+                ds_op0_md,
+                k_op1_md,
+            )
+            dq1 = tlx.require_layout(dq1, mma_md, pin=False)
+        if OWNER_FRAGMENTS >= 3:
+            if not SKIP_OWNER_TAIL or valid_fragments >= 3:
+                dq2 = _attn_bwd_dq_d64_causal_step(
+                    dq2,
+                    q2,
+                    do2,
+                    lse2,
+                    delta2,
+                    rows2,
+                    k_view,
+                    v_view,
+                    kv_wait,
+                    n0,
+                    SM_SCALE,
+                    SQ,
+                    SKV,
+                    D,
+                    STAT_MODE,
+                    N_OFFSET,
+                    BLOCK_N,
+                    APPLY_MASK,
+                    mma_mn,
+                    mma_md,
+                    kt_op1_mn,
+                    vt_op1_mn,
+                    ds_op0_md,
+                    k_op1_md,
+                )
+                dq2 = tlx.require_layout(dq2, mma_md, pin=False)
+        if OWNER_FRAGMENTS == 4:
+            if not SKIP_OWNER_TAIL or valid_fragments >= 4:
+                q3 = tlx.local_load(q3_view, layout=q_op0_mn)
+                dq3 = _attn_bwd_dq_d64_causal_step(
+                    dq3,
+                    q3,
+                    do3,
+                    lse3,
+                    delta3,
+                    rows3,
+                    k_view,
+                    v_view,
+                    kv_wait,
+                    n0,
+                    SM_SCALE,
+                    SQ,
+                    SKV,
+                    D,
+                    STAT_MODE,
+                    N_OFFSET,
+                    BLOCK_N,
+                    APPLY_MASK,
+                    mma_mn,
+                    mma_md,
+                    kt_op1_mn,
+                    vt_op1_mn,
+                    ds_op0_md,
+                    k_op1_md,
+                )
+                dq3 = tlx.require_layout(dq3, mma_md, pin=False)
+    dq0 = tlx.require_layout(dq0, mma_md, pin=False)
+    dq1 = tlx.require_layout(dq1, mma_md, pin=False)
+    dq2 = tlx.require_layout(dq2, mma_md, pin=False)
+    dq3 = tlx.require_layout(dq3, mma_md, pin=False)
+    return dq0, dq1, dq2, dq3
+
+
+@triton.jit
+def _attn_bwd_dq_d64_causal_store_q64(
+    DQ,
+    q_base,
+    dq,
+    row_start,
+    store_end,
+    SM_SCALE: tl.constexpr,
+    D: tl.constexpr,
+    out_layout: tl.constexpr,
+):
+    rows = row_start + tl.arange(0, 64)
+    cols = tl.arange(0, D)
+    offsets = (rows[:, None] * D + cols[None, :]).to(tl.int32)
+    offsets = tlx.require_layout(offsets, out_layout, pin=False)
+    mask = tl.broadcast_to(rows[:, None] < store_end, offsets.shape)
+    mask = tlx.require_layout(mask, out_layout, pin=False)
+    dq = tlx.require_layout(
+        dq,
+        tlx.amd_mfma_layout(
+            version=4,
+            instr_shape=[16, 16, 32],
+            transposed=True,
+            warps_per_cta=[4, 1],
+        ),
+        pin=False,
+    )
+    scale = tlx.require_layout(
+        tl.full((64, D), SM_SCALE, tl.float32),
+        tlx.amd_mfma_layout(
+            version=4,
+            instr_shape=[16, 16, 32],
+            transposed=True,
+            warps_per_cta=[4, 1],
+        ),
+        pin=False,
+    )
+    out = tlx.require_layout((dq * scale).to(tl.bfloat16), out_layout, pin=False)
+    tlx.buffer_store(out, DQ + q_base, offsets, mask=mask)
+
+
+@triton.jit
+def _attn_bwd_dq_d64_causal_impl(
+    Q,
+    K,
+    V,
+    O,
+    DO,
+    LSE,
+    DELTA,
+    LSE_TERM,
+    DQ,
+    SM_SCALE: tl.constexpr,
+    HQ: tl.constexpr,
+    HKV: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    OWNER_ROWS: tl.constexpr,
+    LOGICAL_N: tl.constexpr,
+    USE_DQ_XCD: tl.constexpr,
+    SKIP_OWNER_TAIL: tl.constexpr,
+    OWNER_PID_BASE: tl.constexpr,
+    LAUNCH_Q_TILES: tl.constexpr,
+    OWNER_FRAGMENTS: tl.constexpr,
+    GRID_OWNER_M: tl.constexpr,
+    STAT_MODE: tl.constexpr,
+):
+    tl.static_assert(D == 64)
+    tl.static_assert(HQ % HKV == 0)
+    tl.static_assert(SQ % 64 == 0 and SKV % 64 == 0 and SQ <= SKV)
+    tl.static_assert(OWNER_ROWS == 192 or OWNER_ROWS == 256)
+    tl.static_assert(OWNER_FRAGMENTS == 2 or OWNER_FRAGMENTS == 3 or OWNER_FRAGMENTS == 4)
+    tl.static_assert(LOGICAL_N == 32 or LOGICAL_N == 64)
+    tl.static_assert(STAT_MODE == _D64_MHA_POSITIVE_JIT or STAT_MODE == _D64_GQA_SIGNED_JIT)
+
+    grid_owner_m: tl.constexpr = (OWNER_FRAGMENTS * 64 if GRID_OWNER_M == 0 else GRID_OWNER_M)
+    tl.static_assert(grid_owner_m == OWNER_ROWS)
+    num_owners: tl.constexpr = tl.cdiv(SQ, grid_owner_m)
+    launch_q_tiles: tl.constexpr = (num_owners if LAUNCH_Q_TILES == 0 else LAUNCH_Q_TILES)
+    group: tl.constexpr = HQ // HKV
+    value = tl.program_id(0)
+    if USE_DQ_XCD:
+        xcd = value % 8
+        value //= 8
+        q_in_group = value % group
+        value //= group
+        local_owner = value % launch_q_tiles
+        bkv_group = value // launch_q_tiles
+        bkv = bkv_group * 8 + xcd
+        pid_hkv = bkv % HKV
+        pid_b = bkv // HKV
+    else:
+        pid_hkv = value % HKV
+        value //= HKV
+        q_in_group = value % group
+        value //= group
+        local_owner = value % launch_q_tiles
+        pid_b = value // launch_q_tiles
+    pid_hq = pid_hkv * group + q_in_group
+    physical_owner = OWNER_PID_BASE + local_owner
+
+    reverse_owner = num_owners - 1 - physical_owner
+    pad: tl.constexpr = num_owners * grid_owner_m - SQ
+    raw_start = reverse_owner * grid_owner_m
+    owner_start = tl.maximum(raw_start - pad, 0)
+    owner_end = raw_start + grid_owner_m - pad
+    store_end = tl.minimum(owner_end, SQ)
+
+    q_head = (pid_b * HQ + pid_hq).to(tl.int64)
+    kv_head = (pid_b * HKV + pid_hkv).to(tl.int64)
+    q_base = q_head * SQ * D
+    kv_base = kv_head * SKV * D
+    stats_base = q_head * SQ
+
+    mma_mn: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[4, 1],
+    )
+    mma_md: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[4, 1],
+    )
+    q_op0_mn: tl.constexpr = tlx.dot_operand_layout(0, mma_mn, k_width=8)
+    kt_op1_mn: tl.constexpr = tlx.dot_operand_layout(1, mma_mn, k_width=8)
+    vt_op1_mn: tl.constexpr = tlx.dot_operand_layout(1, mma_mn, k_width=8)
+    ds_op0_md: tl.constexpr = tlx.dot_operand_layout(0, mma_md, k_width=4)
+    k_op1_md: tl.constexpr = tlx.dot_operand_layout(1, mma_md, k_width=4)
+
+    kv_async_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2)),
+        stride=((8, 64, 128, 256, 512, 16, 32, 2048), (1, 2, 4, 1024)),
+    )
+    out_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2)),
+        stride=((64, 128, 256, 512, 8, 16, 1024, 2048), (1, 2, 4, 32)),
+    )
+    shared_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 8)],
+        [
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+            [0, 16],
+            [0, 32],
+            [16, 0],
+            [32, 0],
+        ],
+        [64, 64],
+    )
+    k_buffers = tlx.local_alloc((64, 64), tl.bfloat16, 2, layout=shared_layout)
+    v_buffers = tlx.local_alloc((64, 64), tl.bfloat16, 2, layout=shared_layout)
+    q3_buffer = tlx.local_alloc((64, 64), tl.bfloat16, 1, layout=shared_layout)
+
+    q0, do0, lse0, delta0, rows0 = _attn_bwd_dq_d64_causal_load_q64(
+        Q,
+        O,
+        DO,
+        LSE,
+        DELTA,
+        LSE_TERM,
+        q_base,
+        stats_base,
+        owner_start,
+        store_end,
+        SM_SCALE,
+        SQ,
+        D,
+        STAT_MODE,
+        q_op0_mn,
+    )
+    q1, do1, lse1, delta1, rows1 = _attn_bwd_dq_d64_causal_load_q64(
+        Q,
+        O,
+        DO,
+        LSE,
+        DELTA,
+        LSE_TERM,
+        q_base,
+        stats_base,
+        owner_start + 64,
+        store_end,
+        SM_SCALE,
+        SQ,
+        D,
+        STAT_MODE,
+        q_op0_mn,
+    )
+    if OWNER_FRAGMENTS >= 3:
+        q2, do2, lse2, delta2, rows2 = _attn_bwd_dq_d64_causal_load_q64(
+            Q,
+            O,
+            DO,
+            LSE,
+            DELTA,
+            LSE_TERM,
+            q_base,
+            stats_base,
+            owner_start + 128,
+            store_end,
+            SM_SCALE,
+            SQ,
+            D,
+            STAT_MODE,
+            q_op0_mn,
+        )
+    else:
+        q2, do2, lse2, delta2, rows2 = q0, do0, lse0, delta0, rows0
+    if OWNER_FRAGMENTS == 4:
+        q3, do3, lse3, delta3, rows3 = _attn_bwd_dq_d64_causal_load_q64(
+            Q,
+            O,
+            DO,
+            LSE,
+            DELTA,
+            LSE_TERM,
+            q_base,
+            stats_base,
+            owner_start + 192,
+            store_end,
+            SM_SCALE,
+            SQ,
+            D,
+            STAT_MODE,
+            q_op0_mn,
+        )
+        tlx.local_store(tlx.local_view(q3_buffer, 0), q3)
+        tl.debug_barrier()
+    else:
+        do3, lse3, delta3, rows3 = do0, lse0, delta0, rows0
+
+    dq0 = tlx.zeros((64, 64), tl.float32, layout=mma_md)
+    dq1 = tlx.zeros((64, 64), tl.float32, layout=mma_md)
+    dq2 = tlx.zeros((64, 64), tl.float32, layout=mma_md)
+    dq3 = tlx.zeros((64, 64), tl.float32, layout=mma_md)
+
+    offs_n = tl.arange(0, 64)
+    offs_d = tl.arange(0, D)
+    first_offsets = (offs_n[:, None] * D + offs_d[None, :]).to(tl.int32)
+    first_offsets = tlx.require_layout(first_offsets, kv_async_layout, pin=False)
+    first_k = tlx.buffer_load_to_local(tlx.local_view(k_buffers, 0), K + kv_base, first_offsets)
+    first_v = tlx.buffer_load_to_local(tlx.local_view(v_buffers, 0), V + kv_base, first_offsets)
+    tlx.async_load_commit_group([first_k, first_v])
+
+    bulk_end_block = (owner_start + (SKV - SQ)) // 64
+    end_n_block = tl.minimum(
+        (owner_end - 1 + (SKV - SQ)) // 64 + 1,
+        SKV // 64,
+    )
+    valid_fragments = (store_end - owner_start + 63) // 64
+    for n_block in range(0, bulk_end_block):
+        current_slot = n_block % 2
+        next_slot = 1 - current_slot
+        tl.debug_barrier()
+        if n_block + 1 < end_n_block:
+            next_offsets = ((n_block + 1) * 64 * D + offs_n[:, None] * D + offs_d[None, :]).to(tl.int32)
+            next_offsets = tlx.require_layout(next_offsets, kv_async_layout, pin=False)
+            next_k = tlx.buffer_load_to_local(
+                tlx.local_view(k_buffers, next_slot),
+                K + kv_base,
+                next_offsets,
+            )
+            next_v = tlx.buffer_load_to_local(
+                tlx.local_view(v_buffers, next_slot),
+                V + kv_base,
+                next_offsets,
+            )
+            tlx.async_load_commit_group([next_k, next_v])
+            kv_wait = tlx.async_load_wait_group(1)
+        else:
+            kv_wait = tlx.async_load_wait_group(0)
+        k_view = tlx.local_view(k_buffers, current_slot)
+        v_view = tlx.local_view(v_buffers, current_slot)
+        n0 = n_block * 64
+        if LOGICAL_N == 32:
+            dq0, dq1, dq2, dq3 = _attn_bwd_dq_d64_causal_nslice(
+                dq0, dq1, dq2, dq3, q0, q1, q2, do0, do1, do2, lse0,
+                lse1, lse2, lse3, delta0, delta1, delta2, delta3, rows0, rows1, rows2, rows3,
+                tlx.local_view(q3_buffer, 0), do3, k_view, v_view, kv_wait, valid_fragments, 0, n0, SM_SCALE, SQ, SKV,
+                D, STAT_MODE, OWNER_FRAGMENTS, SKIP_OWNER_TAIL, 0, 32, False, False, mma_mn, mma_md, q_op0_mn,
+                kt_op1_mn, vt_op1_mn, ds_op0_md, k_op1_md)
+            dq0, dq1, dq2, dq3 = _attn_bwd_dq_d64_causal_nslice(
+                dq0, dq1, dq2, dq3, q0, q1, q2, do0, do1, do2, lse0,
+                lse1, lse2, lse3, delta0, delta1, delta2, delta3, rows0, rows1, rows2, rows3,
+                tlx.local_view(q3_buffer, 0), do3, k_view, v_view, kv_wait, valid_fragments, 0, n0, SM_SCALE, SQ, SKV,
+                D, STAT_MODE, OWNER_FRAGMENTS, SKIP_OWNER_TAIL, 32, 32, False, False, mma_mn, mma_md, q_op0_mn,
+                kt_op1_mn, vt_op1_mn, ds_op0_md, k_op1_md)
+        else:
+            dq0, dq1, dq2, dq3 = _attn_bwd_dq_d64_causal_nslice(
+                dq0, dq1, dq2, dq3, q0, q1, q2, do0, do1, do2, lse0,
+                lse1, lse2, lse3, delta0, delta1, delta2, delta3, rows0, rows1, rows2, rows3,
+                tlx.local_view(q3_buffer, 0), do3, k_view, v_view, kv_wait, valid_fragments, 0, n0, SM_SCALE, SQ, SKV,
+                D, STAT_MODE, OWNER_FRAGMENTS, SKIP_OWNER_TAIL, 0, 64, False, False, mma_mn, mma_md, q_op0_mn,
+                kt_op1_mn, vt_op1_mn, ds_op0_md, k_op1_md)
+
+    for n_block in range(bulk_end_block, end_n_block):
+        current_slot = n_block % 2
+        next_slot = 1 - current_slot
+        tl.debug_barrier()
+        if n_block + 1 < end_n_block:
+            next_offsets = ((n_block + 1) * 64 * D + offs_n[:, None] * D + offs_d[None, :]).to(tl.int32)
+            next_offsets = tlx.require_layout(next_offsets, kv_async_layout, pin=False)
+            next_k = tlx.buffer_load_to_local(
+                tlx.local_view(k_buffers, next_slot),
+                K + kv_base,
+                next_offsets,
+            )
+            next_v = tlx.buffer_load_to_local(
+                tlx.local_view(v_buffers, next_slot),
+                V + kv_base,
+                next_offsets,
+            )
+            tlx.async_load_commit_group([next_k, next_v])
+            kv_wait = tlx.async_load_wait_group(1)
+        else:
+            kv_wait = tlx.async_load_wait_group(0)
+        k_view = tlx.local_view(k_buffers, current_slot)
+        v_view = tlx.local_view(v_buffers, current_slot)
+        n0 = n_block * 64
+        if LOGICAL_N == 32:
+            dq0, dq1, dq2, dq3 = _attn_bwd_dq_d64_causal_nslice(
+                dq0, dq1, dq2, dq3, q0, q1, q2, do0, do1, do2, lse0,
+                lse1, lse2, lse3, delta0, delta1, delta2, delta3, rows0, rows1, rows2, rows3,
+                tlx.local_view(q3_buffer, 0), do3, k_view, v_view, kv_wait, valid_fragments, n_block - bulk_end_block,
+                n0, SM_SCALE, SQ, SKV, D, STAT_MODE, OWNER_FRAGMENTS, SKIP_OWNER_TAIL, 0, 32, True, True, mma_mn,
+                mma_md, q_op0_mn, kt_op1_mn, vt_op1_mn, ds_op0_md, k_op1_md)
+            dq0, dq1, dq2, dq3 = _attn_bwd_dq_d64_causal_nslice(
+                dq0, dq1, dq2, dq3, q0, q1, q2, do0, do1, do2, lse0,
+                lse1, lse2, lse3, delta0, delta1, delta2, delta3, rows0, rows1, rows2, rows3,
+                tlx.local_view(q3_buffer, 0), do3, k_view, v_view, kv_wait, valid_fragments, n_block - bulk_end_block,
+                n0, SM_SCALE, SQ, SKV, D, STAT_MODE, OWNER_FRAGMENTS, SKIP_OWNER_TAIL, 32, 32, True, True, mma_mn,
+                mma_md, q_op0_mn, kt_op1_mn, vt_op1_mn, ds_op0_md, k_op1_md)
+        else:
+            dq0, dq1, dq2, dq3 = _attn_bwd_dq_d64_causal_nslice(
+                dq0, dq1, dq2, dq3, q0, q1, q2, do0, do1, do2, lse0,
+                lse1, lse2, lse3, delta0, delta1, delta2, delta3, rows0, rows1, rows2, rows3,
+                tlx.local_view(q3_buffer, 0), do3, k_view, v_view, kv_wait, valid_fragments, n_block - bulk_end_block,
+                n0, SM_SCALE, SQ, SKV, D, STAT_MODE, OWNER_FRAGMENTS, SKIP_OWNER_TAIL, 0, 64, True, True, mma_mn,
+                mma_md, q_op0_mn, kt_op1_mn, vt_op1_mn, ds_op0_md, k_op1_md)
+    tlx.async_load_wait_group(0)
+    tl.debug_barrier()
+
+    _attn_bwd_dq_d64_causal_store_q64(DQ, q_base, dq0, owner_start, store_end, SM_SCALE, D, out_layout)
+    if not SKIP_OWNER_TAIL or owner_start + 64 < store_end:
+        _attn_bwd_dq_d64_causal_store_q64(DQ, q_base, dq1, owner_start + 64, store_end, SM_SCALE, D, out_layout)
+    if OWNER_FRAGMENTS >= 3:
+        if not SKIP_OWNER_TAIL or owner_start + 128 < store_end:
+            _attn_bwd_dq_d64_causal_store_q64(DQ, q_base, dq2, owner_start + 128, store_end, SM_SCALE, D, out_layout)
+    if OWNER_FRAGMENTS == 4:
+        if not SKIP_OWNER_TAIL or owner_start + 192 < store_end:
+            _attn_bwd_dq_d64_causal_store_q64(DQ, q_base, dq3, owner_start + 192, store_end, SM_SCALE, D, out_layout)
+
+
+@triton.jit
+def _attn_bwd_dq_d64_causal_mha_kernel(
+    Q,
+    K,
+    V,
+    O,
+    DO,
+    LSE,
+    DELTA,
+    DQ,
+    SM_SCALE: tl.constexpr,
+    HQ: tl.constexpr,
+    HKV: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    OWNER_ROWS: tl.constexpr,
+    LOGICAL_N: tl.constexpr,
+    USE_DQ_XCD: tl.constexpr,
+    SKIP_OWNER_TAIL: tl.constexpr,
+    OWNER_PID_BASE: tl.constexpr,
+    LAUNCH_Q_TILES: tl.constexpr,
+    OWNER_FRAGMENTS: tl.constexpr,
+    GRID_OWNER_M: tl.constexpr,
+):
+    _attn_bwd_dq_d64_causal_impl(Q, K, V, O, DO, LSE, DELTA, DELTA, DQ, SM_SCALE, HQ, HKV, SQ, SKV, D, OWNER_ROWS,
+                                 LOGICAL_N, USE_DQ_XCD, SKIP_OWNER_TAIL, OWNER_PID_BASE, LAUNCH_Q_TILES,
+                                 OWNER_FRAGMENTS, GRID_OWNER_M, _D64_MHA_POSITIVE_JIT)
+
+
+@triton.jit
+def _attn_bwd_dq_d64_causal_gqa8_kernel(
+    Q,
+    K,
+    V,
+    O,
+    DO,
+    LSE,
+    DELTA,
+    LSE_TERM,
+    DQ,
+    SM_SCALE: tl.constexpr,
+    HQ: tl.constexpr,
+    HKV: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    OWNER_ROWS: tl.constexpr,
+    LOGICAL_N: tl.constexpr,
+    USE_DQ_XCD: tl.constexpr,
+    SKIP_OWNER_TAIL: tl.constexpr,
+    OWNER_PID_BASE: tl.constexpr,
+    LAUNCH_Q_TILES: tl.constexpr,
+    OWNER_FRAGMENTS: tl.constexpr,
+    GRID_OWNER_M: tl.constexpr,
+):
+    _attn_bwd_dq_d64_causal_impl(Q, K, V, O, DO, LSE, DELTA, LSE_TERM, DQ, SM_SCALE, HQ, HKV, SQ, SKV, D, OWNER_ROWS,
+                                 LOGICAL_N, USE_DQ_XCD, SKIP_OWNER_TAIL, OWNER_PID_BASE, LAUNCH_Q_TILES,
+                                 OWNER_FRAGMENTS, GRID_OWNER_M, _D64_GQA_SIGNED_JIT)
+
+
+@triton.jit
+def _d64_mha_issue_stage(
+    Q,
+    DO,
+    LSE,
+    Delta,
+    q_dst,
+    do_dst,
+    lse_dst,
+    delta_dst,
+    m_blk,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    q_async_layout: tl.constexpr,
+    stats_async_layout: tl.constexpr,
+):
+    """Stage one complete BM32 Q/dO/natural-stat tile."""
+    rows = m_blk * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = tl.arange(0, D)
+    q_offsets = (rows[:, None] * D + cols[None, :]).to(tl.int32)
+    q_offsets = tlx.require_layout(q_offsets, q_async_layout, pin=False)
+    stats_offsets = tlx.require_layout(rows.to(tl.int32), stats_async_layout, pin=False)
+    q_token = tlx.buffer_load_to_local(q_dst, Q, q_offsets)
+    do_token = tlx.buffer_load_to_local(do_dst, DO, q_offsets)
+    lse = tlx.buffer_load(LSE, stats_offsets)
+    delta = tlx.buffer_load(Delta, stats_offsets)
+    tlx.local_store(lse_dst, lse)
+    tlx.local_store(delta_dst, delta)
+    tlx.async_load_commit_group([q_token, do_token])
+
+
+@triton.jit
+def _d64_mha_positive_front(
+    q_view,
+    do_view,
+    lse_view,
+    delta_view,
+    stage_wait,
+    k_nm,
+    v_nm,
+    m_blk,
+    n0,
+    SM_SCALE: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    APPLY_CAUSAL_MASK: tl.constexpr,
+    mma_nm: tl.constexpr,
+    q_t_op1_nm: tl.constexpr,
+    p_op0_nd: tl.constexpr,
+):
+    """Reconstruct positive-ABI P and dS from one staged BM32 tile."""
+    log2e: tl.constexpr = 1.4426950408889634
+    q_t = tlx.local_load(tlx.local_trans(q_view), token=stage_wait, layout=q_t_op1_nm)
+    do_t = tlx.local_load(tlx.local_trans(do_view), token=stage_wait, layout=q_t_op1_nm)
+    lse = tlx.local_load(lse_view, token=stage_wait, relaxed=True)
+    delta = tlx.local_load(delta_view, token=stage_wait, relaxed=True)
+
+    scores = tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=mma_nm)
+    scores = tl.dot(k_nm, q_t, acc=scores, out_dtype=tl.float32)
+    score_scale = tlx.require_layout(
+        tl.full((BLOCK_N, BLOCK_M), SM_SCALE, tl.float32),
+        mma_nm,
+        pin=False,
+    )
+    lse_nm = tlx.require_layout(
+        tl.broadcast_to(lse[None, :], (BLOCK_N, BLOCK_M)),
+        mma_nm,
+        pin=False,
+    )
+    log2e_nm = tlx.require_layout(
+        tl.full((BLOCK_N, BLOCK_M), log2e, tl.float32),
+        mma_nm,
+        pin=False,
+    )
+    # P = exp2((QK * SM_SCALE - LSE) * log2(e)).
+    scores = (scores * score_scale - lse_nm) * log2e_nm
+    if APPLY_CAUSAL_MASK:
+        rows = m_blk * BLOCK_M + tl.arange(0, BLOCK_M)
+        cols = n0 + tl.arange(0, BLOCK_N)
+        valid = cols[:, None] <= rows[None, :] + (SKV - SQ)
+        valid = tlx.require_layout(valid, mma_nm, pin=False)
+        negative_inf = tlx.require_layout(
+            tl.full(
+                (BLOCK_N, BLOCK_M),
+                float("-inf"),
+                tl.float32,
+            ),
+            mma_nm,
+            pin=False,
+        )
+        scores = tl.where(valid, scores, negative_inf)
+    p = tlx.require_layout(tl.math.exp2(scores), mma_nm, pin=False)
+
+    dp = tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=mma_nm)
+    dp = tl.dot(v_nm, do_t, acc=dp, out_dtype=tl.float32)
+    delta_nm = tlx.require_layout(
+        tl.broadcast_to(delta[None, :], (BLOCK_N, BLOCK_M)),
+        mma_nm,
+        pin=False,
+    )
+    # dS = P * (dO @ V.T - Delta).
+    ds = p * (dp - delta_nm)
+    p_nd = tlx.require_layout(p.to(tl.bfloat16), p_op0_nd, pin=False)
+    ds_nd = tlx.require_layout(ds.to(tl.bfloat16), p_op0_nd, pin=False)
+    return p_nd, ds_nd
+
+
+@triton.jit
+def _d64_mha_step(
+    dk,
+    dv,
+    q_view,
+    do_view,
+    lse_view,
+    delta_view,
+    stage_wait,
+    k_nm,
+    v_nm,
+    m_blk,
+    n0,
+    SM_SCALE: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    APPLY_CAUSAL_MASK: tl.constexpr,
+    mma_nm: tl.constexpr,
+    mma_nd: tl.constexpr,
+    q_t_op1_nm: tl.constexpr,
+    p_op0_nd: tl.constexpr,
+    q_op1_nd: tl.constexpr,
+):
+    dk = tlx.require_layout(dk, mma_nd, pin=False)
+    dv = tlx.require_layout(dv, mma_nd, pin=False)
+    p_nd, ds_nd = _d64_mha_positive_front(
+        q_view,
+        do_view,
+        lse_view,
+        delta_view,
+        stage_wait,
+        k_nm,
+        v_nm,
+        m_blk,
+        n0,
+        SM_SCALE,
+        SQ,
+        SKV,
+        BLOCK_M,
+        BLOCK_N,
+        APPLY_CAUSAL_MASK,
+        mma_nm,
+        q_t_op1_nm,
+        p_op0_nd,
+    )
+    do_nd = tlx.local_load(do_view, token=stage_wait, layout=q_op1_nd)
+    q_nd = tlx.local_load(q_view, token=stage_wait, layout=q_op1_nd)
+    dv = tl.dot(p_nd, do_nd, acc=dv, out_dtype=tl.float32)
+    dk = tl.dot(ds_nd, q_nd, acc=dk, out_dtype=tl.float32)
+    return (
+        tlx.require_layout(dk, mma_nd, pin=False),
+        tlx.require_layout(dv, mma_nd, pin=False),
+    )
+
+
+@triton.jit
+def _d64_mha_consume(
+    dk,
+    dv,
+    q_view,
+    do_view,
+    lse_view,
+    delta_view,
+    stage_wait,
+    k_nm,
+    v_nm,
+    m_blk,
+    n0,
+    SM_SCALE: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    mma_nm: tl.constexpr,
+    mma_nd: tl.constexpr,
+    q_t_op1_nm: tl.constexpr,
+    p_op0_nd: tl.constexpr,
+    q_op1_nd: tl.constexpr,
+):
+    dk = tlx.require_layout(dk, mma_nd, pin=False)
+    dv = tlx.require_layout(dv, mma_nd, pin=False)
+    if n0 + BLOCK_N - 1 > m_blk * BLOCK_M + (SKV - SQ):
+        dk, dv = _d64_mha_step(
+            dk,
+            dv,
+            q_view,
+            do_view,
+            lse_view,
+            delta_view,
+            stage_wait,
+            k_nm,
+            v_nm,
+            m_blk,
+            n0,
+            SM_SCALE,
+            SQ,
+            SKV,
+            D,
+            BLOCK_M,
+            BLOCK_N,
+            True,
+            mma_nm,
+            mma_nd,
+            q_t_op1_nm,
+            p_op0_nd,
+            q_op1_nd,
+        )
+        dk = tlx.require_layout(dk, mma_nd, pin=False)
+        dv = tlx.require_layout(dv, mma_nd, pin=False)
+    else:
+        dk, dv = _d64_mha_step(
+            dk,
+            dv,
+            q_view,
+            do_view,
+            lse_view,
+            delta_view,
+            stage_wait,
+            k_nm,
+            v_nm,
+            m_blk,
+            n0,
+            SM_SCALE,
+            SQ,
+            SKV,
+            D,
+            BLOCK_M,
+            BLOCK_N,
+            False,
+            mma_nm,
+            mma_nd,
+            q_t_op1_nm,
+            p_op0_nd,
+            q_op1_nd,
+        )
+        dk = tlx.require_layout(dk, mma_nd, pin=False)
+        dv = tlx.require_layout(dv, mma_nd, pin=False)
+    return (
+        tlx.require_layout(dk, mma_nd, pin=False),
+        tlx.require_layout(dv, mma_nd, pin=False),
+    )
+
+
+@triton.jit
+def _attn_bwd_dkdv_d64_causal_mha_kernel(
+    Q,
+    K,
+    V,
+    DO,
+    LSE,
+    Delta,
+    DK,
+    DV,
+    SM_SCALE: tl.constexpr,
+    HQ: tl.constexpr,
+    HKV: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    LSE_MODE: tl.constexpr,
+    DELTA_MODE: tl.constexpr,
+):
+    """Two-wave BM32/BN64 causal MHA owner with direct publication."""
+    tl.static_assert(HQ == HKV)
+    tl.static_assert(D == 64)
+    tl.static_assert(BLOCK_M == 32)
+    tl.static_assert(BLOCK_N == 64)
+    tl.static_assert(SQ % BLOCK_M == 0 and SKV % BLOCK_N == 0)
+    tl.static_assert(SQ % 64 == 0 and SKV % 64 == 0)
+    tl.static_assert(SQ <= SKV)
+    tl.static_assert(LSE_MODE == _D64_LSE_NATURAL_LOG_JIT)
+    tl.static_assert(DELTA_MODE == _D64_DELTA_POSITIVE_JIT)
+
+    value = tl.program_id(0)
+    nt = SKV // BLOCK_N
+    pid_n = value % nt
+    value //= nt
+    pid_hkv = value % HKV
+    pid_b = value // HKV
+    n0 = pid_n * BLOCK_N
+
+    mma_nm: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[2, 1],
+    )
+    mma_nd: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[2, 1],
+    )
+    k_op0_nm: tl.constexpr = tlx.dot_operand_layout(0, mma_nm, k_width=8)
+    v_op0_nm: tl.constexpr = tlx.dot_operand_layout(0, mma_nm, k_width=8)
+    q_t_op1_nm: tl.constexpr = tlx.dot_operand_layout(1, mma_nm, k_width=8)
+    p_op0_nd: tl.constexpr = tlx.dot_operand_layout(0, mma_nd, k_width=4)
+    q_op1_nd: tl.constexpr = tlx.dot_operand_layout(1, mma_nd, k_width=4)
+
+    # Two waves cooperatively copy one BM32xD64 tile with D8 vectors.
+    q_async_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2)),
+        stride=((8, 64, 128, 256, 512, 16, 32), (1, 2, 4, 1024)),
+    )
+    stats_async_layout: tl.constexpr = tlx.layout(
+        shape=((32, 4), ()),
+        stride=((1, 0), ()),
+    )
+    out_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2, 2)),
+        stride=(
+            (64, 128, 256, 512, 8, 16, 1024),
+            (1, 2, 4, 32, 2048),
+        ),
+    )
+    qdo_smem_layout: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+            [0, 16],
+            [0, 32],
+            [16, 0],
+        ],
+        block_bases=[],
+        alignment=16,
+    )
+    stats_smem_layout: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[[1], [2], [4], [8], [16]],
+        block_bases=[],
+        alignment=4,
+    )
+    q_ring = tlx.local_alloc((BLOCK_M, D), tl.bfloat16, 2, layout=qdo_smem_layout)
+    do_ring = tlx.local_alloc((BLOCK_M, D), tl.bfloat16, 2, layout=qdo_smem_layout)
+    lse_ring = tlx.local_alloc((BLOCK_M, ), tl.float32, 2, layout=stats_smem_layout)
+    delta_ring = tlx.local_alloc((BLOCK_M, ), tl.float32, 2, layout=stats_smem_layout)
+
+    # K/V are loaded once in their final MFMA operand layouts and remain
+    # resident through the complete bottom-right query frontier.
+    kv_head = (pid_b * HKV + pid_hkv).to(tl.int64)
+    kv_base = kv_head * SKV * D
+    kv_rows = n0 + tl.arange(0, BLOCK_N)
+    kv_cols = tl.arange(0, D)
+    kv_offsets = (kv_rows[:, None] * D + kv_cols[None, :]).to(tl.int32)
+    k_offsets = tlx.require_layout(kv_offsets, k_op0_nm, pin=False)
+    v_offsets = tlx.require_layout(kv_offsets, v_op0_nm, pin=False)
+    k_nm = tlx.buffer_load(K + kv_base, k_offsets)
+    k_nm = tlx.require_layout(k_nm, k_op0_nm, pin=False)
+    v_nm = tlx.buffer_load(V + kv_base, v_offsets)
+    v_nm = tlx.require_layout(v_nm, v_op0_nm, pin=False)
+
+    q_head = (pid_b * HQ + pid_hkv).to(tl.int64)
+    q_base = Q + q_head * SQ * D
+    do_base = DO + q_head * SQ * D
+    stats_base = q_head * SQ
+    lse_base = LSE + stats_base
+    delta_base = Delta + stats_base
+    start_m_blk = tl.maximum((n0 - (SKV - SQ)) // BLOCK_M, 0)
+
+    dk = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
+    dv = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
+    full_pairs: tl.constexpr = SQ // (2 * BLOCK_M)
+    _d64_mha_issue_stage(
+        q_base,
+        do_base,
+        lse_base,
+        delta_base,
+        tlx.local_view(q_ring, 0),
+        tlx.local_view(do_ring, 0),
+        tlx.local_view(lse_ring, 0),
+        tlx.local_view(delta_ring, 0),
+        start_m_blk,
+        D,
+        BLOCK_M,
+        q_async_layout,
+        stats_async_layout,
+    )
+    for m_pair in range(start_m_blk // 2, full_pairs):
+        m_blk_a = m_pair * 2
+        m_blk_b = m_blk_a + 1
+        _d64_mha_issue_stage(
+            q_base,
+            do_base,
+            lse_base,
+            delta_base,
+            tlx.local_view(q_ring, 1),
+            tlx.local_view(do_ring, 1),
+            tlx.local_view(lse_ring, 1),
+            tlx.local_view(delta_ring, 1),
+            m_blk_b,
+            D,
+            BLOCK_M,
+            q_async_layout,
+            stats_async_layout,
+        )
+        stage_wait = tlx.async_load_wait_group(1)
+        dk, dv = _d64_mha_consume(
+            dk,
+            dv,
+            tlx.local_view(q_ring, 0),
+            tlx.local_view(do_ring, 0),
+            tlx.local_view(lse_ring, 0),
+            tlx.local_view(delta_ring, 0),
+            stage_wait,
+            k_nm,
+            v_nm,
+            m_blk_a,
+            n0,
+            SM_SCALE,
+            SQ,
+            SKV,
+            D,
+            BLOCK_M,
+            BLOCK_N,
+            mma_nm,
+            mma_nd,
+            q_t_op1_nm,
+            p_op0_nd,
+            q_op1_nd,
+        )
+        has_next = m_pair + 1 < full_pairs
+        if has_next:
+            # Retire every relaxed view before overwriting the ping slot.
+            tl.debug_barrier()
+            _d64_mha_issue_stage(
+                q_base,
+                do_base,
+                lse_base,
+                delta_base,
+                tlx.local_view(q_ring, 0),
+                tlx.local_view(do_ring, 0),
+                tlx.local_view(lse_ring, 0),
+                tlx.local_view(delta_ring, 0),
+                m_blk_a + 2,
+                D,
+                BLOCK_M,
+                q_async_layout,
+                stats_async_layout,
+            )
+            stage_wait = tlx.async_load_wait_group(1)
+        else:
+            stage_wait = tlx.async_load_wait_group(0)
+        dk, dv = _d64_mha_consume(
+            dk,
+            dv,
+            tlx.local_view(q_ring, 1),
+            tlx.local_view(do_ring, 1),
+            tlx.local_view(lse_ring, 1),
+            tlx.local_view(delta_ring, 1),
+            stage_wait,
+            k_nm,
+            v_nm,
+            m_blk_b,
+            n0,
+            SM_SCALE,
+            SQ,
+            SKV,
+            D,
+            BLOCK_M,
+            BLOCK_N,
+            mma_nm,
+            mma_nd,
+            q_t_op1_nm,
+            p_op0_nd,
+            q_op1_nd,
+        )
+        if has_next:
+            # Slot one is reused at the top of the next pair.
+            tl.debug_barrier()
+
+    dk_scale = tlx.require_layout(
+        tl.full((BLOCK_N, D), SM_SCALE, tl.float32),
+        mma_nd,
+        pin=False,
+    )
+    dk = tlx.require_layout(dk, mma_nd, pin=False) * dk_scale
+    dv = tlx.require_layout(dv, mma_nd, pin=False)
+    output_offsets = (tl.arange(0, BLOCK_N)[:, None] * D + tl.arange(0, D)[None, :]).to(tl.int32)
+    output_offsets = tlx.require_layout(output_offsets, out_layout, pin=False)
+    dk_out = tlx.require_layout(dk.to(tl.bfloat16), out_layout, pin=False)
+    dv_out = tlx.require_layout(dv.to(tl.bfloat16), out_layout, pin=False)
+    output_base = kv_head * SKV * D + n0 * D
+    tlx.buffer_store(dk_out, DK + output_base, output_offsets)
+    tlx.buffer_store(dv_out, DV + output_base, output_offsets)
+
+
+@triton.jit
+def _d64_gqa8_issue_stage(
+    Q,
+    DO,
+    LSE_TERM,
+    Delta,
+    q_dst,
+    do_dst,
+    lse_dst,
+    delta_dst,
+    m_blk,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    q_async_layout: tl.constexpr,
+    stats_async_layout: tl.constexpr,
+):
+    """Issue one complete Q/dO/signed-stat tile as one async group."""
+    rows = m_blk * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = tl.arange(0, D)
+    q_offsets = (rows[:, None] * D + cols[None, :]).to(tl.int32)
+    q_offsets = tlx.require_layout(q_offsets, q_async_layout, pin=False)
+    stats_offsets = tlx.require_layout(rows.to(tl.int32), stats_async_layout, pin=False)
+    q_token = tlx.buffer_load_to_local(q_dst, Q, q_offsets)
+    do_token = tlx.buffer_load_to_local(do_dst, DO, q_offsets)
+    lse_token = tlx.buffer_load_to_local(lse_dst, LSE_TERM, stats_offsets)
+    delta_token = tlx.buffer_load_to_local(delta_dst, Delta, stats_offsets)
+    tlx.async_load_commit_group([q_token, do_token, lse_token, delta_token])
+
+
+@triton.jit
+def _d64_gqa8_signed_front(
+    q_view,
+    do_view,
+    lse_view,
+    delta_view,
+    stage_wait,
+    k_nm,
+    v_nm,
+    m_blk,
+    n0,
+    SM_SCALE: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    APPLY_CAUSAL_MASK: tl.constexpr,
+    mma_nm: tl.constexpr,
+    q_t_op1_nm: tl.constexpr,
+    p_op0_nd: tl.constexpr,
+):
+    """Compute signed-ABI P and dS from one staged BM64 query tile."""
+    log2e: tl.constexpr = 1.4426950408889634
+    q_t = tlx.local_load(tlx.local_trans(q_view), token=stage_wait, layout=q_t_op1_nm)
+    do_t = tlx.local_load(tlx.local_trans(do_view), token=stage_wait, layout=q_t_op1_nm)
+    lse_term = tlx.local_load(lse_view, token=stage_wait, relaxed=True)
+    negative_delta = tlx.local_load(delta_view, token=stage_wait, relaxed=True)
+
+    # Selected GQA publishes lse_term=-LSE/sm_scale, so this is exactly
+    # P=exp2((QK+lse_term)*(sm_scale*log2(e))).
+    scores = tlx.require_layout(
+        tl.broadcast_to(lse_term[None, :], (BLOCK_N, BLOCK_M)),
+        mma_nm,
+        pin=False,
+    )
+    scores = tl.dot(k_nm, q_t, acc=scores, out_dtype=tl.float32)
+    score_scale = tlx.require_layout(
+        tl.full(
+            (BLOCK_N, BLOCK_M),
+            SM_SCALE * log2e,
+            tl.float32,
+        ),
+        mma_nm,
+        pin=False,
+    )
+    scores = scores * score_scale
+    if APPLY_CAUSAL_MASK:
+        rows = m_blk * BLOCK_M + tl.arange(0, BLOCK_M)
+        cols = n0 + tl.arange(0, BLOCK_N)
+        valid = cols[:, None] <= rows[None, :] + (SKV - SQ)
+        valid = tlx.require_layout(valid, mma_nm, pin=False)
+        negative_inf = tlx.require_layout(
+            tl.full(
+                (BLOCK_N, BLOCK_M),
+                float("-inf"),
+                tl.float32,
+            ),
+            mma_nm,
+            pin=False,
+        )
+        scores = tl.where(valid, scores, negative_inf)
+    p = tlx.require_layout(tl.math.exp2(scores), mma_nm, pin=False)
+
+    # Selected GQA publishes negative Delta, so this accumulator is exactly
+    # dO@V^T+delta before the P product.
+    dp = tlx.require_layout(
+        tl.broadcast_to(negative_delta[None, :], (BLOCK_N, BLOCK_M)),
+        mma_nm,
+        pin=False,
+    )
+    dp = tl.dot(v_nm, do_t, acc=dp, out_dtype=tl.float32)
+    ds = p * dp
+    p_nd = tlx.require_layout(p.to(tl.bfloat16), p_op0_nd, pin=False)
+    ds_nd = tlx.require_layout(ds.to(tl.bfloat16), p_op0_nd, pin=False)
+    return p_nd, ds_nd
+
+
+@triton.jit
+def _d64_gqa8_direct_d64_step(
+    dk,
+    dv,
+    q_view,
+    do_view,
+    lse_view,
+    delta_view,
+    stage_wait,
+    k_nm,
+    v_nm,
+    m_blk,
+    n0,
+    SM_SCALE: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    APPLY_CAUSAL_MASK: tl.constexpr,
+    mma_nm: tl.constexpr,
+    mma_nd: tl.constexpr,
+    q_t_op1_nm: tl.constexpr,
+    p_op0_nd: tl.constexpr,
+    q_op1_nd: tl.constexpr,
+):
+    dk = tlx.require_layout(dk, mma_nd, pin=False)
+    dv = tlx.require_layout(dv, mma_nd, pin=False)
+    p_nd, ds_nd = _d64_gqa8_signed_front(
+        q_view,
+        do_view,
+        lse_view,
+        delta_view,
+        stage_wait,
+        k_nm,
+        v_nm,
+        m_blk,
+        n0,
+        SM_SCALE,
+        SQ,
+        SKV,
+        D,
+        BLOCK_M,
+        BLOCK_N,
+        APPLY_CAUSAL_MASK,
+        mma_nm,
+        q_t_op1_nm,
+        p_op0_nd,
+    )
+    do_nd = tlx.local_load(do_view, token=stage_wait, layout=q_op1_nd)
+    q_nd = tlx.local_load(q_view, token=stage_wait, layout=q_op1_nd)
+    dv = tl.dot(p_nd, do_nd, acc=dv, out_dtype=tl.float32)
+    dk = tl.dot(ds_nd, q_nd, acc=dk, out_dtype=tl.float32)
+    return (
+        tlx.require_layout(dk, mma_nd, pin=False),
+        tlx.require_layout(dv, mma_nd, pin=False),
+    )
+
+
+@triton.jit
+def _d64_gqa8_d32_step(
+    dk_d0,
+    dk_d1,
+    dv_d0,
+    dv_d1,
+    q_view,
+    do_view,
+    lse_view,
+    delta_view,
+    stage_wait,
+    k_nm,
+    v_nm,
+    m_blk,
+    n0,
+    SM_SCALE: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    APPLY_CAUSAL_MASK: tl.constexpr,
+    INTERLEAVED_D32: tl.constexpr,
+    mma_nm: tl.constexpr,
+    mma_nd: tl.constexpr,
+    q_t_op1_nm: tl.constexpr,
+    p_op0_nd: tl.constexpr,
+    q_op1_nd: tl.constexpr,
+):
+    dk_d0 = tlx.require_layout(dk_d0, mma_nd, pin=False)
+    dk_d1 = tlx.require_layout(dk_d1, mma_nd, pin=False)
+    dv_d0 = tlx.require_layout(dv_d0, mma_nd, pin=False)
+    dv_d1 = tlx.require_layout(dv_d1, mma_nd, pin=False)
+    p_nd, ds_nd = _d64_gqa8_signed_front(
+        q_view,
+        do_view,
+        lse_view,
+        delta_view,
+        stage_wait,
+        k_nm,
+        v_nm,
+        m_blk,
+        n0,
+        SM_SCALE,
+        SQ,
+        SKV,
+        D,
+        BLOCK_M,
+        BLOCK_N,
+        APPLY_CAUSAL_MASK,
+        mma_nm,
+        q_t_op1_nm,
+        p_op0_nd,
+    )
+    if INTERLEAVED_D32:
+        # Interleave low dV/dK then high dV/dK recurrences.
+        do_d0 = tlx.local_load(
+            tlx.local_slice(do_view, [0, 0], [BLOCK_M, D // 2]),
+            token=stage_wait,
+            layout=q_op1_nd,
+        )
+        dv_d0 = tl.dot(p_nd, do_d0, acc=dv_d0, out_dtype=tl.float32)
+        q_d0 = tlx.local_load(
+            tlx.local_slice(q_view, [0, 0], [BLOCK_M, D // 2]),
+            token=stage_wait,
+            layout=q_op1_nd,
+        )
+        dk_d0 = tl.dot(ds_nd, q_d0, acc=dk_d0, out_dtype=tl.float32)
+        do_d1 = tlx.local_load(
+            tlx.local_slice(do_view, [0, D // 2], [BLOCK_M, D // 2]),
+            token=stage_wait,
+            layout=q_op1_nd,
+        )
+        dv_d1 = tl.dot(p_nd, do_d1, acc=dv_d1, out_dtype=tl.float32)
+        q_d1 = tlx.local_load(
+            tlx.local_slice(q_view, [0, D // 2], [BLOCK_M, D // 2]),
+            token=stage_wait,
+            layout=q_op1_nd,
+        )
+        dk_d1 = tl.dot(ds_nd, q_d1, acc=dk_d1, out_dtype=tl.float32)
+    else:
+        # Independent D32 keeps both dV recurrences separate from both dK
+        # recurrences, shortening each scheduler-visible chain.
+        do_d0 = tlx.local_load(
+            tlx.local_slice(do_view, [0, 0], [BLOCK_M, D // 2]),
+            token=stage_wait,
+            layout=q_op1_nd,
+        )
+        dv_d0 = tl.dot(p_nd, do_d0, acc=dv_d0, out_dtype=tl.float32)
+        do_d1 = tlx.local_load(
+            tlx.local_slice(do_view, [0, D // 2], [BLOCK_M, D // 2]),
+            token=stage_wait,
+            layout=q_op1_nd,
+        )
+        dv_d1 = tl.dot(p_nd, do_d1, acc=dv_d1, out_dtype=tl.float32)
+        q_d0 = tlx.local_load(
+            tlx.local_slice(q_view, [0, 0], [BLOCK_M, D // 2]),
+            token=stage_wait,
+            layout=q_op1_nd,
+        )
+        dk_d0 = tl.dot(ds_nd, q_d0, acc=dk_d0, out_dtype=tl.float32)
+        q_d1 = tlx.local_load(
+            tlx.local_slice(q_view, [0, D // 2], [BLOCK_M, D // 2]),
+            token=stage_wait,
+            layout=q_op1_nd,
+        )
+        dk_d1 = tl.dot(ds_nd, q_d1, acc=dk_d1, out_dtype=tl.float32)
+    return (
+        tlx.require_layout(dk_d0, mma_nd, pin=False),
+        tlx.require_layout(dk_d1, mma_nd, pin=False),
+        tlx.require_layout(dv_d0, mma_nd, pin=False),
+        tlx.require_layout(dv_d1, mma_nd, pin=False),
+    )
+
+
+@triton.jit
+def _d64_gqa8_direct_consume(
+    dk,
+    dv,
+    q_view,
+    do_view,
+    lse_view,
+    delta_view,
+    stage_wait,
+    k_nm,
+    v_nm,
+    m_blk,
+    n0,
+    SM_SCALE: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    mma_nm: tl.constexpr,
+    mma_nd: tl.constexpr,
+    q_t_op1_nm: tl.constexpr,
+    p_op0_nd: tl.constexpr,
+    q_op1_nd: tl.constexpr,
+):
+    dk = tlx.require_layout(dk, mma_nd, pin=False)
+    dv = tlx.require_layout(dv, mma_nd, pin=False)
+    if n0 + BLOCK_N - 1 > m_blk * BLOCK_M + (SKV - SQ):
+        dk, dv = _d64_gqa8_direct_d64_step(dk, dv, q_view, do_view, lse_view, delta_view, stage_wait, k_nm, v_nm, m_blk,
+                                           n0, SM_SCALE, SQ, SKV, D, BLOCK_M, BLOCK_N, True, mma_nm, mma_nd, q_t_op1_nm,
+                                           p_op0_nd, q_op1_nd)
+        dk = tlx.require_layout(dk, mma_nd, pin=False)
+        dv = tlx.require_layout(dv, mma_nd, pin=False)
+    else:
+        dk, dv = _d64_gqa8_direct_d64_step(dk, dv, q_view, do_view, lse_view, delta_view, stage_wait, k_nm, v_nm, m_blk,
+                                           n0, SM_SCALE, SQ, SKV, D, BLOCK_M, BLOCK_N, False, mma_nm, mma_nd,
+                                           q_t_op1_nm, p_op0_nd, q_op1_nd)
+        dk = tlx.require_layout(dk, mma_nd, pin=False)
+        dv = tlx.require_layout(dv, mma_nd, pin=False)
+    dk = tlx.require_layout(dk, mma_nd, pin=False)
+    dv = tlx.require_layout(dv, mma_nd, pin=False)
+    return dk, dv
+
+
+@triton.jit
+def _d64_gqa8_d32_consume(
+    dk_d0,
+    dk_d1,
+    dv_d0,
+    dv_d1,
+    q_view,
+    do_view,
+    lse_view,
+    delta_view,
+    stage_wait,
+    k_nm,
+    v_nm,
+    m_blk,
+    n0,
+    SM_SCALE: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    INTERLEAVED_D32: tl.constexpr,
+    mma_nm: tl.constexpr,
+    mma_nd: tl.constexpr,
+    q_t_op1_nm: tl.constexpr,
+    p_op0_nd: tl.constexpr,
+    q_op1_nd: tl.constexpr,
+):
+    dk_d0 = tlx.require_layout(dk_d0, mma_nd, pin=False)
+    dk_d1 = tlx.require_layout(dk_d1, mma_nd, pin=False)
+    dv_d0 = tlx.require_layout(dv_d0, mma_nd, pin=False)
+    dv_d1 = tlx.require_layout(dv_d1, mma_nd, pin=False)
+    if n0 + BLOCK_N - 1 > m_blk * BLOCK_M + (SKV - SQ):
+        dk_d0, dk_d1, dv_d0, dv_d1 = _d64_gqa8_d32_step(dk_d0, dk_d1, dv_d0, dv_d1, q_view, do_view, lse_view,
+                                                        delta_view, stage_wait, k_nm, v_nm, m_blk, n0, SM_SCALE, SQ,
+                                                        SKV, D, BLOCK_M, BLOCK_N, True, INTERLEAVED_D32, mma_nm, mma_nd,
+                                                        q_t_op1_nm, p_op0_nd, q_op1_nd)
+        dk_d0 = tlx.require_layout(dk_d0, mma_nd, pin=False)
+        dk_d1 = tlx.require_layout(dk_d1, mma_nd, pin=False)
+        dv_d0 = tlx.require_layout(dv_d0, mma_nd, pin=False)
+        dv_d1 = tlx.require_layout(dv_d1, mma_nd, pin=False)
+    else:
+        dk_d0, dk_d1, dv_d0, dv_d1 = _d64_gqa8_d32_step(dk_d0, dk_d1, dv_d0, dv_d1, q_view, do_view, lse_view,
+                                                        delta_view, stage_wait, k_nm, v_nm, m_blk, n0, SM_SCALE, SQ,
+                                                        SKV, D, BLOCK_M, BLOCK_N, False, INTERLEAVED_D32, mma_nm,
+                                                        mma_nd, q_t_op1_nm, p_op0_nd, q_op1_nd)
+        dk_d0 = tlx.require_layout(dk_d0, mma_nd, pin=False)
+        dk_d1 = tlx.require_layout(dk_d1, mma_nd, pin=False)
+        dv_d0 = tlx.require_layout(dv_d0, mma_nd, pin=False)
+        dv_d1 = tlx.require_layout(dv_d1, mma_nd, pin=False)
+    dk_d0 = tlx.require_layout(dk_d0, mma_nd, pin=False)
+    dk_d1 = tlx.require_layout(dk_d1, mma_nd, pin=False)
+    dv_d0 = tlx.require_layout(dv_d0, mma_nd, pin=False)
+    dv_d1 = tlx.require_layout(dv_d1, mma_nd, pin=False)
+    return dk_d0, dk_d1, dv_d0, dv_d1
+
+
+@triton.jit
+def _d64_gqa8_direct_d64_impl(
+    Q,
+    DO,
+    LSE_TERM,
+    Delta,
+    q_ring,
+    do_ring,
+    lse_ring,
+    delta_ring,
+    k_nm,
+    v_nm,
+    pid_b,
+    pid_hkv,
+    off_split,
+    n0,
+    start_m_blk,
+    SM_SCALE: tl.constexpr,
+    HQ: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    CYCLIC_QUERY_SPLIT: tl.constexpr,
+    q_async_layout: tl.constexpr,
+    stats_async_layout: tl.constexpr,
+    mma_nm: tl.constexpr,
+    mma_nd: tl.constexpr,
+    q_t_op1_nm: tl.constexpr,
+    p_op0_nd: tl.constexpr,
+    q_op1_nd: tl.constexpr,
+):
+    """Carry only full-width FP32 dK/dV through the complete owner walk."""
+    dk = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
+    dv = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
+    num_m_blocks: tl.constexpr = SQ // BLOCK_M
+    full_pairs: tl.constexpr = num_m_blocks // 2
+    has_odd: tl.constexpr = (num_m_blocks % 2) != 0
+
+    if CYCLIC_QUERY_SPLIT:
+        for local_head in range(0, 8):
+            q_head = (pid_b * HQ + pid_hkv * 8 + local_head).to(tl.int64)
+            q_base = Q + q_head * SQ * D
+            do_base = DO + q_head * SQ * D
+            stats_base = q_head * SQ
+            lse_base = LSE_TERM + stats_base
+            delta_base = Delta + stats_base
+            split_advance = (off_split - (start_m_blk % 4) + 4) % 4
+            first_m_blk = start_m_blk + split_advance
+            if first_m_blk < num_m_blocks:
+                _d64_gqa8_issue_stage(q_base, do_base, lse_base, delta_base, tlx.local_view(q_ring, 0),
+                                      tlx.local_view(do_ring, 0), tlx.local_view(lse_ring, 0),
+                                      tlx.local_view(delta_ring, 0), first_m_blk, D, BLOCK_M, q_async_layout,
+                                      stats_async_layout)
+                sequence_blocks = (num_m_blocks - first_m_blk + 3) // 4
+                sequence_pairs = sequence_blocks // 2
+                for sequence_pair in range(0, sequence_pairs):
+                    m_blk_a = first_m_blk + sequence_pair * 8
+                    m_blk_b = m_blk_a + 4
+                    # Issue the complete next stage before consuming current.
+                    _d64_gqa8_issue_stage(q_base, do_base, lse_base, delta_base, tlx.local_view(q_ring, 1),
+                                          tlx.local_view(do_ring, 1), tlx.local_view(lse_ring, 1),
+                                          tlx.local_view(delta_ring, 1), m_blk_b, D, BLOCK_M, q_async_layout,
+                                          stats_async_layout)
+                    stage_wait = tlx.async_load_wait_group(1)
+                    dk, dv = _d64_gqa8_direct_consume(dk, dv, tlx.local_view(q_ring, 0), tlx.local_view(do_ring, 0),
+                                                      tlx.local_view(lse_ring, 0), tlx.local_view(delta_ring, 0),
+                                                      stage_wait, k_nm, v_nm, m_blk_a, n0, SM_SCALE, SQ, SKV, D,
+                                                      BLOCK_M, BLOCK_N, mma_nm, mma_nd, q_t_op1_nm, p_op0_nd, q_op1_nd)
+                    has_next_pair = sequence_pair + 1 < sequence_pairs
+                    has_odd_block = (sequence_blocks % 2) != 0
+                    if has_next_pair or has_odd_block:
+                        # All relaxed views are retired before slot reuse.
+                        tl.debug_barrier()
+                        _d64_gqa8_issue_stage(q_base, do_base, lse_base, delta_base, tlx.local_view(q_ring, 0),
+                                              tlx.local_view(do_ring, 0), tlx.local_view(lse_ring, 0),
+                                              tlx.local_view(delta_ring, 0), m_blk_a + 8, D, BLOCK_M, q_async_layout,
+                                              stats_async_layout)
+                        stage_wait = tlx.async_load_wait_group(1)
+                    else:
+                        stage_wait = tlx.async_load_wait_group(0)
+                    dk, dv = _d64_gqa8_direct_consume(dk, dv, tlx.local_view(q_ring, 1), tlx.local_view(do_ring, 1),
+                                                      tlx.local_view(lse_ring, 1), tlx.local_view(delta_ring, 1),
+                                                      stage_wait, k_nm, v_nm, m_blk_b, n0, SM_SCALE, SQ, SKV, D,
+                                                      BLOCK_M, BLOCK_N, mma_nm, mma_nd, q_t_op1_nm, p_op0_nd, q_op1_nd)
+                    if has_next_pair:
+                        tl.debug_barrier()
+                dk = tlx.require_layout(dk, mma_nd, pin=False)
+                dv = tlx.require_layout(dv, mma_nd, pin=False)
+                if (sequence_blocks % 2) != 0:
+                    stage_wait = tlx.async_load_wait_group(0)
+                    m_blk_tail = first_m_blk + (sequence_blocks - 1) * 4
+                    dk, dv = _d64_gqa8_direct_consume(dk, dv, tlx.local_view(q_ring, 0), tlx.local_view(do_ring, 0),
+                                                      tlx.local_view(lse_ring, 0), tlx.local_view(delta_ring, 0),
+                                                      stage_wait, k_nm, v_nm, m_blk_tail, n0, SM_SCALE, SQ, SKV, D,
+                                                      BLOCK_M, BLOCK_N, mma_nm, mma_nd, q_t_op1_nm, p_op0_nd, q_op1_nd)
+                    dk = tlx.require_layout(dk, mma_nd, pin=False)
+                    dv = tlx.require_layout(dv, mma_nd, pin=False)
+                dk = tlx.require_layout(dk, mma_nd, pin=False)
+                dv = tlx.require_layout(dv, mma_nd, pin=False)
+            if local_head + 1 < 8:
+                tl.debug_barrier()
+    else:
+        pair_start = (start_m_blk // 2) * 2
+        for local_head in range(0, 2):
+            query_in_group = off_split * 2 + local_head
+            q_head = (pid_b * HQ + pid_hkv * 8 + query_in_group).to(tl.int64)
+            q_base = Q + q_head * SQ * D
+            do_base = DO + q_head * SQ * D
+            stats_base = q_head * SQ
+            lse_base = LSE_TERM + stats_base
+            delta_base = Delta + stats_base
+            _d64_gqa8_issue_stage(q_base, do_base, lse_base, delta_base, tlx.local_view(q_ring,
+                                                                                        0), tlx.local_view(do_ring, 0),
+                                  tlx.local_view(lse_ring, 0), tlx.local_view(delta_ring, 0), pair_start, D, BLOCK_M,
+                                  q_async_layout, stats_async_layout)
+            for m_pair in range(pair_start // 2, full_pairs):
+                m_blk_a = m_pair * 2
+                m_blk_b = m_blk_a + 1
+                _d64_gqa8_issue_stage(q_base, do_base, lse_base, delta_base, tlx.local_view(q_ring, 1),
+                                      tlx.local_view(do_ring, 1), tlx.local_view(lse_ring, 1),
+                                      tlx.local_view(delta_ring, 1), m_blk_b, D, BLOCK_M, q_async_layout,
+                                      stats_async_layout)
+                stage_wait = tlx.async_load_wait_group(1)
+                dk, dv = _d64_gqa8_direct_consume(dk, dv, tlx.local_view(q_ring, 0), tlx.local_view(do_ring, 0),
+                                                  tlx.local_view(lse_ring, 0), tlx.local_view(delta_ring, 0),
+                                                  stage_wait, k_nm, v_nm, m_blk_a, n0, SM_SCALE, SQ, SKV, D, BLOCK_M,
+                                                  BLOCK_N, mma_nm, mma_nd, q_t_op1_nm, p_op0_nd, q_op1_nd)
+                has_following = (m_pair + 1 < full_pairs) or has_odd
+                if has_following:
+                    tl.debug_barrier()
+                    _d64_gqa8_issue_stage(q_base, do_base, lse_base, delta_base, tlx.local_view(q_ring, 0),
+                                          tlx.local_view(do_ring, 0), tlx.local_view(lse_ring, 0),
+                                          tlx.local_view(delta_ring, 0), m_blk_a + 2, D, BLOCK_M, q_async_layout,
+                                          stats_async_layout)
+                    stage_wait = tlx.async_load_wait_group(1)
+                else:
+                    stage_wait = tlx.async_load_wait_group(0)
+                dk, dv = _d64_gqa8_direct_consume(dk, dv, tlx.local_view(q_ring, 1), tlx.local_view(do_ring, 1),
+                                                  tlx.local_view(lse_ring, 1), tlx.local_view(delta_ring, 1),
+                                                  stage_wait, k_nm, v_nm, m_blk_b, n0, SM_SCALE, SQ, SKV, D, BLOCK_M,
+                                                  BLOCK_N, mma_nm, mma_nd, q_t_op1_nm, p_op0_nd, q_op1_nd)
+                if m_pair + 1 < full_pairs:
+                    tl.debug_barrier()
+            if has_odd:
+                stage_wait = tlx.async_load_wait_group(0)
+                dk, dv = _d64_gqa8_direct_consume(dk, dv, tlx.local_view(q_ring, 0), tlx.local_view(do_ring, 0),
+                                                  tlx.local_view(lse_ring, 0), tlx.local_view(delta_ring, 0),
+                                                  stage_wait, k_nm, v_nm, num_m_blocks - 1, n0, SM_SCALE, SQ, SKV, D,
+                                                  BLOCK_M, BLOCK_N, mma_nm, mma_nd, q_t_op1_nm, p_op0_nd, q_op1_nd)
+            if local_head + 1 < 2:
+                tl.debug_barrier()
+    return (
+        tlx.require_layout(dk, mma_nd, pin=False),
+        tlx.require_layout(dv, mma_nd, pin=False),
+    )
+
+
+@triton.jit
+def _d64_gqa8_d32_impl(
+    Q,
+    DO,
+    LSE_TERM,
+    Delta,
+    q_ring,
+    do_ring,
+    lse_ring,
+    delta_ring,
+    k_nm,
+    v_nm,
+    pid_b,
+    pid_hkv,
+    off_split,
+    n0,
+    start_m_blk,
+    SM_SCALE: tl.constexpr,
+    HQ: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    INTERLEAVED_D32: tl.constexpr,
+    q_async_layout: tl.constexpr,
+    stats_async_layout: tl.constexpr,
+    mma_nm: tl.constexpr,
+    mma_nd: tl.constexpr,
+    q_t_op1_nm: tl.constexpr,
+    p_op0_nd: tl.constexpr,
+    q_op1_nd: tl.constexpr,
+):
+    """Carry only the selected low/high FP32 recurrences until epilogue."""
+    dk_d0 = tlx.zeros((BLOCK_N, D // 2), tl.float32, layout=mma_nd)
+    dk_d1 = tlx.zeros((BLOCK_N, D // 2), tl.float32, layout=mma_nd)
+    dv_d0 = tlx.zeros((BLOCK_N, D // 2), tl.float32, layout=mma_nd)
+    dv_d1 = tlx.zeros((BLOCK_N, D // 2), tl.float32, layout=mma_nd)
+    num_m_blocks: tl.constexpr = SQ // BLOCK_M
+    full_pairs: tl.constexpr = num_m_blocks // 2
+    has_odd: tl.constexpr = (num_m_blocks % 2) != 0
+    peel_frontier = (start_m_blk % 2) != 0
+    pair_start = start_m_blk + (start_m_blk % 2)
+
+    for local_head in range(0, 2):
+        query_in_group = off_split * 2 + local_head
+        q_head = (pid_b * HQ + pid_hkv * 8 + query_in_group).to(tl.int64)
+        q_base = Q + q_head * SQ * D
+        do_base = DO + q_head * SQ * D
+        stats_base = q_head * SQ
+        lse_base = LSE_TERM + stats_base
+        delta_base = Delta + stats_base
+        if peel_frontier:
+            _d64_gqa8_issue_stage(q_base, do_base, lse_base, delta_base, tlx.local_view(q_ring,
+                                                                                        0), tlx.local_view(do_ring, 0),
+                                  tlx.local_view(lse_ring, 0), tlx.local_view(delta_ring, 0), start_m_blk, D, BLOCK_M,
+                                  q_async_layout, stats_async_layout)
+            stage_wait = tlx.async_load_wait_group(0)
+            dk_d0, dk_d1, dv_d0, dv_d1 = _d64_gqa8_d32_consume(dk_d0, dk_d1, dv_d0, dv_d1, tlx.local_view(q_ring, 0),
+                                                               tlx.local_view(do_ring, 0), tlx.local_view(lse_ring, 0),
+                                                               tlx.local_view(delta_ring, 0), stage_wait, k_nm, v_nm,
+                                                               start_m_blk, n0, SM_SCALE, SQ, SKV, D, BLOCK_M, BLOCK_N,
+                                                               INTERLEAVED_D32, mma_nm, mma_nd, q_t_op1_nm, p_op0_nd,
+                                                               q_op1_nd)
+            dk_d0 = tlx.require_layout(dk_d0, mma_nd, pin=False)
+            dk_d1 = tlx.require_layout(dk_d1, mma_nd, pin=False)
+            dv_d0 = tlx.require_layout(dv_d0, mma_nd, pin=False)
+            dv_d1 = tlx.require_layout(dv_d1, mma_nd, pin=False)
+            # Every relaxed view is retired before slot-zero reuse.
+            tl.debug_barrier()
+        if pair_start < num_m_blocks:
+            _d64_gqa8_issue_stage(q_base, do_base, lse_base, delta_base, tlx.local_view(q_ring,
+                                                                                        0), tlx.local_view(do_ring, 0),
+                                  tlx.local_view(lse_ring, 0), tlx.local_view(delta_ring, 0), pair_start, D, BLOCK_M,
+                                  q_async_layout, stats_async_layout)
+            for m_pair in range(pair_start // 2, full_pairs):
+                m_blk_a = m_pair * 2
+                m_blk_b = m_blk_a + 1
+                # Issue all next-stage requests before any current-stage read.
+                _d64_gqa8_issue_stage(q_base, do_base, lse_base, delta_base, tlx.local_view(q_ring, 1),
+                                      tlx.local_view(do_ring, 1), tlx.local_view(lse_ring, 1),
+                                      tlx.local_view(delta_ring, 1), m_blk_b, D, BLOCK_M, q_async_layout,
+                                      stats_async_layout)
+                stage_wait = tlx.async_load_wait_group(1)
+                dk_d0, dk_d1, dv_d0, dv_d1 = _d64_gqa8_d32_consume(dk_d0, dk_d1, dv_d0,
+                                                                   dv_d1, tlx.local_view(q_ring, 0),
+                                                                   tlx.local_view(do_ring, 0),
+                                                                   tlx.local_view(lse_ring, 0),
+                                                                   tlx.local_view(delta_ring, 0), stage_wait, k_nm,
+                                                                   v_nm, m_blk_a, n0, SM_SCALE, SQ, SKV, D, BLOCK_M,
+                                                                   BLOCK_N, INTERLEAVED_D32, mma_nm, mma_nd, q_t_op1_nm,
+                                                                   p_op0_nd, q_op1_nd)
+                has_following = (m_pair + 1 < full_pairs) or has_odd
+                if has_following:
+                    # Retire every view before overwriting the ping slot.
+                    tl.debug_barrier()
+                    _d64_gqa8_issue_stage(q_base, do_base, lse_base, delta_base, tlx.local_view(q_ring, 0),
+                                          tlx.local_view(do_ring, 0), tlx.local_view(lse_ring, 0),
+                                          tlx.local_view(delta_ring, 0), m_blk_a + 2, D, BLOCK_M, q_async_layout,
+                                          stats_async_layout)
+                    stage_wait = tlx.async_load_wait_group(1)
+                else:
+                    stage_wait = tlx.async_load_wait_group(0)
+                dk_d0, dk_d1, dv_d0, dv_d1 = _d64_gqa8_d32_consume(dk_d0, dk_d1, dv_d0,
+                                                                   dv_d1, tlx.local_view(q_ring, 1),
+                                                                   tlx.local_view(do_ring, 1),
+                                                                   tlx.local_view(lse_ring, 1),
+                                                                   tlx.local_view(delta_ring, 1), stage_wait, k_nm,
+                                                                   v_nm, m_blk_b, n0, SM_SCALE, SQ, SKV, D, BLOCK_M,
+                                                                   BLOCK_N, INTERLEAVED_D32, mma_nm, mma_nd, q_t_op1_nm,
+                                                                   p_op0_nd, q_op1_nd)
+                if m_pair + 1 < full_pairs:
+                    tl.debug_barrier()
+            dk_d0 = tlx.require_layout(dk_d0, mma_nd, pin=False)
+            dk_d1 = tlx.require_layout(dk_d1, mma_nd, pin=False)
+            dv_d0 = tlx.require_layout(dv_d0, mma_nd, pin=False)
+            dv_d1 = tlx.require_layout(dv_d1, mma_nd, pin=False)
+            if has_odd:
+                stage_wait = tlx.async_load_wait_group(0)
+                dk_d0, dk_d1, dv_d0, dv_d1 = _d64_gqa8_d32_consume(dk_d0, dk_d1, dv_d0,
+                                                                   dv_d1, tlx.local_view(q_ring, 0),
+                                                                   tlx.local_view(do_ring, 0),
+                                                                   tlx.local_view(lse_ring, 0),
+                                                                   tlx.local_view(delta_ring, 0), stage_wait, k_nm,
+                                                                   v_nm, num_m_blocks - 1, n0, SM_SCALE, SQ, SKV, D,
+                                                                   BLOCK_M, BLOCK_N, INTERLEAVED_D32, mma_nm, mma_nd,
+                                                                   q_t_op1_nm, p_op0_nd, q_op1_nd)
+                dk_d0 = tlx.require_layout(dk_d0, mma_nd, pin=False)
+                dk_d1 = tlx.require_layout(dk_d1, mma_nd, pin=False)
+                dv_d0 = tlx.require_layout(dv_d0, mma_nd, pin=False)
+                dv_d1 = tlx.require_layout(dv_d1, mma_nd, pin=False)
+        dk_d0 = tlx.require_layout(dk_d0, mma_nd, pin=False)
+        dk_d1 = tlx.require_layout(dk_d1, mma_nd, pin=False)
+        dv_d0 = tlx.require_layout(dv_d0, mma_nd, pin=False)
+        dv_d1 = tlx.require_layout(dv_d1, mma_nd, pin=False)
+        if local_head + 1 < 2:
+            tl.debug_barrier()
+
+    # This is the only D32 join: both selected recurrences die in epilogue.
+    dk = tl.join(dk_d0, dk_d1)
+    dk = tl.permute(dk, (0, 2, 1))
+    dk = tl.reshape(dk, (BLOCK_N, D))
+    dv = tl.join(dv_d0, dv_d1)
+    dv = tl.permute(dv, (0, 2, 1))
+    dv = tl.reshape(dv, (BLOCK_N, D))
+    return (
+        tlx.require_layout(dk, mma_nd, pin=False),
+        tlx.require_layout(dv, mma_nd, pin=False),
+    )
+
+
+@triton.jit
+def _attn_bwd_dkdv_d64_causal_gqa8_kernel(
+    Q,
+    K,
+    V,
+    DO,
+    LSE_TERM,
+    Delta,
+    DK_PART,
+    DV_PART,
+    SM_SCALE: tl.constexpr,
+    HQ: tl.constexpr,
+    HKV: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    USE_GQA_XCD: tl.constexpr,
+    USE_XCD_N_FAST: tl.constexpr,
+    CYCLIC_QUERY_SPLIT: tl.constexpr,
+    LIFETIME_MODE: tl.constexpr,
+    LSE_MODE: tl.constexpr,
+    DELTA_MODE: tl.constexpr,
+):
+    """Resident-K/V causal D64 GQA8 producer with four fixed partials."""
+    tl.static_assert(D == 64 and BLOCK_M == 64 and BLOCK_N == 128)
+    tl.static_assert(HQ == HKV * 8)
+    tl.static_assert(SQ % BLOCK_M == 0 and SKV % BLOCK_N == 0)
+    tl.static_assert(SQ <= SKV)
+    tl.static_assert(LSE_MODE == _D64_LSE_NEG_INV_SCALE_JIT)
+    tl.static_assert(DELTA_MODE == _D64_DELTA_NEGATED_JIT)
+    tl.static_assert(LIFETIME_MODE == _D64_GQA_INDEPENDENT_D32_JIT or LIFETIME_MODE == _D64_GQA_INTERLEAVED_D32_JIT
+                     or LIFETIME_MODE == _D64_GQA_DIRECT_D64_JIT)
+    if USE_XCD_N_FAST:
+        tl.static_assert(USE_GQA_XCD)
+    if CYCLIC_QUERY_SPLIT:
+        tl.static_assert(USE_GQA_XCD and LIFETIME_MODE == _D64_GQA_DIRECT_D64_JIT)
+
+    value = tl.program_id(0)
+    num_n: tl.constexpr = SKV // BLOCK_N
+    if USE_GQA_XCD:
+        xcd = value % 8
+        value //= 8
+        if USE_XCD_N_FAST:
+            pid_n = value % num_n
+            value //= num_n
+            off_split = value % 4
+            bkv_group = value // 4
+        else:
+            off_split = value % 4
+            value //= 4
+            pid_n = value % num_n
+            bkv_group = value // num_n
+        bkv = bkv_group * 8 + xcd
+        pid_hkv = bkv % HKV
+        pid_b = bkv // HKV
+    else:
+        off_split = value % 4
+        value //= 4
+        pid_hkv = value % HKV
+        value //= HKV
+        pid_n = value % num_n
+        pid_b = value // num_n
+    n0 = pid_n * BLOCK_N
+
+    mma_nm: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[4, 1],
+    )
+    mma_nd: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[4, 1],
+    )
+    k_op0_nm: tl.constexpr = tlx.dot_operand_layout(0, mma_nm, k_width=8)
+    v_op0_nm: tl.constexpr = tlx.dot_operand_layout(0, mma_nm, k_width=8)
+    q_t_op1_nm: tl.constexpr = tlx.dot_operand_layout(1, mma_nm, k_width=8)
+    p_op0_nd: tl.constexpr = tlx.dot_operand_layout(0, mma_nd, k_width=4)
+    q_op1_nd: tl.constexpr = tlx.dot_operand_layout(1, mma_nd, k_width=4)
+
+    q_async_layout: tl.constexpr = tlx.layout(
+        shape=(
+            (2, 2, 2, 2, 2, 2, 2, 2),
+            (2, 2, 2, 2),
+        ),
+        stride=(
+            (8, 64, 128, 256, 512, 16, 32, 2048),
+            (1, 2, 4, 1024),
+        ),
+    )
+    stats_async_layout: tl.constexpr = tlx.layout(
+        shape=((64, 4), ()),
+        stride=((1, 0), ()),
+    )
+    out_layout: tl.constexpr = tlx.layout(
+        shape=(
+            (2, 2, 2, 2, 2, 2, 2, 2),
+            (2, 2, 2, 2, 2),
+        ),
+        stride=(
+            (64, 128, 256, 512, 8, 16, 1024, 2048),
+            (1, 2, 4, 32, 4096),
+        ),
+    )
+    qdo_smem_layout: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+            [0, 16],
+            [0, 32],
+            [16, 0],
+            [32, 0],
+        ],
+        block_bases=[],
+        alignment=16,
+    )
+    stats_smem_layout: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[[1], [2], [4], [8], [16], [32]],
+        block_bases=[],
+        alignment=4,
+    )
+    q_ring = tlx.local_alloc((BLOCK_M, D), tl.bfloat16, 2, layout=qdo_smem_layout)
+    do_ring = tlx.local_alloc((BLOCK_M, D), tl.bfloat16, 2, layout=qdo_smem_layout)
+    lse_ring = tlx.local_alloc((BLOCK_M, ), tl.float32, 2, layout=stats_smem_layout)
+    delta_ring = tlx.local_alloc((BLOCK_M, ), tl.float32, 2, layout=stats_smem_layout)
+
+    # K/V are loaded once into their final MFMA operand layouts and remain
+    # resident through every owned head/BM64 visit. They never round-trip LDS.
+    kv_head = (pid_b * HKV + pid_hkv).to(tl.int64)
+    kv_base = kv_head * SKV * D
+    kv_rows = n0 + tl.arange(0, BLOCK_N)
+    kv_cols = tl.arange(0, D)
+    kv_offsets = (kv_rows[:, None] * D + kv_cols[None, :]).to(tl.int32)
+    k_offsets = tlx.require_layout(kv_offsets, k_op0_nm, pin=False)
+    v_offsets = tlx.require_layout(kv_offsets, v_op0_nm, pin=False)
+    k_nm = tlx.buffer_load(K + kv_base, k_offsets)
+    k_nm = tlx.require_layout(k_nm, k_op0_nm, pin=False)
+    v_nm = tlx.buffer_load(V + kv_base, v_offsets)
+    v_nm = tlx.require_layout(v_nm, v_op0_nm, pin=False)
+
+    # Compute the bottom-right physical frontier once per resident K/V owner.
+    start_m_blk = tl.maximum((n0 - (SKV - SQ)) // BLOCK_M, 0)
+    # Implementations branch on this exact predicate so an unmasked BM64 has
+    # no elementwise causal arithmetic:
+    # n0 + BLOCK_N - 1 > m_blk * BLOCK_M + (SKV - SQ)
+    if LIFETIME_MODE == _D64_GQA_DIRECT_D64_JIT:
+        dk, dv = _d64_gqa8_direct_d64_impl(Q, DO, LSE_TERM, Delta, q_ring, do_ring, lse_ring, delta_ring, k_nm, v_nm,
+                                           pid_b, pid_hkv, off_split, n0, start_m_blk, SM_SCALE, HQ, SQ, SKV, D,
+                                           BLOCK_M, BLOCK_N, CYCLIC_QUERY_SPLIT, q_async_layout, stats_async_layout,
+                                           mma_nm, mma_nd, q_t_op1_nm, p_op0_nd, q_op1_nd)
+    else:
+        tl.static_assert(not CYCLIC_QUERY_SPLIT)
+        INTERLEAVED_D32: tl.constexpr = (LIFETIME_MODE == _D64_GQA_INTERLEAVED_D32_JIT)
+        dk, dv = _d64_gqa8_d32_impl(Q, DO, LSE_TERM, Delta, q_ring, do_ring, lse_ring, delta_ring, k_nm, v_nm, pid_b,
+                                    pid_hkv, off_split, n0, start_m_blk, SM_SCALE, HQ, SQ, SKV, D, BLOCK_M, BLOCK_N,
+                                    INTERLEAVED_D32, q_async_layout, stats_async_layout, mma_nm, mma_nd, q_t_op1_nm,
+                                    p_op0_nd, q_op1_nd)
+
+    dk_scale = tlx.require_layout(tl.full((BLOCK_N, D), SM_SCALE, tl.float32), mma_nd, pin=False)
+    dk = tlx.require_layout(dk, mma_nd, pin=False) * dk_scale
+    dv = tlx.require_layout(dv, mma_nd, pin=False)
+    output_offsets = (tl.arange(0, BLOCK_N)[:, None] * D + tl.arange(0, D)[None, :]).to(tl.int32)
+    output_offsets = tlx.require_layout(output_offsets, out_layout, pin=False)
+    dk_out = tlx.require_layout(dk.to(tl.bfloat16), out_layout, pin=False)
+    dv_out = tlx.require_layout(dv.to(tl.bfloat16), out_layout, pin=False)
+    partial_head = ((pid_b * HKV + pid_hkv) * 4 + off_split).to(tl.int64)
+    partial_base = partial_head * SKV * D + n0 * D
+    tlx.buffer_store(dk_out, DK_PART + partial_base, output_offsets)
+    tlx.buffer_store(dv_out, DV_PART + partial_base, output_offsets)
+
+
+@triton.jit
+def _attn_bwd_dkdv_d64_causal_gqa8_reduce_kernel(
+    DK_PART,
+    DV_PART,
+    DK,
+    DV,
+    HKV: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Reduce split 0,1,2,3 in FP32, then narrow exactly once."""
+    tl.static_assert(D == 64 and BLOCK_N == 128 and SKV % BLOCK_N == 0)
+    pid_n = tl.program_id(0)
+    pid_hkv = tl.program_id(1)
+    pid_b = tl.program_id(2)
+    n0 = pid_n * BLOCK_N
+    out_layout: tl.constexpr = tlx.layout(
+        shape=(
+            (2, 2, 2, 2, 2, 2, 2, 2),
+            (2, 2, 2, 2, 2),
+        ),
+        stride=(
+            (64, 128, 256, 512, 8, 16, 1024, 2048),
+            (1, 2, 4, 32, 4096),
+        ),
+    )
+    offsets = (tl.arange(0, BLOCK_N)[:, None] * D + tl.arange(0, D)[None, :]).to(tl.int32)
+    offsets = tlx.require_layout(offsets, out_layout, pin=False)
+    owner = (pid_b * HKV + pid_hkv).to(tl.int64)
+    split_stride: tl.constexpr = SKV * D
+    partial_base = owner * 4 * split_stride + n0 * D
+
+    dk_split0 = tlx.buffer_load(DK_PART + partial_base + 0 * split_stride, offsets)
+    dv_split0 = tlx.buffer_load(DV_PART + partial_base + 0 * split_stride, offsets)
+    dk_acc = dk_split0.to(tl.float32)
+    dv_acc = dv_split0.to(tl.float32)
+    dk_split1 = tlx.buffer_load(DK_PART + partial_base + 1 * split_stride, offsets)
+    dv_split1 = tlx.buffer_load(DV_PART + partial_base + 1 * split_stride, offsets)
+    dk_acc = dk_acc + dk_split1.to(tl.float32)
+    dv_acc = dv_acc + dv_split1.to(tl.float32)
+    dk_split2 = tlx.buffer_load(DK_PART + partial_base + 2 * split_stride, offsets)
+    dv_split2 = tlx.buffer_load(DV_PART + partial_base + 2 * split_stride, offsets)
+    dk_acc = dk_acc + dk_split2.to(tl.float32)
+    dv_acc = dv_acc + dv_split2.to(tl.float32)
+    dk_split3 = tlx.buffer_load(DK_PART + partial_base + 3 * split_stride, offsets)
+    dv_split3 = tlx.buffer_load(DV_PART + partial_base + 3 * split_stride, offsets)
+    dk_acc = dk_acc + dk_split3.to(tl.float32)
+    dv_acc = dv_acc + dv_split3.to(tl.float32)
+
+    output_base = owner * SKV * D + n0 * D
+    dk_out = tlx.require_layout(dk_acc.to(tl.bfloat16), out_layout, pin=False)
+    dv_out = tlx.require_layout(dv_acc.to(tl.bfloat16), out_layout, pin=False)
+    tlx.buffer_store(dk_out, DK + output_base, offsets)
+    tlx.buffer_store(dv_out, DV + output_base, offsets)
+
+
+@triton.jit
+def _attn_bwd_dq_d64_update(
+    q_tile,
+    do_tile,
+    lse,
+    delta,
+    dq,
+    k_tile,
+    k_t,
+    v_t,
+    offs_m,
+    offs_n,
+    SM_SCALE: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+):
+    log2e: tl.constexpr = 1.4426950408889634
+    scores = tl.dot(q_tile, k_t)
+    scores = scores * (SM_SCALE * log2e) - lse[:, None] * log2e
+    valid = (offs_m[:, None] < SQ) & (offs_n[None, :] < SKV)
+    if IS_CAUSAL:
+        valid = valid & (offs_n[None, :] <= offs_m[:, None] + (SKV - SQ))
+    scores = tl.where(valid, scores, float("-inf"))
+    p = tl.math.exp2(scores)
+    dp = tl.dot(do_tile, v_t)
+    ds = p * (dp - delta[:, None])
+    return tl.dot(ds.to(tl.bfloat16), k_tile, dq)
+
+
+@triton.jit
+def _attn_bwd_dq_d64_direct_kernel(
+    Q,
+    K,
+    V,
+    DO,
+    LSE,
+    Delta,
+    DQ,
+    SM_SCALE: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    HQ: tl.constexpr,
+    HKV: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    OWNER_ROWS: tl.constexpr,
+):
+    """Query-owned D64 dQ with shared K/V and direct fragment stores."""
+    tl.static_assert(D == 64)
+    tl.static_assert(BLOCK_M == 32 or BLOCK_M == 64)
+    tl.static_assert(BLOCK_N == 32 or BLOCK_N == 64 or BLOCK_N == 256)
+    tl.static_assert(OWNER_ROWS == BLOCK_M or OWNER_ROWS == 192 or OWNER_ROWS == 256)
+    tl.static_assert(HQ % HKV == 0)
+    pid_owner = tl.program_id(0)
+    pid_hq = tl.program_id(1)
+    pid_b = tl.program_id(2)
+    group_size: tl.constexpr = HQ // HKV
+    pid_hkv = pid_hq // group_size
+    offs_d = tl.arange(0, D)
+    q_head = (pid_b * HQ + pid_hq).to(tl.int64)
+    kv_head = (pid_b * HKV + pid_hkv).to(tl.int64)
+    q_base = q_head * SQ * D
+    kv_base = kv_head * SKV * D
+    stats_base = q_head * SQ
+
+    num_owners: tl.constexpr = tl.cdiv(SQ, OWNER_ROWS)
+    logical_owner = num_owners - 1 - pid_owner if IS_CAUSAL else pid_owner
+    owner_start = logical_owner * OWNER_ROWS
+    offs_m0 = owner_start + tl.arange(0, BLOCK_M)
+    qdo_ptrs0 = q_base + offs_m0[:, None] * D + offs_d[None, :]
+    qdo_mask0 = offs_m0[:, None] < SQ
+    q0 = tl.load(Q + qdo_ptrs0, mask=qdo_mask0, other=0.0)
+    do0 = tl.load(DO + qdo_ptrs0, mask=qdo_mask0, other=0.0)
+    lse0 = tl.load(LSE + stats_base + offs_m0, mask=offs_m0 < SQ, other=0.0)
+    delta0 = tl.load(Delta + stats_base + offs_m0, mask=offs_m0 < SQ, other=0.0)
+    dq0 = tl.zeros((BLOCK_M, D), tl.float32)
+    if OWNER_ROWS >= 128:
+        offs_m1 = owner_start + 64 + tl.arange(0, 64)
+        qdo_ptrs1 = q_base + offs_m1[:, None] * D + offs_d[None, :]
+        qdo_mask1 = offs_m1[:, None] < SQ
+        q1 = tl.load(Q + qdo_ptrs1, mask=qdo_mask1, other=0.0)
+        do1 = tl.load(DO + qdo_ptrs1, mask=qdo_mask1, other=0.0)
+        lse1 = tl.load(LSE + stats_base + offs_m1, mask=offs_m1 < SQ, other=0.0)
+        delta1 = tl.load(Delta + stats_base + offs_m1, mask=offs_m1 < SQ, other=0.0)
+        dq1 = tl.zeros((64, D), tl.float32)
+        offs_m2 = owner_start + 128 + tl.arange(0, 64)
+        qdo_ptrs2 = q_base + offs_m2[:, None] * D + offs_d[None, :]
+        qdo_mask2 = offs_m2[:, None] < SQ
+        q2 = tl.load(Q + qdo_ptrs2, mask=qdo_mask2, other=0.0)
+        do2 = tl.load(DO + qdo_ptrs2, mask=qdo_mask2, other=0.0)
+        lse2 = tl.load(LSE + stats_base + offs_m2, mask=offs_m2 < SQ, other=0.0)
+        delta2 = tl.load(Delta + stats_base + offs_m2, mask=offs_m2 < SQ, other=0.0)
+        dq2 = tl.zeros((64, D), tl.float32)
+    if OWNER_ROWS == 256:
+        offs_m3 = owner_start + 192 + tl.arange(0, 64)
+        qdo_ptrs3 = q_base + offs_m3[:, None] * D + offs_d[None, :]
+        qdo_mask3 = offs_m3[:, None] < SQ
+        q3 = tl.load(Q + qdo_ptrs3, mask=qdo_mask3, other=0.0)
+        do3 = tl.load(DO + qdo_ptrs3, mask=qdo_mask3, other=0.0)
+        lse3 = tl.load(LSE + stats_base + offs_m3, mask=offs_m3 < SQ, other=0.0)
+        delta3 = tl.load(Delta + stats_base + offs_m3, mask=offs_m3 < SQ, other=0.0)
+        dq3 = tl.zeros((64, D), tl.float32)
+
+    if BLOCK_N == 32:
+        row_bases: tl.constexpr = [[16, 0], [8, 0], [1, 0], [2, 0], [4, 0]]
+    else:
+        if BLOCK_N == 64:
+            row_bases: tl.constexpr = [[16, 0], [32, 0], [1, 0], [2, 0], [4, 0], [8, 0]]
+        else:
+            row_bases: tl.constexpr = [
+                [16, 0],
+                [32, 0],
+                [64, 0],
+                [128, 0],
+                [1, 0],
+                [2, 0],
+                [4, 0],
+                [8, 0],
+            ]
+    shared_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 32)],
+        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]] + row_bases,
+        [BLOCK_N, D],
+    )
+    k_buffer = tlx.local_alloc((BLOCK_N, D), tl.bfloat16, 1, layout=shared_layout)
+    v_buffer = tlx.local_alloc((BLOCK_N, D), tl.bfloat16, 1, layout=shared_layout)
+    if IS_CAUSAL:
+        owner_key_end = tl.minimum(SKV, owner_start + OWNER_ROWS + (SKV - SQ))
+        num_n_blocks = (owner_key_end + BLOCK_N - 1) // BLOCK_N
+    else:
+        num_n_blocks: tl.constexpr = tl.cdiv(SKV, BLOCK_N)
+
+    for n_block in range(0, num_n_blocks):
+        tl.debug_barrier()
+        offs_n = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+        kv_ptrs = kv_base + offs_n[:, None] * D + offs_d[None, :]
+        kv_mask = offs_n[:, None] < SKV
+        k_token = tlx.async_load(K + kv_ptrs, tlx.local_view(k_buffer, 0), mask=kv_mask, other=0.0)
+        v_token = tlx.async_load(V + kv_ptrs, tlx.local_view(v_buffer, 0), mask=kv_mask, other=0.0)
+        tlx.async_load_commit_group([k_token, v_token])
+        kv_wait = tlx.async_load_wait_group(0)
+        k_tile = tlx.local_load(tlx.local_view(k_buffer, 0), token=kv_wait)
+        k_t = tlx.local_load(tlx.local_trans(tlx.local_view(k_buffer, 0)), token=kv_wait)
+        v_t = tlx.local_load(tlx.local_trans(tlx.local_view(v_buffer, 0)), token=kv_wait)
+        dq0 = _attn_bwd_dq_d64_update(q0, do0, lse0, delta0, dq0, k_tile, k_t, v_t, offs_m0, offs_n, SM_SCALE,
+                                      IS_CAUSAL, SQ, SKV)
+        if OWNER_ROWS >= 128:
+            dq1 = _attn_bwd_dq_d64_update(q1, do1, lse1, delta1, dq1, k_tile, k_t, v_t, offs_m1, offs_n, SM_SCALE,
+                                          IS_CAUSAL, SQ, SKV)
+            dq2 = _attn_bwd_dq_d64_update(q2, do2, lse2, delta2, dq2, k_tile, k_t, v_t, offs_m2, offs_n, SM_SCALE,
+                                          IS_CAUSAL, SQ, SKV)
+        if OWNER_ROWS == 256:
+            dq3 = _attn_bwd_dq_d64_update(q3, do3, lse3, delta3, dq3, k_tile, k_t, v_t, offs_m3, offs_n, SM_SCALE,
+                                          IS_CAUSAL, SQ, SKV)
+
+    tl.store(DQ + qdo_ptrs0, (dq0 * SM_SCALE).to(tl.bfloat16), mask=qdo_mask0)
+    if OWNER_ROWS >= 128:
+        tl.store(DQ + qdo_ptrs1, (dq1 * SM_SCALE).to(tl.bfloat16), mask=qdo_mask1)
+        tl.store(DQ + qdo_ptrs2, (dq2 * SM_SCALE).to(tl.bfloat16), mask=qdo_mask2)
+    if OWNER_ROWS == 256:
+        tl.store(DQ + qdo_ptrs3, (dq3 * SM_SCALE).to(tl.bfloat16), mask=qdo_mask3)
+
+
+@triton.jit
+def _attn_bwd_dkdv_d64_direct_kernel(
+    Q,
+    K,
+    V,
+    DO,
+    LSE,
+    Delta,
+    DK,
+    DV,
+    SM_SCALE: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    HQ: tl.constexpr,
+    HKV: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    KV_SPLITS: tl.constexpr,
+):
+    """KV-owned D64 dK/dV with deterministic FP32 GQA accumulation."""
+    tl.static_assert(D == 64)
+    tl.static_assert(BLOCK_M == 64 and BLOCK_N == 64)
+    tl.static_assert(HQ % HKV == 0)
+    tl.static_assert((HQ // HKV) % KV_SPLITS == 0)
+    pid_n = tl.program_id(0)
+    pid_hkv_split = tl.program_id(1)
+    pid_b = tl.program_id(2)
+    group_size: tl.constexpr = HQ // HKV
+    heads_per_split: tl.constexpr = group_size // KV_SPLITS
+    pid_hkv = pid_hkv_split // KV_SPLITS
+    pid_split = pid_hkv_split % KV_SPLITS
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, D)
+    kv_head = (pid_b * HKV + pid_hkv).to(tl.int64)
+    kv_base = kv_head * SKV * D
+    kv_ptrs = kv_base + offs_n[:, None] * D + offs_d[None, :]
+    kv_mask = offs_n[:, None] < SKV
+    k_tile = tl.load(K + kv_ptrs, mask=kv_mask, other=0.0)
+    v_tile = tl.load(V + kv_ptrs, mask=kv_mask, other=0.0)
+
+    shared_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 32)],
+        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [1, 0], [2, 0], [4, 0], [8, 0]],
+        [BLOCK_M, D],
+    )
+    q_buffer = tlx.local_alloc((BLOCK_M, D), tl.bfloat16, 1, layout=shared_layout)
+    do_buffer = tlx.local_alloc((BLOCK_M, D), tl.bfloat16, 1, layout=shared_layout)
+    dk = tl.zeros((BLOCK_N, D), tl.float32)
+    dv = tl.zeros((BLOCK_N, D), tl.float32)
+    num_m_blocks: tl.constexpr = tl.cdiv(SQ, BLOCK_M)
+    if IS_CAUSAL:
+        first_m_block = tl.maximum(0, pid_n * BLOCK_N - (SKV - SQ)) // BLOCK_M
+    else:
+        first_m_block: tl.constexpr = 0
+    causal_shift: tl.constexpr = SKV - SQ
+    log2e: tl.constexpr = 1.4426950408889634
+
+    for local_group_head in tl.static_range(0, heads_per_split):
+        group_head = pid_split * heads_per_split + local_group_head
+        pid_hq = pid_hkv * group_size + group_head
+        q_head = (pid_b * HQ + pid_hq).to(tl.int64)
+        q_base = q_head * SQ * D
+        stats_base = q_head * SQ
+        for m_block in range(first_m_block, num_m_blocks):
+            tl.debug_barrier()
+            offs_m = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
+            qdo_ptrs = q_base + offs_m[:, None] * D + offs_d[None, :]
+            qdo_mask = offs_m[:, None] < SQ
+            q_token = tlx.async_load(Q + qdo_ptrs, tlx.local_view(q_buffer, 0), mask=qdo_mask, other=0.0)
+            do_token = tlx.async_load(DO + qdo_ptrs, tlx.local_view(do_buffer, 0), mask=qdo_mask, other=0.0)
+            tlx.async_load_commit_group([q_token, do_token])
+            qdo_wait = tlx.async_load_wait_group(0)
+            q_tile = tlx.local_load(tlx.local_view(q_buffer, 0), token=qdo_wait)
+            do_tile = tlx.local_load(tlx.local_view(do_buffer, 0), token=qdo_wait)
+            q_t = tlx.local_load(tlx.local_trans(tlx.local_view(q_buffer, 0)), token=qdo_wait)
+            do_t = tlx.local_load(tlx.local_trans(tlx.local_view(do_buffer, 0)), token=qdo_wait)
+            lse = tl.load(LSE + stats_base + offs_m, mask=offs_m < SQ, other=0.0)
+            delta = tl.load(Delta + stats_base + offs_m, mask=offs_m < SQ, other=0.0)
+            scores_t = tl.dot(k_tile, q_t)
+            scores_t = scores_t * (SM_SCALE * log2e) - lse[None, :] * log2e
+            valid = (offs_n[:, None] < SKV) & (offs_m[None, :] < SQ)
+            if IS_CAUSAL:
+                valid = valid & (offs_n[:, None] <= offs_m[None, :] + causal_shift)
+            scores_t = tl.where(valid, scores_t, float("-inf"))
+            p_t = tl.math.exp2(scores_t)
+            dp_t = tl.dot(v_tile, do_t)
+            ds_t = p_t * (dp_t - delta[None, :])
+            dv = tl.dot(p_t.to(tl.bfloat16), do_tile, dv)
+            dk = tl.dot(ds_t.to(tl.bfloat16), q_tile, dk)
+
+    dk *= SM_SCALE
+    if KV_SPLITS == 1:
+        output_ptrs = kv_ptrs
+    else:
+        partial_head = ((pid_b * HKV + pid_hkv) * KV_SPLITS + pid_split).to(tl.int64)
+        output_ptrs = partial_head * SKV * D + offs_n[:, None] * D + offs_d[None, :]
+    tl.store(DK + output_ptrs, dk.to(tl.bfloat16), mask=kv_mask)
+    tl.store(DV + output_ptrs, dv.to(tl.bfloat16), mask=kv_mask)
+
+
+@triton.jit
+def _attn_bwd_dkdv_d64_reduce_kernel(
+    DK_PART,
+    DV_PART,
+    DK,
+    DV,
+    HKV: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    KV_SPLITS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Reduce fixed-order BF16 GQA partials in FP32 and narrow once."""
+    tl.static_assert(D == 64 and BLOCK_N == 64)
+    pid_n = tl.program_id(0)
+    pid_hkv = tl.program_id(1)
+    pid_b = tl.program_id(2)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, D)
+    mask = offs_n[:, None] < SKV
+    dk = tl.zeros((BLOCK_N, D), tl.float32)
+    dv = tl.zeros((BLOCK_N, D), tl.float32)
+    for split in tl.static_range(0, KV_SPLITS):
+        partial_head = ((pid_b * HKV + pid_hkv) * KV_SPLITS + split).to(tl.int64)
+        partial_ptrs = partial_head * SKV * D + offs_n[:, None] * D + offs_d[None, :]
+        dk += tl.load(DK_PART + partial_ptrs, mask=mask, other=0.0).to(tl.float32)
+        dv += tl.load(DV_PART + partial_ptrs, mask=mask, other=0.0).to(tl.float32)
+    output_head = (pid_b * HKV + pid_hkv).to(tl.int64)
+    output_ptrs = output_head * SKV * D + offs_n[:, None] * D + offs_d[None, :]
+    tl.store(DK + output_ptrs, dk.to(tl.bfloat16), mask=mask)
+    tl.store(DV + output_ptrs, dv.to(tl.bfloat16), mask=mask)
+
+
+def _launch_bwd_d64_dq(q, k, v, do, lse, delta, dq, sm_scale, causal, dispatch):
+    batch, hq, sq, head_dim = q.shape
+    _k_batch, hkv, skv, _k_head_dim = k.shape
+    dq_block_m = 32 if dispatch.owner_rows == 32 else 64
+    _attn_bwd_dq_d64_direct_kernel[(triton.cdiv(sq, dispatch.owner_rows), hq, batch)](
+        q,
+        k,
+        v,
+        do,
+        lse,
+        delta,
+        dq,
+        SM_SCALE=sm_scale,
+        IS_CAUSAL=causal,
+        HQ=hq,
+        HKV=hkv,
+        SQ=sq,
+        SKV=skv,
+        D=head_dim,
+        BLOCK_M=dq_block_m,
+        BLOCK_N=dispatch.key_rows,
+        OWNER_ROWS=dispatch.owner_rows,
+        num_warps=4,
+        matrix_instr_nonkdim=_matrix_instr_nonkdim(),
+    )
+
+
+def _launch_bwd_d64_causal_dq(
+    q,
+    k,
+    v,
+    o,
+    do,
+    lse,
+    delta,
+    lse_term,
+    dq,
+    sm_scale,
+    dispatch,
+):
+    batch, hq, sq, head_dim = q.shape
+    _k_batch, hkv, skv, _k_head_dim = k.shape
+    if dispatch.stat_mode == _D64_MHA_POSITIVE:
+        if lse_term is not None:
+            raise ValueError("MHA positive dQ must not receive lse_term")
+        kernel = _attn_bwd_dq_d64_causal_mha_kernel
+    elif dispatch.stat_mode == _D64_GQA_SIGNED:
+        if lse_term is None:
+            raise ValueError("GQA signed dQ requires lse_term")
+        kernel = _attn_bwd_dq_d64_causal_gqa8_kernel
+    else:
+        raise ValueError(f"unknown dQ stat mode {dispatch.stat_mode!r}")
+
+    for launch in dispatch.dq_launches:
+        grid = (batch * hq * launch.launch_tiles, )
+        args = (q, k, v, o, do, lse, delta)
+        if dispatch.stat_mode == _D64_GQA_SIGNED:
+            args += (lse_term, )
+        args += (dq, )
+        kernel[grid](
+            *args,
+            SM_SCALE=sm_scale,
+            HQ=hq,
+            HKV=hkv,
+            SQ=sq,
+            SKV=skv,
+            D=head_dim,
+            OWNER_ROWS=dispatch.owner_rows,
+            LOGICAL_N=dispatch.dq_logical_n,
+            USE_DQ_XCD=dispatch.dq_use_xcd,
+            SKIP_OWNER_TAIL=launch.skip_owner_tail,
+            OWNER_PID_BASE=launch.owner_pid_base,
+            LAUNCH_Q_TILES=launch.launch_q_tiles,
+            OWNER_FRAGMENTS=launch.owner_fragments,
+            GRID_OWNER_M=launch.grid_owner_m,
+            num_warps=4,
+            matrix_instr_nonkdim=_matrix_instr_nonkdim(),
+        )
+
+
+def _launch_bwd_d64_causal_mha_dkdv(q, k, v, do, lse, delta, dk, dv, sm_scale, dispatch):
+    batch, hq, sq, head_dim = q.shape
+    _k_batch, hkv, skv, _k_head_dim = k.shape
+    _require_d64_dispatch_variant(
+        dispatch,
+        "causal_gluon_mha",
+        stat_mode=_D64_MHA_POSITIVE,
+        kv_splits=1,
+    )
+    grid = (batch * hkv * triton.cdiv(skv, 64), )
+    _attn_bwd_dkdv_d64_causal_mha_kernel[grid](
+        q,
+        k,
+        v,
+        do,
+        lse,
+        delta,
+        dk,
+        dv,
+        SM_SCALE=sm_scale,
+        HQ=hq,
+        HKV=hkv,
+        SQ=sq,
+        SKV=skv,
+        D=head_dim,
+        BLOCK_M=32,
+        BLOCK_N=64,
+        LSE_MODE=_D64_LSE_NATURAL_LOG,
+        DELTA_MODE=_D64_DELTA_POSITIVE,
+        num_warps=2,
+        matrix_instr_nonkdim=_matrix_instr_nonkdim(),
+    )
+
+
+def _launch_bwd_d64_causal_gqa8_dkdv(
+    q,
+    k,
+    v,
+    do,
+    lse_term,
+    delta,
+    dk_part,
+    dv_part,
+    sm_scale,
+    dispatch,
+):
+    batch, hq, sq, head_dim = q.shape
+    _k_batch, hkv, skv, _k_head_dim = k.shape
+    _require_d64_dispatch_variant(
+        dispatch,
+        "causal_gluon_gqa8",
+        stat_mode=_D64_GQA_SIGNED,
+        kv_splits=4,
+    )
+    use_gqa_xcd = dispatch.gqa_grid_mode != _D64_GQA_SPLIT_FAST
+    use_xcd_n_fast = dispatch.gqa_grid_mode == _D64_GQA_XCD_N_FAST
+    grid = (batch * hkv * 4 * triton.cdiv(skv, 128), )
+    _attn_bwd_dkdv_d64_causal_gqa8_kernel[grid](
+        q,
+        k,
+        v,
+        do,
+        lse_term,
+        delta,
+        dk_part,
+        dv_part,
+        SM_SCALE=sm_scale,
+        HQ=hq,
+        HKV=hkv,
+        SQ=sq,
+        SKV=skv,
+        D=head_dim,
+        BLOCK_M=64,
+        BLOCK_N=128,
+        USE_GQA_XCD=use_gqa_xcd,
+        USE_XCD_N_FAST=use_xcd_n_fast,
+        CYCLIC_QUERY_SPLIT=dispatch.cyclic_query_split,
+        LIFETIME_MODE=dispatch.dkdv_lifetime,
+        LSE_MODE=_D64_LSE_NEG_INV_SCALE,
+        DELTA_MODE=_D64_DELTA_NEGATED,
+        num_warps=4,
+        matrix_instr_nonkdim=_matrix_instr_nonkdim(),
+    )
+
+
+def _launch_bwd_d64_causal_gqa8_reduce(dk_part, dv_part, dk, dv):
+    batch, hkv, skv, head_dim = dk.shape
+    block_n = 128
+    _attn_bwd_dkdv_d64_causal_gqa8_reduce_kernel[(triton.cdiv(skv, block_n), hkv, batch)](
+        dk_part,
+        dv_part,
+        dk,
+        dv,
+        HKV=hkv,
+        SKV=skv,
+        D=head_dim,
+        BLOCK_N=block_n,
+        num_warps=4,
+    )
+
+
+def _allocate_bwd_d64_kv_partials(k, kv_splits):
+    if kv_splits == 1:
+        return None, None
+    batch, hkv, skv, head_dim = k.shape
+    partial_shape = (batch, hkv, kv_splits, skv, head_dim)
+    dk_part = torch.empty(partial_shape, device=k.device, dtype=k.dtype)
+    return dk_part, torch.empty_like(dk_part)
+
+
+def _allocate_bwd_d64_causal_gqa8_workspaces(q, k):
+    batch, hq, sq, _d = q.shape
+    _kb, hkv, skv, head_dim = k.shape
+    lse_term = torch.empty((batch, hq, sq), device=q.device, dtype=torch.float32)
+    partial_shape = (batch, hkv, 4, skv, head_dim)
+    dk_part = torch.empty(partial_shape, device=k.device, dtype=torch.bfloat16)
+    return lse_term, dk_part, torch.empty_like(dk_part)
+
+
+def _allocate_bwd_d64_fused_workspaces(q, k, dispatch):
+    _require_d64_dispatch_variant(dispatch, "noncausal_fused_n256")
+    dq_acc = torch.empty_like(q, dtype=torch.float32)
+    if dispatch.kv_splits == 1:
+        return dq_acc, None, None
+    dk_part, dv_part = _allocate_bwd_d64_kv_partials(k, dispatch.kv_splits)
+    return dq_acc, dk_part, dv_part
+
+
+def _launch_bwd_d64_fused_n256(
+    q,
+    k,
+    v,
+    do,
+    lse,
+    delta,
+    dq_acc,
+    dk_owner,
+    dv_owner,
+    sm_scale,
+    dispatch,
+):
+    batch, hq, sq, head_dim = q.shape
+    _k_batch, hkv, skv, _k_head_dim = k.shape
+    _attn_bwd_d64_fused_n256_kernel[(triton.cdiv(skv, 256), hq, batch)](
+        q,
+        k,
+        v,
+        do,
+        lse,
+        delta,
+        dq_acc,
+        dk_owner,
+        dv_owner,
+        SM_SCALE=sm_scale,
+        HQ=hq,
+        HKV=hkv,
+        SQ=sq,
+        SKV=skv,
+        D=head_dim,
+        BLOCK_M=32,
+        BLOCK_N=256,
+        KV_SPLITS=dispatch.kv_splits,
+        num_warps=4,
+        matrix_instr_nonkdim=_matrix_instr_nonkdim(),
+    )
+
+
+def _launch_bwd_d64_fused_dq_convert(dq_acc, dq):
+    batch, hq, sq, head_dim = dq.shape
+    block_m = 64
+    _attn_bwd_d64_fused_dq_convert_kernel[(triton.cdiv(sq, block_m), batch * hq)](
+        dq_acc,
+        dq,
+        N=sq,
+        D=head_dim,
+        BLOCK_M=block_m,
+        num_warps=4,
+    )
+
+
+def _launch_bwd_d64_dkdv(q, k, v, do, lse, delta, dk_target, dv_target, sm_scale, causal, dispatch):
+    batch, hq, sq, head_dim = q.shape
+    _k_batch, hkv, skv, _k_head_dim = k.shape
+    dkdv_block = 64
+    _attn_bwd_dkdv_d64_direct_kernel[(triton.cdiv(skv, dkdv_block), hkv * dispatch.kv_splits, batch)](
+        q,
+        k,
+        v,
+        do,
+        lse,
+        delta,
+        dk_target,
+        dv_target,
+        SM_SCALE=sm_scale,
+        IS_CAUSAL=causal,
+        HQ=hq,
+        HKV=hkv,
+        SQ=sq,
+        SKV=skv,
+        D=head_dim,
+        BLOCK_M=dkdv_block,
+        BLOCK_N=dkdv_block,
+        KV_SPLITS=dispatch.kv_splits,
+        num_warps=4,
+        matrix_instr_nonkdim=_matrix_instr_nonkdim(),
+    )
+
+
+def _launch_bwd_d64_kv_reduce(dk_part, dv_part, dk, dv, dispatch):
+    batch, hkv, skv, head_dim = dk.shape
+    block_n = 64
+    _attn_bwd_dkdv_d64_reduce_kernel[(triton.cdiv(skv, block_n), hkv, batch)](
+        dk_part,
+        dv_part,
+        dk,
+        dv,
+        HKV=hkv,
+        SKV=skv,
+        D=head_dim,
+        KV_SPLITS=dispatch.kv_splits,
+        BLOCK_N=block_n,
+        num_warps=4,
+    )
+
+
+def _run_bwd_d64_direct(q, k, v, do, lse, delta, dq, dk, dv, sm_scale, causal, dispatch):
+    _validate_d64_dispatch(tuple(q.shape), tuple(k.shape), causal, dispatch)
+    if dispatch.family not in {
+            "noncausal_direct_n256",
+            "causal_m192",
+            "causal_m256",
+    }:
+        _invalid_d64_dispatch(dispatch, "family cannot use the direct route")
+    _launch_bwd_d64_dq(q, k, v, do, lse, delta, dq, sm_scale, causal, dispatch)
+    dk_part, dv_part = _allocate_bwd_d64_kv_partials(k, dispatch.kv_splits)
+    dk_target = dk if dk_part is None else dk_part
+    dv_target = dv if dv_part is None else dv_part
+    _launch_bwd_d64_dkdv(q, k, v, do, lse, delta, dk_target, dv_target, sm_scale, causal, dispatch)
+    if dk_part is not None:
+        _launch_bwd_d64_kv_reduce(dk_part, dv_part, dk, dv, dispatch)
+
+
+def _select_d64_dispatch_for_device(q, k, v, o, do, lse, sm_scale, causal):
+    properties = torch.cuda.get_device_properties(q.device)
+    bases_aligned_16 = all(tensor.data_ptr() % 16 == 0 for tensor in (q, k, v, o, do, lse))
+    return _select_d64_dispatch(
+        tuple(q.shape),
+        tuple(k.shape),
+        causal,
+        arch=properties.gcnArchName,
+        cu_count=properties.multi_processor_count,
+        sm_scale=sm_scale,
+        bases_aligned_16=bases_aligned_16,
+    )
+
+
+def _run_bwd_d64(q, k, v, o, do, lse, delta, dq, dk, dv, sm_scale, causal, dispatch):
+    _validate_d64_dispatch(tuple(q.shape), tuple(k.shape), causal, dispatch)
+    if dispatch.family == "causal_gluon_gqa8":
+        lse_term, dk_part, dv_part = (_allocate_bwd_d64_causal_gqa8_workspaces(q, k))
+        _launch_bwd_d64_causal_dq(
+            q,
+            k,
+            v,
+            o,
+            do,
+            lse,
+            delta,
+            lse_term,
+            dq,
+            sm_scale,
+            dispatch,
+        )
+        _launch_bwd_d64_causal_gqa8_dkdv(
+            q,
+            k,
+            v,
+            do,
+            lse_term,
+            delta,
+            dk_part,
+            dv_part,
+            sm_scale,
+            dispatch,
+        )
+        _launch_bwd_d64_causal_gqa8_reduce(dk_part, dv_part, dk, dv)
+        return
+    if dispatch.family == "causal_gluon_mha":
+        _launch_bwd_d64_causal_dq(
+            q,
+            k,
+            v,
+            o,
+            do,
+            lse,
+            delta,
+            None,
+            dq,
+            sm_scale,
+            dispatch,
+        )
+        _launch_bwd_d64_causal_mha_dkdv(
+            q,
+            k,
+            v,
+            do,
+            lse,
+            delta,
+            dk,
+            dv,
+            sm_scale,
+            dispatch,
+        )
+        return
+    if dispatch.family == "noncausal_fused_n256":
+        dq_acc, dk_part, dv_part = _allocate_bwd_d64_fused_workspaces(q, k, dispatch)
+        dk_owner = dk if dk_part is None else dk_part
+        dv_owner = dv if dv_part is None else dv_part
+        _run_bwd_preprocess(o, do, delta, dq_acc=dq_acc)
+        _launch_bwd_d64_fused_n256(
+            q,
+            k,
+            v,
+            do,
+            lse,
+            delta,
+            dq_acc,
+            dk_owner,
+            dv_owner,
+            sm_scale,
+            dispatch,
+        )
+        _launch_bwd_d64_fused_dq_convert(dq_acc, dq)
+        if dk_part is not None:
+            _launch_bwd_d64_kv_reduce(dk_part, dv_part, dk, dv, dispatch)
+        return
+
+    _run_bwd_preprocess(o, do, delta)
+    _run_bwd_d64_direct(q, k, v, do, lse, delta, dq, dk, dv, sm_scale, causal, dispatch)
 
 
 @triton.jit
@@ -4538,10 +8637,12 @@ def _validate_inputs(q, k, v, o, do, lse):
         n_ctx,
         head_dim,
     ))
-    if not (mha_shape or gqa_shape):
+    d64_shape = _is_supported_d64_shape(tuple(q.shape), tuple(k.shape))
+    if not (mha_shape or gqa_shape or d64_shape):
         supported = sorted(SUPPORTED_SHAPES)
         raise ValueError(f"supported MHA shapes are {supported}; supported GQA shapes "
-                         f"satisfy {_GQA_SHAPE_CONSTRAINT}; got q={tuple(q.shape)}, "
+                         f"satisfy {_GQA_SHAPE_CONSTRAINT}; {_D64_SHAPE_CONSTRAINT}; "
+                         f"got q={tuple(q.shape)}, "
                          f"k={tuple(k.shape)}")
     q_tensors = {"q": q, "o": o, "do": do}
     for name, tensor in q_tensors.items():
@@ -4570,6 +8671,31 @@ def _validate_inputs(q, k, v, o, do, lse):
 
 def fa_backward(q, k, v, o, do, lse, sm_scale, causal):
     _validate_inputs(q, k, v, o, do, lse)
+    if _is_supported_d64_shape(tuple(q.shape), tuple(k.shape)):
+        sm_scale = _validate_d64_sm_scale(sm_scale)
+        if causal and q.shape[2] > k.shape[2]:
+            raise ValueError("D64 bottom-right causal attention requires SQ <= SKV")
+        dispatch = _select_d64_dispatch_for_device(q, k, v, o, do, lse, sm_scale, causal)
+        dq = torch.empty_like(q)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+        delta = torch.empty(q.shape[:-1], device=q.device, dtype=torch.float32)
+        _run_bwd_d64(
+            q,
+            k,
+            v,
+            o,
+            do,
+            lse,
+            delta,
+            dq,
+            dk,
+            dv,
+            sm_scale,
+            causal,
+            dispatch,
+        )
+        return dq, dk, dv
     gqa_signature = (
         q.shape[0],
         q.shape[1],
@@ -4763,6 +8889,3601 @@ def test_gqa_supported_shapes_end_to_end_gfx950(shape):
     for actual, expected in zip(actual_grads, case.grads):
         assert torch.isfinite(actual).all()
         assert _snr_db(actual, expected) >= 40.0
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_d64_noncausal_mha_public_contract_gfx950():
+    case = _make_d64_gqa_smoke_case((1, 1, 1, 256, 256, 64), causal=False, seed=23)
+    actual_grads = fa_backward(*case.kernel_args)
+    for name, actual, expected in zip(("dq", "dk", "dv"), actual_grads, case.grads):
+        assert torch.isfinite(actual).all(), name
+        relative_l2 = torch.linalg.vector_norm(actual.float() - expected) / torch.linalg.vector_norm(expected)
+        assert relative_l2.item() < 5e-3, (name, relative_l2.item())
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_d64_noncausal_gqa_public_contract_gfx950():
+    case = _make_d64_gqa_smoke_case((1, 8, 1, 256, 256, 64), causal=False, seed=29)
+    actual_grads = fa_backward(*case.kernel_args)
+    for name, actual, expected in zip(("dq", "dk", "dv"), actual_grads, case.grads):
+        assert torch.isfinite(actual).all(), name
+        relative_l2 = torch.linalg.vector_norm(actual.float() - expected) / torch.linalg.vector_norm(expected)
+        assert relative_l2.item() < 5e-3, (name, relative_l2.item())
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_d64_noncausal_gqa_group2_public_contract_gfx950():
+    case = _make_d64_gqa_smoke_case((1, 2, 1, 256, 256, 64), causal=False, seed=43)
+    actual_grads = fa_backward(*case.kernel_args)
+    for name, actual, expected in zip(("dq", "dk", "dv"), actual_grads, case.grads):
+        assert torch.isfinite(actual).all(), name
+        relative_l2 = torch.linalg.vector_norm(actual.float() - expected) / torch.linalg.vector_norm(expected)
+        assert relative_l2.item() < 5e-3, (name, relative_l2.item())
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_d64_square_causal_mha_public_contract_gfx950():
+    case = _make_d64_gqa_smoke_case((1, 1, 1, 256, 256, 64), causal=True, seed=31)
+    actual_grads = fa_backward(*case.kernel_args)
+    for name, actual, expected in zip(("dq", "dk", "dv"), actual_grads, case.grads):
+        assert torch.isfinite(actual).all(), name
+        relative_l2 = torch.linalg.vector_norm(actual.float() - expected) / torch.linalg.vector_norm(expected)
+        assert relative_l2.item() < 5e-3, (name, relative_l2.item())
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_d64_square_causal_gqa_public_contract_gfx950():
+    case = _make_d64_gqa_smoke_case((1, 8, 1, 256, 256, 64), causal=True, seed=37)
+    actual_grads = fa_backward(*case.kernel_args)
+    for name, actual, expected in zip(("dq", "dk", "dv"), actual_grads, case.grads):
+        assert torch.isfinite(actual).all(), name
+        relative_l2 = torch.linalg.vector_norm(actual.float() - expected) / torch.linalg.vector_norm(expected)
+        assert relative_l2.item() < 5e-3, (name, relative_l2.item())
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_d64_bottom_right_rectangular_causal_gqa_public_contract_gfx950():
+    case = _make_d64_gqa_smoke_case((1, 8, 1, 256, 512, 64), causal=True, seed=41)
+    actual_grads = fa_backward(*case.kernel_args)
+    for name, actual, expected in zip(("dq", "dk", "dv"), actual_grads, case.grads):
+        assert torch.isfinite(actual).all(), name
+        relative_l2 = torch.linalg.vector_norm(actual.float() - expected) / torch.linalg.vector_norm(expected)
+        assert relative_l2.item() < 5e-3, (name, relative_l2.item())
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(
+    ("causal", "expected_family", "seed"),
+    (
+        pytest.param(False, "noncausal_direct_n256", 127, id="noncausal"),
+        pytest.param(True, "causal_m192", 131, id="bottom-right-causal"),
+    ),
+)
+def test_d64_64_aligned_public_fallback_gfx950(monkeypatch, causal, expected_family, seed):
+    case = _make_d64_gqa_smoke_case((1, 1, 1, 320, 384, 64), causal=causal, seed=seed)
+    assert torch.count_nonzero(case.q).item() > 0
+    dispatches = []
+    original_run = _run_bwd_d64
+
+    def record_dispatch(*args):
+        dispatches.append(args[-1])
+        return original_run(*args)
+
+    monkeypatch.setitem(globals(), "_run_bwd_d64", record_dispatch)
+    actual_grads = fa_backward(*case.kernel_args)
+
+    assert [dispatch.family for dispatch in dispatches] == [expected_family]
+    assert not dispatches[0].selected_causal
+    for name, actual, expected in zip(("dq", "dk", "dv"), actual_grads, case.grads):
+        assert torch.isfinite(actual).all(), name
+        assert torch.linalg.vector_norm(expected).item() > 0.0, name
+        relative_l2 = torch.linalg.vector_norm(actual.float() - expected.float()) / torch.linalg.vector_norm(
+            expected.float())
+        assert relative_l2.item() < 5e-3, (name, relative_l2.item())
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("case_name", ["t02", "t04"])
+def test_d64_causal_m256_ticket_accuracy_gfx950(case_name):
+    batch, sq, skv, hq, hkv, head_dim, causal = D64_BENCHMARK_SHAPES[case_name]
+    assert causal and sq == skv == 16384
+    dispatch = _select_d64_dispatch((batch, hq, sq, head_dim), (batch, hkv, skv, head_dim), causal)
+    assert dispatch.family == "causal_m256"
+    assert dispatch.kv_splits == (1 if hq == hkv else 4)
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(20260807 + int(case_name[1:]))
+
+    def random(shape):
+        return torch.randn(shape, generator=generator, device="cuda", dtype=torch.bfloat16).contiguous()
+
+    q = random((batch, hq, sq, head_dim))
+    k = random((batch, hkv, skv, head_dim))
+    v = random((batch, hkv, skv, head_dim))
+    do = random(q.shape)
+    sm_scale = head_dim**-0.5
+    state = torch.ops.aten._scaled_dot_product_flash_attention.default(q, k, v, 0.0, True, False, scale=sm_scale)
+    o, lse, cum_q, cum_k, max_q, max_k, rng, unused, _debug = state
+    reference = torch.ops.aten._scaled_dot_product_flash_attention_backward.default(do, q, k, v, o, lse, cum_q, cum_k,
+                                                                                    max_q, max_k, 0.0, True, rng,
+                                                                                    unused, scale=sm_scale)
+
+    actual = fa_backward(q, k, v, o.contiguous(), do, lse.contiguous(), sm_scale, True)
+
+    for name, result, expected in zip(("dq", "dk", "dv"), actual, reference):
+        assert torch.isfinite(result).all(), name
+        relative_l2 = torch.linalg.vector_norm(result.float() - expected.float()) / torch.linalg.vector_norm(
+            expected.float())
+        assert relative_l2.item() < 5e-3, (name, relative_l2.item())
+
+
+def test_d64_benchmark_shapes_match_ticket_table():
+    assert D64_BENCHMARK_SHAPES == {
+        "t01": (2, 16384, 16384, 32, 32, 64, False),
+        "t02": (2, 16384, 16384, 32, 32, 64, True),
+        "t03": (2, 16384, 16384, 32, 4, 64, False),
+        "t04": (2, 16384, 16384, 32, 4, 64, True),
+        "t05": (4, 4096, 4096, 48, 6, 64, True),
+        "t06": (4, 4096, 16384, 48, 6, 64, True),
+        "t07": (4, 4096, 8192, 48, 6, 64, True),
+        "t08": (4, 4096, 12288, 48, 6, 64, True),
+    }
+
+
+def test_d64_causal_stat_contract_formulas():
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(101)
+    q = torch.randn((3, 4), generator=generator, dtype=torch.float32)
+    k = torch.randn((5, 4), generator=generator, dtype=torch.float32)
+    v = torch.randn((5, 4), generator=generator, dtype=torch.float32)
+    o = torch.randn((3, 4), generator=generator, dtype=torch.float32)
+    do = torch.randn((3, 4), generator=generator, dtype=torch.float32)
+    lse = torch.randn((3, ), generator=generator, dtype=torch.float32)
+    sm_scale = 0.5
+
+    delta_mha, lse_term_mha = _d64_causal_stat_values(o, do, lse, sm_scale, _D64_MHA_POSITIVE)
+    delta_gqa, lse_term_gqa = _d64_causal_stat_values(o, do, lse, sm_scale, _D64_GQA_SIGNED)
+    with pytest.raises(ValueError, match=r"^unknown D64 stat mode 2$"):
+        _d64_causal_stat_values(o, do, lse, sm_scale, 2)
+
+    delta_positive = torch.sum(o.float() * do.float(), dim=-1)
+    delta_signed = -delta_positive
+    lse_term = -lse.float() / sm_scale
+
+    torch.testing.assert_close(delta_mha, delta_positive)
+    torch.testing.assert_close(delta_gqa, delta_signed)
+    assert lse_term_mha is None
+    torch.testing.assert_close(lse_term_gqa, lse_term)
+    assert delta_gqa.dtype is lse_term_gqa.dtype is torch.float32
+    assert delta_gqa.is_contiguous() and lse_term_gqa.is_contiguous()
+
+    scores_mha = q.float() @ k.float().mT
+    p_mha = torch.exp2((scores_mha * sm_scale - lse.float()[..., None]) * math.log2(math.e))
+    ds_mha = p_mha * (do.float() @ v.float().mT - delta_positive[..., None])
+
+    scores_gqa = q.float() @ k.float().mT
+    p_gqa = torch.exp2((scores_gqa + lse_term[..., None]) * (sm_scale * math.log2(math.e)))
+    ds_gqa = p_gqa * (do.float() @ v.float().mT + delta_signed[..., None])
+
+    torch.testing.assert_close(p_mha, p_gqa)
+    torch.testing.assert_close(ds_mha, ds_gqa)
+
+
+def test_d64_causal_owner_interval_exhaustive():
+    for sq, owner_rows in (
+        (4096, 192),
+        (8192, 192),
+        (12288, 192),
+        (16384, 256),
+        (16448, 192),
+    ):
+        owners = triton.cdiv(sq, owner_rows)
+        for invalid_owner in (-1, owners):
+            with pytest.raises(
+                    ValueError,
+                    match=r"^physical owner is outside the dQ grid$",
+            ):
+                _d64_causal_owner_interval(invalid_owner, sq, owner_rows)
+        covered = []
+        for physical_owner in range(owners):
+            actual = _d64_causal_owner_interval(physical_owner, sq, owner_rows)
+            expected = (
+                max(
+                    (owners - 1 - physical_owner) * owner_rows - (owners * owner_rows - sq),
+                    0,
+                ),
+                min(
+                    (owners - 1 - physical_owner) * owner_rows - (owners * owner_rows - sq) + owner_rows,
+                    sq,
+                ),
+            )
+            assert actual == expected
+            covered.extend(range(*actual))
+        assert len(covered) == len(set(covered))
+        assert sorted(covered) == list(range(sq))
+
+
+def test_d64_causal_dq_grid_bijection_exhaustive():
+    launch_tiles = 5
+    owner_pid_base = 3
+    for batch, hq, hkv in ((2, 16, 16), (2, 64, 8)):
+        for use_xcd in (
+                False,
+                _d64_use_dq_xcd(batch, hkv, 8192, 8192, 192),
+        ):
+            assert use_xcd is (batch * hkv % 8 == 0) if use_xcd else True
+            decoded = []
+            for pid in range(batch * hq * launch_tiles):
+                coords = _d64_decode_dq_pid(
+                    pid,
+                    batch,
+                    hq,
+                    hkv,
+                    launch_tiles,
+                    use_xcd,
+                    owner_pid_base,
+                )
+                decoded.append(coords)
+                assert _d64_encode_dq_pid(
+                    *coords,
+                    batch,
+                    hq,
+                    hkv,
+                    launch_tiles,
+                    use_xcd,
+                    owner_pid_base,
+                ) == pid
+            assert len(decoded) == len(set(decoded))
+            assert set(decoded) == {(batch_id, hq_id, owner_pid_base + local_owner)
+                                    for batch_id in range(batch)
+                                    for hq_id in range(hq)
+                                    for local_owner in range(launch_tiles)}
+
+
+def test_d64_causal_dq_xcd_predicate_boundaries():
+    assert not _d64_use_dq_xcd(1, 7, 8192, 8192, 192)
+    assert _d64_use_dq_xcd(1, 8, 8192, 8192, 192)
+
+    assert not _d64_use_dq_xcd(1, 8, 4096, 4096, 192)
+    assert _d64_use_dq_xcd(1, 8, 4096, 4096, 256)
+    assert _d64_use_dq_xcd(1, 8, 4096, 4160, 192)
+    assert _d64_use_dq_xcd(1, 8, 4160, 4160, 192)
+    assert _d64_use_dq_xcd(1, 8, 3904, 3904, 192)
+    assert _d64_use_dq_xcd(1, 8, 5248, 5248, 192)
+    assert _d64_use_dq_xcd(8, 1, 4096, 4096, 192)
+
+
+def test_d64_causal_m192_launch_plan(monkeypatch):
+    batch, hq, hkv = 4, 64, 8
+    sq = skv = 8192
+    owner_rows = 192
+    cu_count = 256
+    owners = triton.cdiv(sq, owner_rows)
+    peeled = _d64_dq_launch_plan(
+        batch,
+        hq,
+        hkv,
+        sq,
+        skv,
+        owner_rows,
+        cu_count,
+        True,
+    )
+    assert peeled == (
+        _D64DQLaunch(owners - 1, False, 0, owners - 1, 3, 0),
+        _D64DQLaunch(1, False, owners - 1, 1, 2, 192),
+    )
+
+    false_boundaries = (
+        (batch, hq, hkv, 8000, 8000, owner_rows, cu_count, True),
+        (1, 7, 7, sq, skv, owner_rows, 1, True),
+        (1, hq, hkv, sq, skv, owner_rows, cu_count, True),
+        (batch, hq, hkv, sq, skv, owner_rows, cu_count, False),
+        (batch, hq, hkv, 8256, 8256, owner_rows, cu_count, True),
+    )
+    for args in false_boundaries:
+        local_owners = triton.cdiv(args[3], args[5])
+        assert _d64_dq_launch_plan(*args) == (_D64DQLaunch(local_owners, args[-1], 0, 0, 3, 0), )
+
+    with monkeypatch.context() as patch:
+        patch.setattr(triton, "cdiv", lambda _sq, _owner_rows: 1)
+        assert _d64_dq_launch_plan(
+            batch,
+            hq,
+            hkv,
+            sq,
+            skv,
+            owner_rows,
+            cu_count,
+            True,
+        ) == (_D64DQLaunch(1, True, 0, 0, 3, 0), )
+
+
+def test_d64_causal_m192_launch_coverage_and_order():
+    batch, hq, hkv = 4, 64, 8
+    sq = skv = 8192
+    owner_rows = 192
+    owners = triton.cdiv(sq, owner_rows)
+    launches = _d64_dq_launch_plan(batch, hq, hkv, sq, skv, owner_rows, 256, True)
+    assert launches == (
+        _D64DQLaunch(owners - 1, False, 0, owners - 1, 3, 0),
+        _D64DQLaunch(1, False, owners - 1, 1, 2, 192),
+    )
+
+    decoded_by_launch = []
+    for launch in launches:
+        decoded_by_launch.append([
+            _d64_decode_dq_pid(
+                pid,
+                batch,
+                hq,
+                hkv,
+                launch.launch_tiles,
+                True,
+                launch.owner_pid_base,
+            ) for pid in range(batch * hq * launch.launch_tiles)
+        ])
+
+    assert all(coords[2] < owners - 1 for coords in decoded_by_launch[0])
+    assert all(coords[2] == owners - 1 for coords in decoded_by_launch[1])
+    combined = decoded_by_launch[0] + decoded_by_launch[1]
+    assert len(combined) == len(set(combined))
+    assert set(combined) == {(batch_id, hq_id, physical_owner)
+                             for batch_id in range(batch)
+                             for hq_id in range(hq)
+                             for physical_owner in range(owners)}
+    assert _d64_causal_owner_interval(owners - 1, sq, owner_rows) == (
+        0,
+        128,
+    )
+
+
+def test_d64_causal_owner_triangular_tail_schedule_exhaustive():
+    for owner_fragments in (2, 3, 4):
+        for tail_step in range(owner_fragments):
+            modes = _d64_causal_triangular_tail_schedule(owner_fragments, owner_fragments, tail_step)
+            assert modes.count("masked") == 1
+            assert modes[tail_step] == "masked"
+            assert modes[:tail_step] == ("skip", ) * tail_step
+            assert modes[tail_step + 1:] == ("unmasked", ) * (owner_fragments - tail_step - 1)
+
+        for valid_fragments in range(1, owner_fragments + 1):
+            for tail_step in range(valid_fragments):
+                modes = _d64_causal_triangular_tail_schedule(owner_fragments, valid_fragments, tail_step)
+                assert modes.count("masked") == 1
+                assert modes[tail_step] == "masked"
+                assert all(mode == "skip" for mode in modes[valid_fragments:])
+
+
+def test_d64_structural_dispatch_locked_host_interface():
+    assert tuple(field.name for field in dataclasses.fields(_D64Dispatch)) == (
+        "family",
+        "owner_rows",
+        "key_rows",
+        "kv_splits",
+        "selected_causal",
+        "stat_mode",
+        "dq_logical_n",
+        "dq_use_xcd",
+        "dq_launches",
+        "gqa_grid_mode",
+        "cyclic_query_split",
+        "dkdv_lifetime",
+    )
+    for value in (
+            _D64_MHA_POSITIVE,
+            _D64_GQA_SIGNED,
+            _D64_LSE_NATURAL_LOG,
+            _D64_LSE_NEG_INV_SCALE,
+            _D64_DELTA_POSITIVE,
+            _D64_DELTA_NEGATED,
+    ):
+        assert type(value) is int
+    assert dataclasses.asdict(_D64Dispatch("retained", 192, 64, 1)) == {
+        "family": "retained",
+        "owner_rows": 192,
+        "key_rows": 64,
+        "kv_splits": 1,
+        "selected_causal": False,
+        "stat_mode": _D64_MHA_POSITIVE,
+        "dq_logical_n": 64,
+        "dq_use_xcd": False,
+        "dq_launches": (),
+        "gqa_grid_mode": None,
+        "cyclic_query_split": False,
+        "dkdv_lifetime": None,
+    }
+
+
+def test_d64_structural_dispatch_dq_launcher_stat_mode_contract():
+    q = torch.empty((1, 1, 64, 64), device="meta", dtype=torch.bfloat16)
+    stats = torch.empty((1, 1, 64), device="meta", dtype=torch.float32)
+
+    def launch(dispatch, lse_term):
+        _launch_bwd_d64_causal_dq(
+            q,
+            q,
+            q,
+            q,
+            q,
+            stats,
+            stats,
+            lse_term,
+            q,
+            0.125,
+            dispatch,
+        )
+
+    mha = _D64Dispatch("causal_gluon_mha", 192, 64, 1, stat_mode=_D64_MHA_POSITIVE)
+    with pytest.raises(ValueError) as exc_info:
+        launch(mha, stats)
+    assert exc_info.value.args == ("MHA positive dQ must not receive lse_term", )
+
+    gqa = dataclasses.replace(mha, stat_mode=_D64_GQA_SIGNED)
+    with pytest.raises(ValueError) as exc_info:
+        launch(gqa, None)
+    assert exc_info.value.args == ("GQA signed dQ requires lse_term", )
+
+    unknown = dataclasses.replace(mha, stat_mode=7)
+    with pytest.raises(ValueError) as exc_info:
+        launch(unknown, None)
+    assert exc_info.value.args == ("unknown dQ stat mode 7", )
+
+
+def test_d64_structural_dispatch_direct_route_uses_selected_record(monkeypatch):
+    q = torch.empty((1, 8, 256, 64), device="meta", dtype=torch.bfloat16)
+    k = torch.empty((1, 1, 256, 64), device="meta", dtype=torch.bfloat16)
+    stats = torch.empty((1, 8, 256), device="meta", dtype=torch.float32)
+    dispatch = _D64Dispatch("causal_m192", owner_rows=192, key_rows=32, kv_splits=4)
+    calls = []
+
+    def forbid_reselection(*args, **kwargs):
+        raise AssertionError("retained D64 route reselected dispatch")
+
+    def preprocess(*args, **kwargs):
+        calls.append(("preprocess", None))
+
+    def launch_dq(*args, **kwargs):
+        calls.append(("dq", args[-1]))
+
+    def allocate(_k, kv_splits):
+        calls.append(("allocate", kv_splits))
+        return None, None
+
+    def launch_dkdv(*args, **kwargs):
+        calls.append(("dkdv", args[-1]))
+
+    monkeypatch.setitem(globals(), "_select_d64_dispatch", forbid_reselection)
+    monkeypatch.setitem(globals(), "_run_bwd_preprocess", preprocess)
+    monkeypatch.setitem(globals(), "_launch_bwd_d64_dq", launch_dq)
+    monkeypatch.setitem(globals(), "_allocate_bwd_d64_kv_partials", allocate)
+    monkeypatch.setitem(globals(), "_launch_bwd_d64_dkdv", launch_dkdv)
+
+    _run_bwd_d64(
+        q,
+        k,
+        k,
+        q,
+        q,
+        stats,
+        stats,
+        q,
+        k,
+        k,
+        0.125,
+        True,
+        dispatch,
+    )
+
+    assert calls == [
+        ("preprocess", None),
+        ("dq", dispatch),
+        ("allocate", dispatch.kv_splits),
+        ("dkdv", dispatch),
+    ]
+
+
+def test_d64_causal_gqa_grid_policy_ticket_shapes():
+    cu_count = 256
+    expected = {
+        "t04": (_D64_GQA_SPLIT_FAST, False),
+        "t05": (_D64_GQA_XCD, False),
+        "t06": (_D64_GQA_XCD_N_FAST, False),
+        "t07": (_D64_GQA_XCD, False),
+        "t08": (_D64_GQA_SPLIT_FAST, False),
+    }
+    for ticket, expected_policy in expected.items():
+        batch, sq, skv, _hq, hkv, _d, causal = D64_BENCHMARK_SHAPES[ticket]
+        assert causal
+        assert _d64_gqa_grid_policy(batch, hkv, sq, skv, cu_count) == expected_policy
+
+    cyclic = (8, 8, 16384, 16384, cu_count)
+    assert _d64_gqa_grid_policy(*cyclic) == (_D64_GQA_XCD_N_FAST, True)
+
+    # Negate each cyclic conjunct independently while retaining the others.
+    assert _d64_gqa_grid_policy(8, 8, 8192, 16384, cu_count) == (
+        _D64_GQA_SPLIT_FAST,
+        False,
+    )
+    assert _d64_gqa_grid_policy(8, 8, 8192, 8192, cu_count) == (
+        _D64_GQA_SPLIT_FAST,
+        False,
+    )
+    assert _d64_gqa_grid_policy(1, 8, 16384, 16384, cu_count) == (
+        _D64_GQA_SPLIT_FAST,
+        False,
+    )
+    assert _d64_gqa_grid_policy(10, 7, 16384, 16384, cu_count) == (
+        _D64_GQA_SPLIT_FAST,
+        False,
+    )
+
+    boundary_cases = (
+        ((1, 8, 4032, 4032, cu_count), (_D64_GQA_XCD, False)),
+        ((1, 8, 4096, 4096, cu_count), (_D64_GQA_SPLIT_FAST, False)),
+        ((4, 6, 8192, 8192, cu_count), (_D64_GQA_XCD, False)),
+        ((4, 6, 8256, 8256, cu_count), (_D64_GQA_SPLIT_FAST, False)),
+        ((4, 6, 4096, 16256, cu_count), (_D64_GQA_SPLIT_FAST, False)),
+        ((4, 6, 4096, 16384, cu_count), (_D64_GQA_XCD_N_FAST, False)),
+    )
+    for arguments, expected_policy in boundary_cases:
+        assert _d64_gqa_grid_policy(*arguments) == expected_policy
+
+
+def test_d64_causal_gqa_grid_bijection_exhaustive():
+    for batch, hkv, skv in (
+        (2, 8, 256),
+        (2, 8, 640),
+        (4, 6, 384),
+        (4, 6, 512),
+        (4, 6, 640),
+    ):
+        assert (batch * hkv) % 8 == 0
+        nt = triton.cdiv(skv, 128)
+        total = batch * hkv * 4 * nt
+
+        expected_orders = {
+            _D64_GQA_SPLIT_FAST: [(batch_id, hkv_id, split, n)
+                                  for batch_id in range(batch)
+                                  for n in range(nt)
+                                  for hkv_id in range(hkv)
+                                  for split in range(4)],
+            _D64_GQA_XCD: [(bkv // hkv, bkv % hkv, split, n)
+                           for bkv_group in range(batch * hkv // 8)
+                           for n in range(nt)
+                           for split in range(4)
+                           for xcd in range(8)
+                           for bkv in (bkv_group * 8 + xcd, )],
+            _D64_GQA_XCD_N_FAST: [(bkv // hkv, bkv % hkv, split, n)
+                                  for bkv_group in range(batch * hkv // 8)
+                                  for split in range(4)
+                                  for n in range(nt)
+                                  for xcd in range(8)
+                                  for bkv in (bkv_group * 8 + xcd, )],
+        }
+        expected_coords = {(batch_id, hkv_id, split, n)
+                           for batch_id in range(batch)
+                           for hkv_id in range(hkv)
+                           for split in range(4)
+                           for n in range(nt)}
+        assert len(expected_coords) == total
+
+        for grid_mode, expected_order in expected_orders.items():
+            decoded = [_d64_decode_gqa_pid(pid, batch, hkv, skv, grid_mode) for pid in range(total)]
+            assert decoded == expected_order
+            assert len(decoded) == len(set(decoded)) == total
+            assert set(decoded) == expected_coords
+
+
+def test_d64_causal_gqa_frontier_exhaustive():
+    block_m, block_n = 64, 128
+    for sq, skv in (
+        (4096, 4096),
+        (4096, 8192),
+        (4096, 12288),
+        (4096, 16384),
+        (16384, 16384),
+    ):
+        diff = skv - sq
+        m_blocks = triton.cdiv(sq, block_m)
+        for n0 in range(0, skv, block_n):
+            start_m_blk, masked = _d64_causal_physical_frontier(n0, sq, skv, block_m, block_n)
+            expected_start = max((n0 - diff) // block_m, 0)
+            expected_masked = tuple(m_blk for m_blk in range(expected_start, m_blocks)
+                                    if n0 + block_n - 1 > m_blk * block_m + diff)
+            assert start_m_blk == expected_start
+            assert masked == expected_masked
+
+            # Every omitted block is wholly invalid, and every scheduled block
+            # contains at least one valid (m, n) satisfying bottom-right causal.
+            for m_blk in range(m_blocks):
+                m0 = m_blk * block_m
+                m_last = min(sq, m0 + block_m) - 1
+                scheduled = m_blk >= start_m_blk
+                assert scheduled is (n0 <= m_last + diff)
+                tile_needs_mask = n0 + block_n - 1 > m0 + diff
+                assert (m_blk in masked) is (scheduled and tile_needs_mask)
+                if scheduled and not tile_needs_mask:
+                    assert all(0 <= m < sq and 0 <= n < skv and n <= m + skv - sq
+                               for m in range(m0, min(m0 + block_m, sq))
+                               for n in range(n0, min(n0 + block_n, skv)))
+
+        aligned_n0 = diff + block_n
+        start_m_blk, masked = _d64_causal_physical_frontier(aligned_n0, sq, skv, block_m, block_n)
+        assert start_m_blk > 0
+        assert masked == (start_m_blk, start_m_blk + 1)
+
+        if diff:
+            zero_clamp_n0 = diff - block_n
+            start_m_blk, masked = _d64_causal_physical_frontier(zero_clamp_n0, sq, skv, block_m, block_n)
+            assert start_m_blk == 0
+            assert masked == tuple(m_blk for m_blk in range(m_blocks)
+                                   if zero_clamp_n0 + block_n - 1 > m_blk * block_m + diff)
+            assert masked == ()
+
+
+def test_d64_causal_mha_frontier_exhaustive():
+    block_m, block_n = 32, 64
+    for sq, skv in (
+        (4096, 4096),
+        (16384, 16384),
+        (4096, 8192),
+    ):
+        diff = skv - sq
+        m_blocks = triton.cdiv(sq, block_m)
+        for n0 in range(0, skv, block_n):
+            start_m_blk, masked = _d64_causal_physical_frontier(n0, sq, skv, block_m, block_n)
+            expected_start = max((n0 - diff) // block_m, 0)
+            expected_masked = tuple(m_blk for m_blk in range(expected_start, m_blocks)
+                                    if n0 + block_n - 1 > m_blk * block_m + diff)
+            assert start_m_blk == expected_start
+            assert masked == expected_masked
+
+            # Exhaust every physical BM32 block against bottom-right validity.
+            for m_blk in range(m_blocks):
+                m0 = m_blk * block_m
+                m_last = min(sq, m0 + block_m) - 1
+                any_valid = n0 <= m_last + diff
+                all_valid = n0 + block_n - 1 <= m0 + diff
+                scheduled = m_blk >= start_m_blk
+                assert scheduled is any_valid
+                assert (m_blk in masked) is (scheduled and not all_valid)
+
+        aligned_n0 = diff + block_n
+        start_m_blk, masked = _d64_causal_physical_frontier(aligned_n0, sq, skv, block_m, block_n)
+        assert start_m_blk > 0
+        assert masked == (start_m_blk, start_m_blk + 1)
+
+        if diff:
+            zero_clamp_n0 = diff - block_n
+            start_m_blk, masked = _d64_causal_physical_frontier(zero_clamp_n0, sq, skv, block_m, block_n)
+            assert start_m_blk == 0
+            assert masked == tuple(m_blk for m_blk in range(m_blocks)
+                                   if zero_clamp_n0 + block_n - 1 > m_blk * block_m + diff)
+            assert masked == ()
+
+
+def test_d64_causal_gqa_split_ownership():
+    query_blocks = 13
+    expected = {(head, m_blk) for head in range(8) for m_blk in range(query_blocks)}
+    for cyclic in (False, True):
+        by_split = [_d64_gqa_split_ownership(split, query_blocks, cyclic) for split in range(4)]
+        for split, owned in enumerate(by_split):
+            if cyclic:
+                assert {head for head, _m_blk in owned} == set(range(8))
+                assert all(m_blk % 4 == split for _head, m_blk in owned)
+            else:
+                assert {head
+                        for head, _m_blk in owned} == {
+                            2 * split,
+                            2 * split + 1,
+                        }
+                assert all(0 <= m_blk < query_blocks for _head, m_blk in owned)
+        flattened = [item for owned in by_split for item in owned]
+        assert len(flattened) == len(set(flattened)) == len(expected)
+        assert set(flattened) == expected
+
+
+def test_d64_causal_gqa_lifetime_policy():
+    for sq in (2048, 4096, 8192):
+        assert _d64_gqa_lifetime(sq, sq) == _D64_GQA_INDEPENDENT_D32
+    for sq, skv in (
+        (1024, 1152),
+        (4096, 8192),
+        (4096, 12288),
+        (4096, 16384),
+        (12288, 16384),
+    ):
+        assert _d64_gqa_lifetime(sq, skv) == _D64_GQA_INTERLEAVED_D32
+    for sq in (1024, 12288, 16384):
+        assert _d64_gqa_lifetime(sq, sq) == _D64_GQA_DIRECT_D64
+
+    for sq in range(1024, 16385, 1024):
+        expected = (_D64_GQA_INDEPENDENT_D32 if 2048 <= sq <= 8192 else _D64_GQA_DIRECT_D64)
+        assert _d64_gqa_lifetime(sq, sq) == expected
+        assert _d64_gqa_lifetime(sq, sq + 128) == _D64_GQA_INTERLEAVED_D32
+    with pytest.raises(ValueError, match="selected GQA8 shape has no lifetime mode"):
+        _d64_gqa_lifetime(960, 960)
+
+
+def test_d64_causal_gqa_d32_schedule_peels_odd_frontier_before_even_pairs():
+    source = _d64_gqa8_d32_impl.src
+    assert "pair_start = (start_m_blk // 2) * 2" not in source
+    assert "peel_frontier = (start_m_blk % 2) != 0" in source
+    assert "pair_start = start_m_blk + (start_m_blk % 2)" in source
+
+    impl = ast.parse(source).body[0]
+    scalar_assignments = {
+        statement.targets[0].id: statement.value
+        for statement in impl.body
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1
+        and isinstance(statement.targets[0], ast.Name)
+    }
+
+    def evaluate(name, start_m_blk):
+        expression = ast.Expression(scalar_assignments[name])
+        return eval(
+            compile(ast.fix_missing_locations(expression), "<d32-jit>", "eval"),
+            {},
+            {"start_m_blk": start_m_blk},
+        )
+
+    def scheduled_groups(start_m_blk, num_m_blocks):
+        groups = []
+        if evaluate("peel_frontier", start_m_blk) and start_m_blk < num_m_blocks:
+            groups.append((start_m_blk, ))
+        pair_start = evaluate("pair_start", start_m_blk)
+        for m_pair in range(pair_start // 2, num_m_blocks // 2):
+            m_blk_a = m_pair * 2
+            groups.append((m_blk_a, m_blk_a + 1))
+        if num_m_blocks % 2 and pair_start < num_m_blocks:
+            groups.append((num_m_blocks - 1, ))
+        return tuple(groups)
+
+    for num_m_blocks in (1, 2, 7, 17, 64):
+        for start_m_blk in range(num_m_blocks + 1):
+            groups = scheduled_groups(start_m_blk, num_m_blocks)
+            scheduled = tuple(block for group in groups for block in group)
+            assert scheduled == tuple(range(start_m_blk, num_m_blocks))
+            if scheduled:
+                assert scheduled[0] == start_m_blk
+                assert len(scheduled) == len(set(scheduled))
+            expected_groups = []
+            next_m_blk = start_m_blk
+            if next_m_blk % 2 and next_m_blk < num_m_blocks:
+                expected_groups.append((next_m_blk, ))
+                next_m_blk += 1
+            while next_m_blk + 1 < num_m_blocks:
+                expected_groups.append((next_m_blk, next_m_blk + 1))
+                next_m_blk += 2
+            if next_m_blk < num_m_blocks:
+                expected_groups.append((next_m_blk, ))
+            assert groups == tuple(expected_groups)
+            assert all(len(group) == 1 or (len(group) == 2 and group[0] % 2 == 0) for group in groups)
+
+    sq, skv, n0 = 1088, 1152, 128
+    start_m_blk, _masked = _d64_causal_physical_frontier(n0, sq, skv, 64, 128)
+    assert start_m_blk == 1
+    assert scheduled_groups(start_m_blk, sq // 64) == (
+        (1, ),
+        (2, 3),
+        (4, 5),
+        (6, 7),
+        (8, 9),
+        (10, 11),
+        (12, 13),
+        (14, 15),
+        (16, ),
+    )
+
+
+def test_d64_causal_gqa8_helper_ast_contract():
+
+    def function_ast(jit_function):
+        tree = ast.parse(jit_function.src)
+        assert len(tree.body) == 1
+        return tree.body[0]
+
+    def dotted_name(call):
+        value = call.func
+        parts = []
+        while isinstance(value, ast.Attribute):
+            parts.append(value.attr)
+            value = value.value
+        if isinstance(value, ast.Name):
+            parts.append(value.id)
+        return ".".join(reversed(parts))
+
+    def root_call_name(statement):
+        if isinstance(statement, (ast.Assign, ast.AnnAssign, ast.Expr)):
+            value = statement.value
+            if isinstance(value, ast.Call):
+                return dotted_name(value)
+        return None
+
+    interesting = {
+        "_d64_gqa8_issue_stage",
+        "_d64_gqa8_d32_consume",
+        "tlx.async_load_wait_group",
+        "tl.debug_barrier",
+    }
+
+    def events(statements):
+        return tuple(event for statement in statements if (event := root_call_name(statement)) in interesting)
+
+    issue = function_ast(_d64_gqa8_issue_stage)
+    load_tokens = []
+    for statement in issue.body:
+        if (isinstance(statement, ast.Assign) and isinstance(statement.value, ast.Call)
+                and dotted_name(statement.value) == "tlx.buffer_load_to_local"):
+            load_tokens.append(statement.targets[0].id)
+    assert load_tokens == [
+        "q_token",
+        "do_token",
+        "lse_token",
+        "delta_token",
+    ]
+    commits = [
+        node for node in ast.walk(issue)
+        if isinstance(node, ast.Call) and dotted_name(node) == "tlx.async_load_commit_group"
+    ]
+    assert len(commits) == 1
+    assert ast.unparse(commits[0].args[0]) == ("[q_token, do_token, lse_token, delta_token]")
+
+    consume = function_ast(_d64_gqa8_d32_consume)
+    causal_if = next(node for node in consume.body if isinstance(node, ast.If))
+    assert ast.unparse(causal_if.test) == ("n0 + BLOCK_N - 1 > m_blk * BLOCK_M + (SKV - SQ)")
+    masked_steps = [
+        node for node in ast.walk(causal_if) if isinstance(node, ast.Call) and dotted_name(node) == "_d64_gqa8_d32_step"
+    ]
+    assert len(masked_steps) == 2
+    assert [ast.unparse(call.args[19]) for call in masked_steps] == [
+        "True",
+        "False",
+    ]
+
+    step = function_ast(_d64_gqa8_d32_step)
+    lifetime_ifs = [
+        node for node in step.body if isinstance(node, ast.If) and ast.unparse(node.test) == "INTERLEAVED_D32"
+    ]
+    assert len(lifetime_ifs) == 1
+
+    def dot_targets(statements):
+        return [
+            statement.targets[0].id for statement in statements if isinstance(statement, ast.Assign)
+            and isinstance(statement.value, ast.Call) and dotted_name(statement.value) == "tl.dot"
+        ]
+
+    lifetime_if = lifetime_ifs[0]
+    assert dot_targets(lifetime_if.body) == [
+        "dv_d0",
+        "dk_d0",
+        "dv_d1",
+        "dk_d1",
+    ]
+    assert dot_targets(lifetime_if.orelse) == [
+        "dv_d0",
+        "dv_d1",
+        "dk_d0",
+        "dk_d1",
+    ]
+
+    impl = function_ast(_d64_gqa8_d32_impl)
+    head_loop = next(node for node in impl.body
+                     if isinstance(node, ast.For) and ast.unparse(node.target) == "local_head")
+    peel_if = next(node for node in head_loop.body
+                   if isinstance(node, ast.If) and ast.unparse(node.test) == "peel_frontier")
+    assert events(peel_if.body) == (
+        "_d64_gqa8_issue_stage",
+        "tlx.async_load_wait_group",
+        "_d64_gqa8_d32_consume",
+        "tl.debug_barrier",
+    )
+    pair_guard = next(node for node in head_loop.body
+                      if isinstance(node, ast.If) and ast.unparse(node.test) == "pair_start < num_m_blocks")
+    assert events(pair_guard.body[:1]) == ("_d64_gqa8_issue_stage", )
+    pair_loop = next(node for node in pair_guard.body if isinstance(node, ast.For))
+    assert ast.unparse(pair_loop.iter) == "range(pair_start // 2, full_pairs)"
+    pair_assignments = {
+        statement.targets[0].id: ast.unparse(statement.value)
+        for statement in pair_loop.body
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1
+        and isinstance(statement.targets[0], ast.Name)
+    }
+    assert pair_assignments["m_blk_a"] == "m_pair * 2"
+    assert pair_assignments["m_blk_b"] == "m_blk_a + 1"
+    assert events(pair_loop.body) == (
+        "_d64_gqa8_issue_stage",
+        "tlx.async_load_wait_group",
+        "_d64_gqa8_d32_consume",
+        "_d64_gqa8_d32_consume",
+    )
+    following_if = next(node for node in pair_loop.body
+                        if isinstance(node, ast.If) and ast.unparse(node.test) == "has_following")
+    assert events(following_if.body) == (
+        "tl.debug_barrier",
+        "_d64_gqa8_issue_stage",
+        "tlx.async_load_wait_group",
+    )
+    assert events(following_if.orelse) == ("tlx.async_load_wait_group", )
+    tail_if = next(node for node in pair_guard.body if isinstance(node, ast.If) and ast.unparse(node.test) == "has_odd")
+    assert events(tail_if.body)[:2] == (
+        "tlx.async_load_wait_group",
+        "_d64_gqa8_d32_consume",
+    )
+
+
+def test_d64_causal_gqa8_launch_mode_kwargs_same_shape(monkeypatch):
+
+    class LaunchRecorder:
+
+        def __init__(self):
+            self.calls = []
+
+        def __getitem__(self, grid):
+
+            def record(*args, **kwargs):
+                self.calls.append((grid, args, kwargs))
+
+            return record
+
+    recorder = LaunchRecorder()
+    monkeypatch.setitem(globals(), "_attn_bwd_dkdv_d64_causal_gqa8_kernel", recorder)
+    q = torch.empty((1, 8, 1024, 64), device="meta", dtype=torch.bfloat16)
+    k = torch.empty((1, 1, 1024, 64), device="meta", dtype=torch.bfloat16)
+    stats = torch.empty((1, 8, 1024), device="meta", dtype=torch.float32)
+    partial = torch.empty((1, 1, 4, 1024, 64), device="meta", dtype=torch.bfloat16)
+    expected = (
+        (
+            _D64_GQA_SPLIT_FAST,
+            False,
+            False,
+            False,
+            _D64_GQA_INDEPENDENT_D32,
+        ),
+        (_D64_GQA_XCD, False, True, False, _D64_GQA_INDEPENDENT_D32),
+        (
+            _D64_GQA_XCD_N_FAST,
+            False,
+            True,
+            True,
+            _D64_GQA_INDEPENDENT_D32,
+        ),
+        (_D64_GQA_XCD_N_FAST, True, True, True, _D64_GQA_DIRECT_D64),
+    )
+    for grid_mode, cyclic, _use_xcd, _use_n_fast, lifetime in expected:
+        dispatch = _D64Dispatch(
+            "causal_gluon_gqa8",
+            owner_rows=192,
+            key_rows=128,
+            kv_splits=4,
+            selected_causal=True,
+            stat_mode=_D64_GQA_SIGNED,
+            gqa_grid_mode=grid_mode,
+            cyclic_query_split=cyclic,
+            dkdv_lifetime=lifetime,
+        )
+        _launch_bwd_d64_causal_gqa8_dkdv(q, k, k, q, stats, stats, partial, partial, 0.125, dispatch)
+
+    assert len(recorder.calls) == len(expected)
+    for call, (grid_mode, cyclic, use_xcd, use_n_fast, lifetime) in zip(recorder.calls, expected):
+        grid, _args, kwargs = call
+        assert grid == (32, )
+        assert kwargs["USE_GQA_XCD"] is use_xcd
+        assert kwargs["USE_XCD_N_FAST"] is use_n_fast
+        assert kwargs["CYCLIC_QUERY_SPLIT"] is cyclic
+        assert kwargs["LIFETIME_MODE"] == lifetime
+        assert kwargs["LSE_MODE"] == _D64_LSE_NEG_INV_SCALE
+        assert kwargs["DELTA_MODE"] == _D64_DELTA_NEGATED
+
+
+def test_d64_causal_gqa_workspace_contract(monkeypatch):
+    batch, hq, hkv, sq, skv, head_dim = 4, 48, 6, 4096, 16384, 64
+    q = torch.empty((batch, hq, sq, head_dim), device="meta", dtype=torch.bfloat16)
+    k = torch.empty((batch, hkv, skv, head_dim), device="meta", dtype=torch.bfloat16)
+    lse_term, dk_part, dv_part = _allocate_bwd_d64_causal_gqa8_workspaces(q, k)
+    assert tuple(lse_term.shape) == (batch, hq, sq)
+    assert lse_term.dtype == torch.float32
+    assert lse_term.is_contiguous()
+    partial_shape = (batch, hkv, 4, skv, head_dim)
+    for partial in (dk_part, dv_part):
+        assert tuple(partial.shape) == partial_shape
+        assert partial.dtype == torch.bfloat16
+        assert partial.is_contiguous()
+
+    def forbidden_allocator(*_args, **_kwargs):
+        raise AssertionError("MHA and generic routes must not allocate GQA workspaces")
+
+    monkeypatch.setitem(
+        globals(),
+        "_allocate_bwd_d64_causal_gqa8_workspaces",
+        forbidden_allocator,
+    )
+    monkeypatch.setitem(globals(), "_launch_bwd_d64_causal_dq", lambda *_args: None)
+    monkeypatch.setitem(globals(), "_launch_bwd_d64_causal_mha_dkdv", lambda *_args: None)
+    monkeypatch.setitem(globals(), "_launch_bwd_d64_dkdv", lambda *_args: None)
+    monkeypatch.setitem(globals(), "_run_bwd_preprocess", lambda *_args, **_kwargs: None)
+    monkeypatch.setitem(globals(), "_run_bwd_d64_direct", lambda *_args: None)
+
+    def exercise_without_gqa_workspace(q_shape, k_shape, dispatch):
+        q_meta = torch.empty(q_shape, device="meta", dtype=torch.bfloat16)
+        k_meta = torch.empty(k_shape, device="meta", dtype=torch.bfloat16)
+        stats = torch.empty(q_shape[:-1], device="meta", dtype=torch.float32)
+        _run_bwd_d64(
+            q_meta,
+            k_meta,
+            k_meta,
+            q_meta,
+            q_meta,
+            stats,
+            stats,
+            q_meta,
+            k_meta,
+            k_meta,
+            0.125,
+            True,
+            dispatch,
+        )
+
+    mha_shape = (4, 64, 4096, 64)
+    mha = _select_d64_dispatch(
+        mha_shape,
+        mha_shape,
+        True,
+        arch="gfx950",
+        cu_count=256,
+        sm_scale=0.125,
+        bases_aligned_16=True,
+    )
+    assert mha.family == "causal_gluon_mha"
+    exercise_without_gqa_workspace(mha_shape, mha_shape, mha)
+
+    generic_q = (1, 8, 1024, 64)
+    generic_k = (1, 1, 1024, 64)
+    generic = _select_d64_dispatch(generic_q, generic_k, True)
+    assert not generic.selected_causal
+    exercise_without_gqa_workspace(generic_q, generic_k, generic)
+
+
+def test_d64_causal_mha_workspace_and_launch_contract(monkeypatch):
+
+    class LaunchRecorder:
+
+        def __init__(self):
+            self.calls = []
+
+        def __getitem__(self, grid):
+
+            def record(*args, **kwargs):
+                self.calls.append((grid, args, kwargs))
+
+            return record
+
+    batch, heads, sq, skv, head_dim = 2, 32, 16384, 16384, 64
+    q = torch.empty(
+        (batch, heads, sq, head_dim),
+        device="meta",
+        dtype=torch.bfloat16,
+    )
+    k = torch.empty(
+        (batch, heads, skv, head_dim),
+        device="meta",
+        dtype=torch.bfloat16,
+    )
+    v = torch.empty_like(k)
+    o = torch.empty_like(q)
+    do = torch.empty_like(q)
+    lse = torch.empty((batch, heads, sq), device="meta", dtype=torch.float32)
+    delta = torch.empty_like(lse)
+    dq = torch.empty_like(q)
+    dk = torch.empty_like(k)
+    dv = torch.empty_like(v)
+    dispatch = _select_d64_dispatch(
+        tuple(q.shape),
+        tuple(k.shape),
+        True,
+        arch="gfx950:sramecc+:xnack-",
+        cu_count=256,
+        sm_scale=0.125,
+        bases_aligned_16=True,
+    )
+    assert dispatch.family == "causal_gluon_mha"
+    assert dispatch.stat_mode == _D64_MHA_POSITIVE
+    assert dispatch.kv_splits == 1
+
+    launches = []
+    real_launcher = globals().get("_launch_bwd_d64_causal_mha_dkdv")
+
+    def record_dq(*args):
+        launches.append(("dq", args[7], args[6], args[8], args[-1]))
+
+    def record_mha(*args):
+        launches.append((
+            "mha",
+            args[4],
+            args[5],
+            args[6],
+            args[7],
+            args[-1],
+        ))
+
+    def reject_forbidden(*_args, **_kwargs):
+        raise AssertionError("selected causal MHA must not preprocess, allocate partials, "
+                             "reduce, convert, publish atomically, or use the retained producer")
+
+    monkeypatch.setitem(globals(), "_launch_bwd_d64_causal_dq", record_dq)
+    monkeypatch.setitem(globals(), "_launch_bwd_d64_causal_mha_dkdv", record_mha)
+    for name in (
+            "_run_bwd_preprocess",
+            "_allocate_bwd_d64_causal_gqa8_workspaces",
+            "_allocate_bwd_d64_kv_partials",
+            "_launch_bwd_d64_causal_gqa8_dkdv",
+            "_launch_bwd_d64_causal_gqa8_reduce",
+            "_launch_bwd_d64_kv_reduce",
+            "_launch_bwd_d64_fused_dq_convert",
+            "_launch_bwd_d64_dkdv",
+    ):
+        monkeypatch.setitem(globals(), name, reject_forbidden)
+
+    _run_bwd_d64(
+        q,
+        k,
+        v,
+        o,
+        do,
+        lse,
+        delta,
+        dq,
+        dk,
+        dv,
+        0.125,
+        True,
+        dispatch,
+    )
+
+    assert [launch[0] for launch in launches] == ["dq", "mha"]
+    dq_launch, mha_launch = launches
+    assert dq_launch[1] is None
+    assert dq_launch[2] is delta is mha_launch[2]
+    assert dq_launch[3] is dq
+    assert mha_launch[1] is lse
+    assert mha_launch[3] is dk
+    assert mha_launch[4] is dv
+    assert dq_launch[4] is mha_launch[5] is dispatch
+
+    # Exercise the real launcher separately so this test covers both the
+    # _run_bwd_d64 policy and the kernel launch ABI, not just a wished-for mock.
+    assert callable(real_launcher)
+    recorder = LaunchRecorder()
+    monkeypatch.setitem(globals(), "_attn_bwd_dkdv_d64_causal_mha_kernel", recorder)
+    real_launcher(q, k, v, do, lse, delta, dk, dv, 0.125, dispatch)
+
+    assert len(recorder.calls) == 1
+    grid, args, kwargs = recorder.calls[0]
+    assert grid == (batch * heads * triton.cdiv(skv, 64), )
+    assert args == (q, k, v, do, lse, delta, dk, dv)
+    assert kwargs["SM_SCALE"] == 0.125
+    assert kwargs["HQ"] == kwargs["HKV"] == heads
+    assert kwargs["SQ"] == sq
+    assert kwargs["SKV"] == skv
+    assert kwargs["D"] == head_dim
+    assert kwargs["BLOCK_M"] == 32
+    assert kwargs["BLOCK_N"] == 64
+    assert kwargs["LSE_MODE"] == _D64_LSE_NATURAL_LOG
+    assert kwargs["DELTA_MODE"] == _D64_DELTA_POSITIVE
+    assert kwargs["num_warps"] == 2
+    assert kwargs["matrix_instr_nonkdim"] == _matrix_instr_nonkdim()
+
+
+def test_d64_causal_selected_dispatch_contract():
+    arch = "gfx950:sramecc+:xnack-"
+    cu_count = 256
+
+    def is_eligible(q_shape, k_shape, **overrides):
+        return _is_d64_causal_gluon_eligible(
+            q_shape,
+            k_shape,
+            True,
+            arch=overrides.get("arch", arch),
+            cu_count=overrides.get("cu_count", cu_count),
+            sm_scale=overrides.get("sm_scale", 0.125),
+            bases_aligned_16=overrides.get("bases_aligned_16", True),
+        )
+
+    def select(q_shape, k_shape):
+        return _select_d64_dispatch(
+            q_shape,
+            k_shape,
+            True,
+            arch=arch,
+            cu_count=cu_count,
+            sm_scale=0.125,
+            bases_aligned_16=True,
+        )
+
+    mha_m192 = ((4, 64, 4096, 64), (4, 64, 4096, 64))
+    mha_m256 = ((2, 32, 16384, 64), (2, 32, 16384, 64))
+    for q_shape, k_shape in (mha_m192, mha_m256):
+        assert is_eligible(q_shape, k_shape)
+        dispatch = select(q_shape, k_shape)
+        assert dispatch.family == "causal_gluon_mha"
+        assert dispatch.selected_causal
+        assert dispatch.stat_mode == _D64_MHA_POSITIVE
+        assert dispatch.key_rows == 64
+        assert dispatch.dq_logical_n == 32
+        assert dispatch.kv_splits == 1
+        assert dispatch.dq_use_xcd is _d64_use_dq_xcd(q_shape[0], k_shape[1], q_shape[2], k_shape[2],
+                                                      dispatch.owner_rows)
+        assert dispatch.dq_launches == _d64_dq_launch_plan(
+            q_shape[0],
+            q_shape[1],
+            k_shape[1],
+            q_shape[2],
+            k_shape[2],
+            dispatch.owner_rows,
+            cu_count,
+            True,
+        )
+    assert select(*mha_m192).owner_rows == 192
+    assert select(*mha_m256).owner_rows == 256
+
+    peeled = select((4, 64, 8192, 64), (4, 64, 8192, 64))
+    owners = triton.cdiv(8192, 192)
+    assert peeled.dq_use_xcd
+    assert peeled.dq_launches == (
+        _D64DQLaunch(owners - 1, False, 0, owners - 1, 3, 0),
+        _D64DQLaunch(1, False, owners - 1, 1, 2, 192),
+    )
+
+    gqa_cases = [
+        ((2, 128, 1024, 64), (2, 16, 1024, 64)),
+        *[(
+            (batch, hq, sq, head_dim),
+            (batch, hkv, skv, head_dim),
+        )
+          for name in ("t04", "t05", "t06", "t07", "t08")
+          for batch, sq, skv, hq, hkv, head_dim, causal in (D64_BENCHMARK_SHAPES[name], )
+          if causal],
+    ]
+    for q_shape, k_shape in gqa_cases:
+        assert q_shape[1] == 8 * k_shape[1]
+        assert is_eligible(q_shape, k_shape)
+        dispatch = select(q_shape, k_shape)
+        expected_grid, expected_cyclic = _d64_gqa_grid_policy(q_shape[0], k_shape[1], q_shape[2], k_shape[2], cu_count)
+        assert dispatch.family == "causal_gluon_gqa8"
+        assert dispatch.selected_causal
+        assert dispatch.stat_mode == _D64_GQA_SIGNED
+        assert dispatch.key_rows == 128
+        assert dispatch.kv_splits == 4
+        assert dispatch.gqa_grid_mode == expected_grid
+        assert dispatch.cyclic_query_split is expected_cyclic
+        assert dispatch.dkdv_lifetime == _d64_gqa_lifetime(q_shape[2], k_shape[2])
+        assert dispatch.dq_logical_n == (32 if q_shape[2] == k_shape[2] else 64)
+        assert dispatch.dq_use_xcd is _d64_use_dq_xcd(q_shape[0], k_shape[1], q_shape[2], k_shape[2],
+                                                      dispatch.owner_rows)
+        assert dispatch.dq_launches == _d64_dq_launch_plan(
+            q_shape[0],
+            q_shape[1],
+            k_shape[1],
+            q_shape[2],
+            k_shape[2],
+            dispatch.owner_rows,
+            cu_count,
+            True,
+        )
+
+    negative_cases = (
+        (
+            (4, 64, 4096, 64),
+            (4, 64, 4096, 64),
+            {"arch": "gfx942"},
+        ),
+        (
+            (4, 64, 4096, 64),
+            (4, 64, 4096, 64),
+            {"bases_aligned_16": False},
+        ),
+        ((4, 64, 4160, 64), (4, 64, 4096, 64), {}),
+        ((4, 64, 4096, 64), (4, 32, 4096, 64), {}),
+        ((4, 64, 4096, 64), (4, 16, 4096, 64), {}),
+        ((4, 64, 4032, 64), (4, 64, 4032, 64), {}),
+        ((2, 128, 960, 64), (2, 16, 960, 64), {}),
+        ((2, 128, 1024, 64), (2, 16, 1088, 64), {}),
+        ((4, 64, 4097, 64), (4, 64, 4097, 64), {}),
+        ((1, 8, 1024, 64), (1, 1, 16384, 64), {}),
+        ((1, 8, 12288, 64), (1, 1, 12288, 64), {}),
+    )
+    for q_shape, k_shape, overrides in negative_cases:
+        assert not is_eligible(q_shape, k_shape, **overrides)
+
+    m192_neighbor = select((2, 32, 16320, 64), (2, 32, 16320, 64))
+    m192_rectangular = select((2, 32, 16384, 64), (2, 32, 16448, 64))
+    assert m192_neighbor.owner_rows == 192
+    assert m192_neighbor.dq_logical_n == 32
+    assert m192_rectangular.owner_rows == 192
+    assert m192_rectangular.dq_logical_n == 64
+
+
+def test_d64_causal_dispatch_allocation_order(monkeypatch):
+    q_shape = (1, 8, 256, 64)
+    k_shape = (1, 1, 256, 64)
+    q = torch.empty(q_shape, dtype=torch.bfloat16)
+    k = torch.empty(k_shape, dtype=torch.bfloat16)
+    v = torch.empty_like(k)
+    o = torch.empty_like(q)
+    do = torch.empty_like(q)
+    lse = torch.empty(q_shape[:-1], dtype=torch.float32)
+    original_empty = torch.empty
+    original_empty_like = torch.empty_like
+    calls = []
+    output_allocations = 0
+    stat_allocations = 0
+    active_dispatch = None
+
+    def make_meta_inputs(test_q_shape, test_k_shape):
+        test_q = torch.empty(test_q_shape, device="meta", dtype=torch.bfloat16)
+        test_k = torch.empty(test_k_shape, device="meta", dtype=torch.bfloat16)
+        return (
+            test_q,
+            test_k,
+            torch.empty_like(test_k),
+            torch.empty_like(test_q),
+            torch.empty_like(test_q),
+            torch.empty(test_q_shape[:-1], device="meta", dtype=torch.float32),
+        )
+
+    selected_mha_q_shape = (4, 64, 4096, 64)
+    selected_mha_k_shape = (4, 64, 4096, 64)
+    selected_mha_inputs = make_meta_inputs(selected_mha_q_shape, selected_mha_k_shape)
+    selected_mha = _select_d64_dispatch(
+        selected_mha_q_shape,
+        selected_mha_k_shape,
+        True,
+        arch="gfx950:sramecc+:xnack-",
+        cu_count=256,
+        sm_scale=0.125,
+        bases_aligned_16=True,
+    )
+    selected_gqa_q_shape = (8, 16, 1024, 64)
+    selected_gqa_k_shape = (8, 2, 1024, 64)
+    selected_gqa_inputs = make_meta_inputs(selected_gqa_q_shape, selected_gqa_k_shape)
+    selected_gqa = _select_d64_dispatch(
+        selected_gqa_q_shape,
+        selected_gqa_k_shape,
+        True,
+        arch="gfx950:sramecc+:xnack-",
+        cu_count=256,
+        sm_scale=0.125,
+        bases_aligned_16=True,
+    )
+    retained = _select_d64_dispatch(q_shape, k_shape, True)
+
+    def record_validate(*_args):
+        calls.append("validate")
+
+    def record_dispatch(*args):
+        calls.append("dispatch")
+        assert args[7] is True
+        return active_dispatch
+
+    def record_empty_like(tensor, *args, **kwargs):
+        nonlocal output_allocations
+        if tensor.ndim == 4:
+            output_allocations += 1
+            if output_allocations == 1:
+                calls.append("outputs")
+        return original_empty_like(tensor, *args, **kwargs)
+
+    def record_empty(*args, **kwargs):
+        nonlocal stat_allocations
+        shape = tuple(args[0]) if args else tuple(kwargs["size"])
+        if len(shape) == 3:
+            stat_allocations += 1
+            calls.append("delta" if stat_allocations == 1 else "lse_term")
+        elif len(shape) == 5:
+            calls.append("partials")
+        return original_empty(*args, **kwargs)
+
+    monkeypatch.setitem(globals(), "_validate_inputs", record_validate)
+    monkeypatch.setitem(globals(), "_select_d64_dispatch_for_device", record_dispatch)
+    monkeypatch.setattr(torch, "empty_like", record_empty_like)
+    monkeypatch.setattr(torch, "empty", record_empty)
+    monkeypatch.setitem(
+        globals(),
+        "_launch_bwd_d64_causal_dq",
+        lambda *_args: calls.append("dq"),
+    )
+    monkeypatch.setitem(
+        globals(),
+        "_launch_bwd_d64_causal_mha_dkdv",
+        lambda *_args: calls.append("mha_producer"),
+    )
+    monkeypatch.setitem(
+        globals(),
+        "_launch_bwd_d64_causal_gqa8_dkdv",
+        lambda *_args: calls.append("gqa_producer"),
+    )
+    monkeypatch.setitem(
+        globals(),
+        "_launch_bwd_d64_causal_gqa8_reduce",
+        lambda *_args: calls.append("reducer"),
+    )
+    monkeypatch.setitem(globals(), "_run_bwd_preprocess", lambda *_args: None)
+    monkeypatch.setitem(
+        globals(),
+        "_run_bwd_d64_direct",
+        lambda *_args: calls.append("retained_generic"),
+    )
+
+    def exercise(inputs, dispatch, scale):
+        nonlocal active_dispatch, output_allocations, stat_allocations
+        active_dispatch = dispatch
+        output_allocations = 0
+        stat_allocations = 0
+        calls.clear()
+        result = fa_backward(*inputs, scale, True)
+        assert len(result) == 3
+        return tuple(calls)
+
+    assert exercise(selected_mha_inputs, selected_mha, 0.125) == (
+        "validate",
+        "dispatch",
+        "outputs",
+        "delta",
+        "dq",
+        "mha_producer",
+    )
+    assert exercise(selected_gqa_inputs, selected_gqa, 0.125) == (
+        "validate",
+        "dispatch",
+        "outputs",
+        "delta",
+        "lse_term",
+        "partials",
+        "dq",
+        "gqa_producer",
+        "reducer",
+    )
+    assert exercise((q, k, v, o, do, lse), retained, -0.125) == (
+        "validate",
+        "dispatch",
+        "outputs",
+        "delta",
+        "retained_generic",
+    )
+
+    input_sentinels = tuple(tensor.view(torch.uint8).clone() for tensor in (q, k, v, o, do, lse))
+    for invalid in (0.0, -0.0, float("nan"), float("inf"), -float("inf")):
+        calls.clear()
+        with pytest.raises(ValueError, match="^D64 sm_scale must be finite and nonzero$"):
+            fa_backward(q, k, v, o, do, lse, invalid, True)
+        assert calls == ["validate"]
+        for tensor, sentinel in zip((q, k, v, o, do, lse), input_sentinels, strict=True):
+            assert torch.equal(tensor.view(torch.uint8), sentinel)
+
+
+def test_d64_causal_scale_classification_before_writes(monkeypatch):
+    shape = (4, 64, 4096, 64)
+    q = torch.empty(shape, device="meta", dtype=torch.bfloat16)
+    k = torch.empty(shape, device="meta", dtype=torch.bfloat16)
+    v = torch.empty_like(k)
+    o = torch.empty_like(q)
+    do = torch.empty_like(q)
+    lse = torch.empty(shape[:-1], device="meta", dtype=torch.float32)
+
+    class Properties:
+        gcnArchName = "gfx950:sramecc+:xnack-"
+        multi_processor_count = 256
+
+    calls = []
+
+    def record_empty_like(*_args, **_kwargs):
+        calls.append("empty_like")
+        return object()
+
+    def record_empty(*_args, **_kwargs):
+        calls.append("empty")
+        return object()
+
+    def record_run(*args):
+        dispatch = args[-1]
+        calls.append(("run", getattr(dispatch, "family", None)))
+
+    def record_gqa_workspace(*_args, **_kwargs):
+        calls.append("gqa_workspace")
+        return object()
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _device: Properties())
+    monkeypatch.setattr(torch, "empty_like", record_empty_like)
+    monkeypatch.setattr(torch, "empty", record_empty)
+    monkeypatch.setitem(globals(), "_run_bwd_d64", record_run)
+    monkeypatch.setitem(
+        globals(),
+        "_allocate_bwd_d64_causal_gqa8_workspaces",
+        record_gqa_workspace,
+    )
+
+    for invalid in (
+            0.0,
+            -0.0,
+            float("nan"),
+            float("inf"),
+            -float("inf"),
+            10**10000,
+    ):
+        calls.clear()
+        with pytest.raises(ValueError, match="^D64 sm_scale must be finite and nonzero$"):
+            fa_backward(q, k, v, o, do, lse, invalid, True)
+        assert calls == []
+
+    calls.clear()
+    fa_backward(q, k, v, o, do, lse, -0.125, True)
+    assert ("run", "causal_m192") in calls
+    assert "gqa_workspace" not in calls
+
+    calls.clear()
+    fa_backward(q, k, v, o, do, lse, 0.125, True)
+    assert ("run", "causal_gluon_mha") in calls
+    assert "gqa_workspace" not in calls
+
+
+def test_d64_causal_gqa8_tiny_scale_dispatch_before_workspace(monkeypatch):
+    q_shape = (8, 16, 1024, 64)
+    k_shape = (8, 2, 1024, 64)
+    select_kwargs = {
+        "arch": "gfx950:sramecc+:xnack-",
+        "cu_count": 256,
+        "bases_aligned_16": True,
+    }
+    selected = _select_d64_dispatch(
+        q_shape,
+        k_shape,
+        True,
+        sm_scale=0.125,
+        **select_kwargs,
+    )
+    tiny_scale = _select_d64_dispatch(
+        q_shape,
+        k_shape,
+        True,
+        sm_scale=1e-38,
+        **select_kwargs,
+    )
+    assert selected.family == "causal_gluon_gqa8"
+    assert tiny_scale.family == "causal_m192"
+
+    class Properties:
+        gcnArchName = select_kwargs["arch"]
+        multi_processor_count = select_kwargs["cu_count"]
+
+    q = torch.empty(q_shape, device="meta", dtype=torch.bfloat16)
+    k = torch.empty(k_shape, device="meta", dtype=torch.bfloat16)
+    stats = torch.empty(q_shape[:-1], device="meta", dtype=torch.float32)
+    retained_dispatches = []
+
+    def reject_selected_workspace(*_args, **_kwargs):
+        raise AssertionError("tiny scale must fall back before GQA8 workspace allocation")
+
+    def record_retained(*args):
+        retained_dispatches.append(args[-1])
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _device: Properties())
+    monkeypatch.setitem(
+        globals(),
+        "_allocate_bwd_d64_causal_gqa8_workspaces",
+        reject_selected_workspace,
+    )
+    monkeypatch.setitem(globals(), "_run_bwd_preprocess", lambda *_args: None)
+    monkeypatch.setitem(globals(), "_run_bwd_d64_direct", record_retained)
+
+    outputs = fa_backward(q, k, k, q, q, stats, 1e-38, True)
+    assert [dispatch.family for dispatch in retained_dispatches] == ["causal_m192"]
+    assert all(output.device.type == "meta" for output in outputs)
+
+
+def test_d64_causal_mha_tiny_scale_uses_retained_dispatch():
+    shape = (4, 64, 4096, 64)
+    select_kwargs = {
+        "arch": "gfx950:sramecc+:xnack-",
+        "cu_count": 256,
+        "bases_aligned_16": True,
+    }
+    selected = _select_d64_dispatch(
+        shape,
+        shape,
+        True,
+        sm_scale=0.125,
+        **select_kwargs,
+    )
+    tiny_scale = _select_d64_dispatch(
+        shape,
+        shape,
+        True,
+        sm_scale=1e-38,
+        **select_kwargs,
+    )
+    assert selected.family == "causal_gluon_mha"
+    assert tiny_scale.family == "causal_m192"
+
+
+def test_d64_causal_scale_oversized_integer_validation():
+    with pytest.raises(ValueError, match=r"^D64 sm_scale must be finite and nonzero$"):
+        _validate_d64_sm_scale(10**10000)
+
+
+def test_d64_causal_scale_oversized_integer_eligibility():
+    assert not _is_d64_causal_gluon_eligible(
+        (4, 64, 4096, 64),
+        (4, 64, 4096, 64),
+        True,
+        arch="gfx950",
+        cu_count=256,
+        sm_scale=10**10000,
+        bases_aligned_16=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("q_shape", "k_shape", "causal", "family", "owner_rows", "key_rows"),
+    [
+        ((2, 32, 16384, 64), (2, 32, 16384, 64), False, "noncausal_direct_n256", 32, 256),
+        ((2, 32, 16384, 64), (2, 32, 16384, 64), True, "causal_m256", 256, 32),
+        ((2, 32, 16384, 64), (2, 4, 16384, 64), True, "causal_m256", 256, 32),
+        ((4, 48, 4096, 64), (4, 6, 4096, 64), True, "causal_m192", 192, 32),
+        ((4, 48, 4096, 64), (4, 6, 16384, 64), True, "causal_m192", 192, 64),
+    ],
+)
+def test_d64_structural_dispatch(q_shape, k_shape, causal, family, owner_rows, key_rows):
+    dispatch = _select_d64_dispatch(q_shape, k_shape, causal)
+    assert (dispatch.family, dispatch.owner_rows, dispatch.key_rows) == (family, owner_rows, key_rows)
+
+
+@pytest.mark.parametrize(
+    ("q_shape", "k_shape", "causal", "arch", "cu_count", "expected"),
+    [
+        pytest.param(
+            (2, 32, 16384, 64),
+            (2, 32, 16384, 64),
+            False,
+            "gfx950",
+            256,
+            True,
+            id="t01-group1",
+        ),
+        pytest.param(
+            (2, 32, 16384, 64),
+            (2, 4, 16384, 64),
+            False,
+            "gfx950:sramecc+:xnack-",
+            256,
+            True,
+            id="t03-group8",
+        ),
+        pytest.param(
+            (1, 1, 4096, 64),
+            (1, 1, 4096, 64),
+            False,
+            "gfx950",
+            256,
+            False,
+            id="insufficient-owner-grid",
+        ),
+        pytest.param(
+            (1, 1, 4096, 64),
+            (1, 1, 4096, 64),
+            False,
+            "gfx950",
+            16,
+            True,
+            id="sufficient-owner-grid",
+        ),
+        pytest.param(
+            (2, 32, 16384, 64),
+            (2, 4, 16384, 64),
+            True,
+            "gfx950",
+            256,
+            False,
+            id="causal",
+        ),
+        pytest.param(
+            (2, 32, 16384, 64),
+            (2, 8, 16384, 64),
+            False,
+            "gfx950",
+            256,
+            False,
+            id="group4",
+        ),
+        pytest.param(
+            (2, 32, 16384, 64),
+            (2, 32, 16384, 64),
+            False,
+            "gfx942",
+            256,
+            False,
+            id="wrong-arch",
+        ),
+        pytest.param(
+            (1, 1, 256, 64),
+            (1, 1, 256, 64),
+            False,
+            "gfx950",
+            1,
+            False,
+            id="short",
+        ),
+        pytest.param(
+            (1, 1, 4095, 64),
+            (1, 1, 4096, 64),
+            False,
+            "gfx950",
+            1,
+            False,
+            id="misaligned-sq",
+        ),
+        pytest.param(
+            (1, 1, 4096, 64),
+            (1, 1, 4095, 64),
+            False,
+            "gfx950",
+            1,
+            False,
+            id="misaligned-skv",
+        ),
+        pytest.param(
+            (2, 32, 16384, 64),
+            (2, 32, 16384, 64),
+            False,
+            None,
+            None,
+            False,
+            id="missing-device-metadata",
+        ),
+    ],
+)
+def test_d64_fused_n256_eligibility(q_shape, k_shape, causal, arch, cu_count, expected):
+    assert _is_d64_fused_n256_eligible(q_shape, k_shape, causal, arch=arch, cu_count=cu_count) is expected
+
+
+@pytest.mark.parametrize(
+    ("q_shape", "k_shape", "causal", "arch", "cu_count", "family"),
+    [
+        pytest.param(
+            (2, 32, 16384, 64),
+            (2, 32, 16384, 64),
+            False,
+            "gfx950",
+            256,
+            "noncausal_fused_n256",
+            id="t01-group1",
+        ),
+        pytest.param(
+            (2, 32, 16384, 64),
+            (2, 4, 16384, 64),
+            False,
+            "gfx950",
+            256,
+            "noncausal_fused_n256",
+            id="t03-group8",
+        ),
+        pytest.param(
+            (1, 1, 4096, 64),
+            (1, 1, 4096, 64),
+            False,
+            "gfx950",
+            256,
+            "noncausal_direct_n256",
+            id="insufficient-owner-grid",
+        ),
+        pytest.param(
+            (2, 32, 16384, 64),
+            (2, 4, 16384, 64),
+            True,
+            "gfx950",
+            256,
+            "causal_m256",
+            id="causal",
+        ),
+        pytest.param(
+            (2, 32, 16384, 64),
+            (2, 8, 16384, 64),
+            False,
+            "gfx950",
+            256,
+            "noncausal_direct_n256",
+            id="group4",
+        ),
+        pytest.param(
+            (2, 32, 16384, 64),
+            (2, 32, 16384, 64),
+            False,
+            "gfx942",
+            256,
+            "noncausal_direct_n256",
+            id="wrong-arch",
+        ),
+        pytest.param(
+            (1, 1, 256, 64),
+            (1, 1, 256, 64),
+            False,
+            "gfx950",
+            1,
+            "noncausal_direct_n256",
+            id="short",
+        ),
+        pytest.param(
+            (2, 32, 16384, 64),
+            (2, 32, 16384, 64),
+            False,
+            None,
+            None,
+            "noncausal_direct_n256",
+            id="missing-device-metadata",
+        ),
+    ],
+)
+def test_d64_fused_dispatch_is_structural(q_shape, k_shape, causal, arch, cu_count, family):
+    dispatch = _select_d64_dispatch(q_shape, k_shape, causal, arch=arch, cu_count=cu_count)
+    assert dispatch.family == family
+
+
+def test_d64_fused_dispatch_without_device_metadata_uses_direct_fallback():
+    dispatch = _select_d64_dispatch((2, 32, 16384, 64), (2, 32, 16384, 64), False)
+    assert dispatch.family == "noncausal_direct_n256"
+
+
+def test_d64_fused_workspace_contract():
+    q = torch.empty((2, 32, 4096, 64), device="meta", dtype=torch.bfloat16)
+    k_mha = torch.empty((2, 32, 4096, 64), device="meta", dtype=torch.bfloat16)
+    k_gqa = torch.empty((2, 4, 4096, 64), device="meta", dtype=torch.bfloat16)
+    mha = _D64Dispatch("noncausal_fused_n256", 32, 256, 1)
+    gqa = _D64Dispatch("noncausal_fused_n256", 32, 256, 8)
+
+    mha_acc, mha_dk, mha_dv = _allocate_bwd_d64_fused_workspaces(q, k_mha, mha)
+    gqa_acc, gqa_dk, gqa_dv = _allocate_bwd_d64_fused_workspaces(q, k_gqa, gqa)
+
+    assert mha_acc.shape == q.shape and mha_acc.dtype is torch.float32
+    assert mha_acc.is_contiguous()
+    assert mha_dk is mha_dv is None
+    assert gqa_acc.shape == q.shape and gqa_acc.dtype is torch.float32
+    assert gqa_acc.is_contiguous()
+    assert gqa_dk.shape == gqa_dv.shape == (2, 4, 8, 4096, 64)
+    assert gqa_dk.dtype is gqa_dv.dtype is torch.bfloat16
+    assert gqa_dk.is_contiguous() and gqa_dv.is_contiguous()
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_d64_fused_preprocess_computes_delta_and_zeros_fp32_dq_gfx950():
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(47)
+    o = torch.randn((1, 2, 256, 64), generator=generator, device="cuda", dtype=torch.bfloat16)
+    do = torch.randn(o.shape, generator=generator, device="cuda", dtype=torch.bfloat16)
+    delta = torch.empty(o.shape[:-1], device="cuda", dtype=torch.float32)
+    dq_acc = torch.full(o.shape, 7.0, device="cuda", dtype=torch.float32)
+    _attn_bwd_preprocess_kernel.device_caches.clear()
+
+    _run_bwd_preprocess(o, do, delta, dq_acc=dq_acc)
+
+    expected = torch.sum(o.float() * do.float(), dim=-1)
+    torch.testing.assert_close(delta, expected, rtol=1e-5, atol=1e-5)
+    assert torch.count_nonzero(dq_acc).item() == 0
+
+    device = torch.cuda.current_device()
+    compiled = tuple(_attn_bwd_preprocess_kernel.device_caches[device][0].values())
+    assert len(compiled) == 1
+    obj = compiled[0]
+    amdgcn = obj.asm["amdgcn"]
+    private_segment = {
+        int(value)
+        for value in re.findall(r"(?:\.amdhsa_)?private_segment_fixed_size:?\s+(\d+)", amdgcn)
+    }
+    resources = {
+        "n_spills": obj.n_spills,
+        "global_scratch_bytes": obj.metadata.global_scratch_size,
+        "private_segment_bytes": (private_segment.pop() if len(private_segment) == 1 else None),
+        "scratch_load_instructions": len(re.findall(r"\bscratch_load", amdgcn)),
+        "scratch_store_instructions": len(re.findall(r"\bscratch_store", amdgcn)),
+    }
+    assert resources == {
+        "n_spills": 0,
+        "global_scratch_bytes": 0,
+        "private_segment_bytes": 0,
+        "scratch_load_instructions": 0,
+        "scratch_store_instructions": 0,
+    }
+    print({"zero_dq_preprocess_resources": resources})
+
+
+_D64_ZERO_RESOURCE_FIELDS = (
+    "n_spills",
+    "global_scratch_bytes",
+    "private_segment_bytes",
+    "scratch_load_instructions",
+    "scratch_store_instructions",
+)
+
+
+def _d64_code_object_resource(obj):
+    amdgcn = obj.asm["amdgcn"]
+    private_segments = {
+        int(value)
+        for value in re.findall(r"(?:\.amdhsa_)?private_segment_fixed_size:?\s+(\d+)", amdgcn)
+    }
+    vector_vgpr_counts = {int(value) for value in re.findall(r";\s+NumVgprs:\s+(\d+)", amdgcn)}
+    agpr_counts = {int(value) for value in re.findall(r";\s+NumAgprs:\s+(\d+)", amdgcn)}
+    return {
+        "vgpr_count": obj.n_regs,
+        "vector_vgpr_count": (vector_vgpr_counts.pop() if len(vector_vgpr_counts) == 1 else None),
+        "agpr_count": agpr_counts.pop() if len(agpr_counts) == 1 else None,
+        "unified_vgpr_count": obj.n_regs,
+        "lds_bytes": obj.metadata.shared,
+        "n_spills": obj.n_spills,
+        "global_scratch_bytes": obj.metadata.global_scratch_size,
+        "private_segment_bytes": (private_segments.pop() if len(private_segments) == 1 else None),
+        "scratch_load_instructions": len(re.findall(r"\bscratch_load", amdgcn)),
+        "scratch_store_instructions": len(re.findall(r"\bscratch_store", amdgcn)),
+    }
+
+
+def test_d64_structural_dispatch_codegen_resource_contract():
+
+    class Metadata:
+        shared = 41472
+        global_scratch_size = 0
+
+    class CompiledObject:
+        n_regs = 268
+        n_spills = 0
+        metadata = Metadata()
+        asm = {"amdgcn": "\n".join((
+            "; NumVgprs: 254",
+            "; NumAgprs: 12",
+            ".private_segment_fixed_size: 0",
+        ))}
+
+    resource = _d64_code_object_resource(CompiledObject())
+    assert resource["vgpr_count"] == 268
+    assert resource["vector_vgpr_count"] == 254
+    assert resource["agpr_count"] == 12
+    assert resource["unified_vgpr_count"] == 268
+    assert resource["unified_vgpr_count"] >= (resource["vector_vgpr_count"] + resource["agpr_count"])
+
+
+def _assert_d64_code_object_scratch_free(name, obj):
+    resource = _d64_code_object_resource(obj)
+    for field in _D64_ZERO_RESOURCE_FIELDS:
+        assert resource[field] == 0, (name, resource)
+    return resource
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(
+    "shape, expected_logical_n, expected_use_xcd, seed",
+    (
+        pytest.param((1, 8, 1, 256, 256, 64), 32, False, 107, id="square_flat"),
+        pytest.param((1, 8, 8, 256, 320, 64), 64, True, 108, id="rectangular_xcd"),
+    ),
+)
+def test_d64_causal_common_dq_stat_modes_gfx950(shape, expected_logical_n, expected_use_xcd, seed):
+    batch, hq, hkv, sq, skv, _head_dim = shape
+    case = _make_d64_gqa_smoke_case(shape, causal=True, seed=seed)
+    launches = _d64_dq_launch_plan(batch, hq, hkv, sq, skv, 192, 1, True)
+
+    def dispatch(family, stat_mode):
+        return _D64Dispatch(
+            family,
+            owner_rows=192,
+            key_rows=64,
+            kv_splits=1,
+            selected_causal=True,
+            stat_mode=stat_mode,
+            dq_logical_n=32 if sq == skv else 64,
+            dq_use_xcd=_d64_use_dq_xcd(batch, hkv, sq, skv, 192),
+            dq_launches=launches,
+        )
+
+    mha_dispatch = dispatch("causal_gluon_mha", _D64_MHA_POSITIVE)
+    gqa_dispatch = dispatch("causal_gluon_gqa8", _D64_GQA_SIGNED)
+    for mode_dispatch in (mha_dispatch, gqa_dispatch):
+        assert mode_dispatch.dq_logical_n == expected_logical_n
+        assert mode_dispatch.dq_use_xcd is expected_use_xcd
+
+    delta_mha = torch.empty_like(case.lse)
+    delta_gqa = torch.empty_like(case.lse)
+    lse_term_gqa = torch.empty_like(case.lse)
+    dq_mha = torch.empty_like(case.q)
+    dq_gqa = torch.empty_like(case.q)
+
+    _launch_bwd_d64_causal_dq(
+        case.q,
+        case.k,
+        case.v,
+        case.o,
+        case.do,
+        case.lse,
+        delta_mha,
+        None,
+        dq_mha,
+        case.sm_scale,
+        mha_dispatch,
+    )
+    _launch_bwd_d64_causal_dq(
+        case.q,
+        case.k,
+        case.v,
+        case.o,
+        case.do,
+        case.lse,
+        delta_gqa,
+        lse_term_gqa,
+        dq_gqa,
+        case.sm_scale,
+        gqa_dispatch,
+    )
+    torch.cuda.synchronize()
+
+    positive = torch.sum(case.o.float() * case.do.float(), dim=-1)
+    torch.testing.assert_close(delta_mha, positive, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(delta_gqa, -positive, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(
+        lse_term_gqa,
+        -case.lse.float() / case.sm_scale,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    for name, actual in (("mha", dq_mha), ("gqa", dq_gqa)):
+        assert torch.isfinite(actual).all(), name
+        relative_l2 = torch.linalg.vector_norm(actual.float() - case.grads[0]) / torch.linalg.vector_norm(case.grads[0])
+        assert relative_l2.item() < 5e-3, (name, relative_l2.item())
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_d64_causal_common_dq_peeled_m128_accuracy_gfx950():
+    shape = (1, 8, 8, 8192, 8192, 64)
+    case = _make_d64_aten_case(shape, seed=137, causal=True)
+    batch, hq, hkv, sq, skv, _head_dim = shape
+    owner_rows = 192
+    owners = triton.cdiv(sq, owner_rows)
+    launches = _d64_dq_launch_plan(
+        batch,
+        hq,
+        hkv,
+        sq,
+        skv,
+        owner_rows,
+        cu_count=8,
+        host_skip_owner_tail=True,
+    )
+    assert launches == (
+        _D64DQLaunch(owners - 1, False, 0, owners - 1, 3, 0),
+        _D64DQLaunch(1, False, owners - 1, 1, 2, 192),
+    )
+    assert _d64_use_dq_xcd(batch, hkv, sq, skv, owner_rows)
+    peeled_interval = _d64_causal_owner_interval(owners - 1, sq, owner_rows)
+    full_interval = _d64_causal_owner_interval(owners - 2, sq, owner_rows)
+    assert peeled_interval == (0, 128)
+    assert full_interval == (128, 320)
+
+    dispatch = _D64Dispatch(
+        family="causal_gluon_mha",
+        owner_rows=owner_rows,
+        key_rows=64,
+        kv_splits=1,
+        selected_causal=True,
+        stat_mode=_D64_MHA_POSITIVE,
+        dq_logical_n=32,
+        dq_use_xcd=True,
+        dq_launches=launches,
+    )
+    delta = torch.empty_like(case.lse)
+    dq = torch.empty_like(case.q)
+    _attn_bwd_dq_d64_causal_mha_kernel.device_caches.clear()
+    _launch_bwd_d64_causal_dq(
+        case.q,
+        case.k,
+        case.v,
+        case.o,
+        case.do,
+        case.lse,
+        delta,
+        None,
+        dq,
+        case.sm_scale,
+        dispatch,
+    )
+    torch.cuda.synchronize()
+
+    positive = torch.sum(case.o.float() * case.do.float(), dim=-1)
+    torch.testing.assert_close(delta, positive, rtol=1e-5, atol=1e-5)
+    assert torch.isfinite(dq).all()
+    expected_dq = case.grads[0].float()
+    for region_name, row_interval in (
+        ("peeled_m128", peeled_interval),
+        ("full_m192", full_interval),
+        ("all_dq", (0, sq)),
+    ):
+        row_begin, row_end = row_interval
+        actual_region = dq[:, :, row_begin:row_end].float()
+        expected_region = expected_dq[:, :, row_begin:row_end]
+        relative_l2 = torch.linalg.vector_norm(actual_region -
+                                               expected_region) / torch.linalg.vector_norm(expected_region)
+        assert relative_l2.item() < 5e-3, (
+            region_name,
+            relative_l2.item(),
+        )
+    device = torch.cuda.current_device()
+    objects = tuple(_attn_bwd_dq_d64_causal_mha_kernel.device_caches[device][0].values())
+    assert len(objects) == 2
+
+
+def test_d64_causal_common_dq_launch_order(monkeypatch):
+
+    class LaunchRecorder:
+
+        def __init__(self):
+            self.calls = []
+
+        def __getitem__(self, grid):
+
+            def record(*args, **kwargs):
+                self.calls.append((grid, args, kwargs))
+
+            return record
+
+    recorder = LaunchRecorder()
+    monkeypatch.setitem(globals(), "_attn_bwd_dq_d64_causal_mha_kernel", recorder)
+
+    def tensors(batch, hq, hkv, sq, skv):
+        q = torch.empty((batch, hq, sq, 64), device="meta", dtype=torch.bfloat16)
+        k = torch.empty((batch, hkv, skv, 64), device="meta", dtype=torch.bfloat16)
+        stats = torch.empty((batch, hq, sq), device="meta", dtype=torch.float32)
+        return q, k, stats
+
+    flat_q, flat_k, flat_stats = tensors(1, 8, 1, 256, 256)
+    flat_launches = _d64_dq_launch_plan(1, 8, 1, 256, 256, 192, 1, True)
+    flat = _D64Dispatch(
+        "causal_gluon_mha",
+        192,
+        64,
+        1,
+        True,
+        _D64_MHA_POSITIVE,
+        32,
+        False,
+        flat_launches,
+    )
+    _launch_bwd_d64_causal_dq(
+        flat_q,
+        flat_k,
+        flat_k,
+        flat_q,
+        flat_q,
+        flat_stats,
+        flat_stats,
+        None,
+        flat_q,
+        0.125,
+        flat,
+    )
+
+    batch, hq, hkv, sq = 4, 64, 8, 8192
+    xcd_q, xcd_k, xcd_stats = tensors(batch, hq, hkv, sq, sq)
+    xcd_launches = _d64_dq_launch_plan(batch, hq, hkv, sq, sq, 192, 256, True)
+    xcd = _D64Dispatch(
+        "causal_gluon_mha",
+        192,
+        64,
+        1,
+        True,
+        _D64_MHA_POSITIVE,
+        32,
+        True,
+        xcd_launches,
+    )
+    _launch_bwd_d64_causal_dq(
+        xcd_q,
+        xcd_k,
+        xcd_k,
+        xcd_q,
+        xcd_q,
+        xcd_stats,
+        xcd_stats,
+        None,
+        xcd_q,
+        0.125,
+        xcd,
+    )
+
+    assert len(recorder.calls) == 1 + len(xcd_launches)
+    flat_grid, _flat_args, flat_kwargs = recorder.calls[0]
+    assert flat_grid == (1 * 8 * flat_launches[0].launch_tiles, )
+    assert not flat_kwargs["USE_DQ_XCD"]
+
+    owners = triton.cdiv(sq, 192)
+    assert xcd_launches == (
+        _D64DQLaunch(owners - 1, False, 0, owners - 1, 3, 0),
+        _D64DQLaunch(1, False, owners - 1, 1, 2, 192),
+    )
+    for call, launch in zip(recorder.calls[1:], xcd_launches):
+        grid, args, kwargs = call
+        assert grid == (batch * hq * launch.launch_tiles, )
+        assert len(args) == 8
+        assert kwargs["USE_DQ_XCD"]
+        assert kwargs["OWNER_PID_BASE"] == launch.owner_pid_base
+        assert kwargs["LAUNCH_Q_TILES"] == launch.launch_q_tiles
+        assert kwargs["OWNER_FRAGMENTS"] == launch.owner_fragments
+        assert kwargs["GRID_OWNER_M"] == launch.grid_owner_m
+
+    decoded = []
+    for launch_index, launch in enumerate(xcd_launches):
+        for pid in range(batch * hq * launch.launch_tiles):
+            coords = _d64_decode_dq_pid(
+                pid,
+                batch,
+                hq,
+                hkv,
+                launch.launch_tiles,
+                True,
+                launch.owner_pid_base,
+            )
+            decoded.append((launch_index, coords))
+    assert all(item[1][2] < owners - 1 for item in decoded if item[0] == 0)
+    assert all(item[1][2] == owners - 1 for item in decoded if item[0] == 1)
+    assert _d64_causal_owner_interval(0, sq, 192)[0] > _d64_causal_owner_interval(owners - 1, sq, 192)[0]
+    assert _d64_causal_owner_interval(owners - 1, sq, 192) == (0, 128)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_d64_causal_common_dq_codegen_gfx950():
+
+    def compile_variant(name, shape, owner_rows, launches, stat_mode, expected_lds):
+        batch, hq, hkv, sq, skv, _head_dim = shape
+        q = torch.zeros((batch, hq, sq, 64), device="cuda", dtype=torch.bfloat16)
+        k = torch.zeros((batch, hkv, skv, 64), device="cuda", dtype=torch.bfloat16)
+        stats = torch.zeros((batch, hq, sq), device="cuda", dtype=torch.float32)
+        dq = torch.empty_like(q)
+        signed = stat_mode == _D64_GQA_SIGNED
+        kernel = (_attn_bwd_dq_d64_causal_gqa8_kernel if signed else _attn_bwd_dq_d64_causal_mha_kernel)
+        kernel.device_caches.clear()
+        dispatch = _D64Dispatch(
+            family="causal_gluon_gqa8" if signed else "causal_gluon_mha",
+            owner_rows=owner_rows,
+            key_rows=64,
+            kv_splits=1,
+            selected_causal=True,
+            stat_mode=stat_mode,
+            dq_logical_n=32 if sq == skv else 64,
+            dq_use_xcd=_d64_use_dq_xcd(batch, hkv, sq, skv, owner_rows),
+            dq_launches=launches,
+        )
+        lse_term = torch.empty_like(stats) if signed else None
+        _launch_bwd_d64_causal_dq(q, k, k, q, q, stats, stats, lse_term, dq, 0.125, dispatch)
+        torch.cuda.synchronize()
+
+        device = torch.cuda.current_device()
+        objects = tuple(kernel.device_caches[device][0].values())
+        assert len(objects) == 1, (name, len(objects))
+        obj = objects[0]
+        resource = _assert_d64_code_object_scratch_free(name, obj)
+        assert resource["unified_vgpr_count"] == resource["vgpr_count"]
+        assert resource["unified_vgpr_count"] >= (resource["vector_vgpr_count"] + resource["agpr_count"])
+        assert resource["lds_bytes"] == expected_lds, (name, resource)
+        amdgcn = obj.asm["amdgcn"]
+        assert re.search(r"\bbuffer_store_dwordx4\b", amdgcn), name
+        assert not re.search(r"\b\w*atomic\w*\b", amdgcn), name
+        return resource
+
+    square_sq = 8192
+    square_owners = triton.cdiv(square_sq, 192)
+    rectangular_shape = (1, 8, 8, 256, 320, 64)
+    rectangular_launches = _d64_dq_launch_plan(1, 8, 8, 256, 320, 192, 1, True)
+    variants = (
+        (
+            "m128_square",
+            (1, 8, 8, square_sq, square_sq, 64),
+            192,
+            (_D64DQLaunch(1, False, square_owners - 1, 1, 2, 192), ),
+            _D64_MHA_POSITIVE,
+            41472,
+        ),
+        (
+            "m192_square",
+            (1, 8, 8, square_sq, square_sq, 64),
+            192,
+            (_D64DQLaunch(
+                square_owners - 1,
+                False,
+                0,
+                square_owners - 1,
+                3,
+                0,
+            ), ),
+            _D64_MHA_POSITIVE,
+            41472,
+        ),
+        (
+            "m192_rectangular",
+            rectangular_shape,
+            192,
+            rectangular_launches,
+            _D64_MHA_POSITIVE,
+            41472,
+        ),
+        (
+            "m256_square",
+            (1, 1, 1, 16384, 16384, 64),
+            256,
+            (_D64DQLaunch(64, True, 0, 0, 4, 0), ),
+            _D64_MHA_POSITIVE,
+            49792,
+        ),
+        (
+            "gqa_signed_rectangular",
+            rectangular_shape,
+            192,
+            rectangular_launches,
+            _D64_GQA_SIGNED,
+            41472,
+        ),
+    )
+    resources = {
+        name: compile_variant(
+            name,
+            shape,
+            owner_rows,
+            launches,
+            stat_mode,
+            expected_lds,
+        )
+        for (
+            name,
+            shape,
+            owner_rows,
+            launches,
+            stat_mode,
+            expected_lds,
+        ) in variants
+    }
+    assert tuple(resources) == tuple(variant[0] for variant in variants)
+    print({"common_dq_resources": resources})
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_d64_causal_mha_ticket_accuracy_gfx950(monkeypatch):
+    ticket = "t02"
+    batch, sq, skv, hq, hkv, head_dim, causal = (D64_BENCHMARK_SHAPES[ticket])
+    assert causal and hq == hkv and sq == skv == 16384
+    real_mha_launcher = globals().get("_launch_bwd_d64_causal_mha_dkdv")
+    original_retained = _launch_bwd_d64_dkdv
+    producer_calls = []
+
+    def record_mha(*args):
+        producer_calls.append(("mha", args[-1]))
+        assert callable(real_mha_launcher)
+        return real_mha_launcher(*args)
+
+    def record_retained(*args, **kwargs):
+        producer_calls.append(("retained", args[-1]))
+        return original_retained(*args, **kwargs)
+
+    monkeypatch.setitem(globals(), "_launch_bwd_d64_causal_mha_dkdv", record_mha)
+    monkeypatch.setitem(globals(), "_launch_bwd_d64_dkdv", record_retained)
+
+    case = _make_d64_aten_case(
+        (batch, hq, hkv, sq, skv, head_dim),
+        seed=223,
+        causal=True,
+    )
+    actual = fa_backward(*case.kernel_args)
+
+    assert [call[0] for call in producer_calls] == ["mha"]
+    dispatch = producer_calls[0][1]
+    assert dispatch.family == "causal_gluon_mha"
+    assert dispatch.stat_mode == _D64_MHA_POSITIVE
+    relative_l2s = {}
+    for name, result, expected in zip(("dq", "dk", "dv"), actual, case.grads):
+        assert torch.isfinite(result).all(), (ticket, name)
+        expected_norm = torch.linalg.vector_norm(expected.float())
+        assert torch.isfinite(expected_norm) and expected_norm.item() > 0.0
+        error_norm = torch.linalg.vector_norm(result.float() - expected.float())
+        assert torch.isfinite(error_norm), (ticket, name)
+        relative_l2 = error_norm / expected_norm
+        relative_l2s[name] = relative_l2.item()
+        assert relative_l2.item() < 5e-3, (
+            ticket,
+            name,
+            relative_l2.item(),
+        )
+    print({"d64_causal_mha_accuracy": ticket, "relative_l2": relative_l2s})
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(
+    "shape",
+    (
+        pytest.param(
+            (1, 24, 24, 4096, 4096, 64),
+            id="square-sq4096-skv4096",
+        ),
+        pytest.param(
+            (1, 24, 24, 4096, 8192, 64),
+            id="rectangular-sq4096-skv8192",
+        ),
+    ),
+)
+def test_d64_causal_mha_direct_publication_gfx950(monkeypatch, shape):
+    real_mha_launcher = globals().get("_launch_bwd_d64_causal_mha_dkdv")
+    assert callable(real_mha_launcher)
+    case = _make_d64_aten_case(shape, seed=227, causal=True)
+    batch, hq, hkv, sq, skv, _head_dim = shape
+    dispatch = _select_d64_dispatch(
+        tuple(case.q.shape),
+        tuple(case.k.shape),
+        True,
+        arch="gfx950:sramecc+:xnack-",
+        cu_count=256,
+        sm_scale=case.sm_scale,
+        bases_aligned_16=True,
+    )
+    assert dispatch.family == "causal_gluon_mha"
+    delta = torch.sum(case.o.float() * case.do.float(), dim=-1)
+    dq = torch.empty_like(case.q)
+    dk = torch.full_like(case.k, float("nan"))
+    dv = torch.full_like(case.v, float("nan"))
+    producer_targets = []
+
+    def record_publication(*args):
+        producer_targets.append((args[6], args[7]))
+        return real_mha_launcher(*args)
+
+    def keep_precomputed_delta(*args):
+        assert args[6] is delta
+        assert args[7] is None
+
+    def reject_partial_allocation(*_args, **_kwargs):
+        raise AssertionError("direct causal MHA publication must not allocate partials")
+
+    monkeypatch.setitem(globals(), "_launch_bwd_d64_causal_dq", keep_precomputed_delta)
+    monkeypatch.setitem(globals(), "_launch_bwd_d64_causal_mha_dkdv", record_publication)
+    monkeypatch.setitem(globals(), "_allocate_bwd_d64_kv_partials", reject_partial_allocation)
+    monkeypatch.setitem(
+        globals(),
+        "_allocate_bwd_d64_causal_gqa8_workspaces",
+        reject_partial_allocation,
+    )
+    monkeypatch.setitem(globals(), "_launch_bwd_d64_dkdv", reject_partial_allocation)
+
+    _run_bwd_d64(
+        case.q,
+        case.k,
+        case.v,
+        case.o,
+        case.do,
+        case.lse,
+        delta,
+        dq,
+        dk,
+        dv,
+        case.sm_scale,
+        True,
+        dispatch,
+    )
+    torch.cuda.synchronize()
+
+    assert len(producer_targets) == 1
+    assert producer_targets[0][0] is dk
+    assert producer_targets[0][1] is dv
+    relative_l2s = {}
+    for name, result, expected in (
+        ("dk", dk, case.grads[1]),
+        ("dv", dv, case.grads[2]),
+    ):
+        assert torch.isfinite(result).all(), name
+        relative_l2 = torch.linalg.vector_norm(result.float() - expected.float()) / torch.linalg.vector_norm(
+            expected.float())
+        relative_l2s[name] = relative_l2.item()
+        assert relative_l2.item() < 5e-3, (name, relative_l2.item())
+    print({
+        "d64_causal_mha_direct_publication": shape,
+        "relative_l2": relative_l2s,
+    })
+
+
+def _compile_d64_causal_mha_producer_variant(name, shape):
+    batch, hq, hkv, sq, skv, head_dim = shape
+    assert hq == hkv
+    q = torch.empty((batch, hq, sq, head_dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.empty((batch, hkv, skv, head_dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.empty_like(k)
+    do = torch.empty_like(q)
+    lse = torch.empty((batch, hq, sq), device="cuda", dtype=torch.float32)
+    delta = torch.empty_like(lse)
+    dk = torch.empty_like(k)
+    dv = torch.empty_like(v)
+    dispatch = _select_d64_dispatch(
+        tuple(q.shape),
+        tuple(k.shape),
+        True,
+        arch="gfx950:sramecc+:xnack-",
+        cu_count=256,
+        sm_scale=0.125,
+        bases_aligned_16=True,
+    )
+    assert dispatch.family == "causal_gluon_mha"
+    kernel = globals().get("_attn_bwd_dkdv_d64_causal_mha_kernel")
+    assert kernel is not None, name
+    kernel.device_caches.clear()
+    _launch_bwd_d64_causal_mha_dkdv(
+        q,
+        k,
+        v,
+        do,
+        lse,
+        delta,
+        dk,
+        dv,
+        0.125,
+        dispatch,
+    )
+    torch.cuda.synchronize()
+    device = torch.cuda.current_device()
+    objects = tuple(kernel.device_caches[device][0].values())
+    assert len(objects) == 1, (name, len(objects))
+    return dispatch, objects[0]
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(
+    "variant_name, shape",
+    (
+        pytest.param(
+            "mha_bm32_bn64_square",
+            (1, 24, 24, 4096, 4096, 64),
+            id="square-sq4096-skv4096",
+        ),
+        pytest.param(
+            "mha_bm32_bn64_rectangular",
+            (1, 24, 24, 4096, 8192, 64),
+            id="rectangular-sq4096-skv8192",
+        ),
+    ),
+)
+def test_d64_causal_mha_codegen_gfx950(variant_name, shape):
+    dispatch, obj = _compile_d64_causal_mha_producer_variant(variant_name, shape)
+    assert dispatch.family == "causal_gluon_mha"
+    resource = _assert_d64_code_object_scratch_free(variant_name, obj)
+    assert resource["vgpr_count"] is not None
+    assert resource["vector_vgpr_count"] is not None
+    assert resource["agpr_count"] is not None
+    assert resource["unified_vgpr_count"] == resource["vgpr_count"]
+    assert resource["unified_vgpr_count"] >= (resource["vector_vgpr_count"] + resource["agpr_count"])
+    assert resource["lds_bytes"] == 16896
+    amdgcn = obj.asm["amdgcn"]
+    assert not re.search(r"\b\w*atomic\w*\b", amdgcn)
+    assert re.search(r"\bbuffer_store_dwordx4\b", amdgcn)
+    print({
+        "d64_causal_mha_resources": variant_name,
+        "shape": shape,
+        "resource": resource,
+    })
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_d64_causal_mha_positive_compatibility_gfx950(monkeypatch):
+    batch, heads, sq, head_dim = 1, 24, 4096, 64
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(109)
+
+    def random(shape):
+        return torch.randn(
+            shape,
+            generator=generator,
+            device="cuda",
+            dtype=torch.bfloat16,
+        ).contiguous()
+
+    q = random((batch, heads, sq, head_dim))
+    k = random(q.shape)
+    v = random(q.shape)
+    do = random(q.shape)
+    sm_scale = head_dim**-0.5
+    state = torch.ops.aten._scaled_dot_product_flash_attention.default(q, k, v, 0.0, True, False, scale=sm_scale)
+    o, lse, cum_q, cum_k, max_q, max_k, rng, unused, _debug = state
+    o = o.contiguous()
+    lse = lse.contiguous()
+    reference = torch.ops.aten._scaled_dot_product_flash_attention_backward.default(
+        do,
+        q,
+        k,
+        v,
+        o,
+        lse,
+        cum_q,
+        cum_k,
+        max_q,
+        max_k,
+        0.0,
+        True,
+        rng,
+        unused,
+        scale=sm_scale,
+    )
+
+    calls = []
+    original_dq = _launch_bwd_d64_causal_dq
+    original_dkdv = _launch_bwd_d64_causal_mha_dkdv
+
+    def record_dq(*args, **kwargs):
+        calls.append(("dq", args[7], args[6], args[-1]))
+        return original_dq(*args, **kwargs)
+
+    def record_dkdv(*args, **kwargs):
+        calls.append(("dkdv", args[5]))
+        return original_dkdv(*args, **kwargs)
+
+    def reject_preprocess(*_args, **_kwargs):
+        calls.append(("preprocess", ))
+        raise AssertionError("selected causal MHA must not preprocess")
+
+    monkeypatch.setitem(globals(), "_launch_bwd_d64_causal_dq", record_dq)
+    monkeypatch.setitem(globals(), "_launch_bwd_d64_causal_mha_dkdv", record_dkdv)
+    monkeypatch.setitem(globals(), "_run_bwd_preprocess", reject_preprocess)
+
+    actual = fa_backward(q, k, v, o, do, lse, sm_scale, True)
+
+    assert [call[0] for call in calls] == ["dq", "dkdv"]
+    assert calls[0][1] is None
+    assert calls[0][2] is calls[1][1]
+    dispatch = calls[0][3]
+    assert dispatch.family == "causal_gluon_mha"
+    assert dispatch.stat_mode == _D64_MHA_POSITIVE
+    for name, result, expected in zip(("dq", "dk", "dv"), actual, reference):
+        assert torch.isfinite(result).all(), name
+        relative_l2 = torch.linalg.vector_norm(result.float() - expected.float()) / torch.linalg.vector_norm(
+            expected.float())
+        assert relative_l2.item() < 5e-3, (name, relative_l2.item())
+
+
+def test_d64_causal_gqa8_signed_pipeline_gfx950(monkeypatch):
+    original_allocator = _allocate_bwd_d64_causal_gqa8_workspaces
+    assert _launch_bwd_d64_causal_gqa8_dkdv is not None
+    assert _launch_bwd_d64_causal_gqa8_reduce is not None
+
+    class Properties:
+        gcnArchName = "gfx950:sramecc+:xnack-"
+        multi_processor_count = 256
+
+    batch, hq, hkv, sq, skv, head_dim = 4, 48, 6, 4096, 16384, 64
+    q = torch.empty((batch, hq, sq, head_dim), device="meta", dtype=torch.bfloat16)
+    k = torch.empty((batch, hkv, skv, head_dim), device="meta", dtype=torch.bfloat16)
+    v = torch.empty_like(k)
+    o = torch.empty_like(q)
+    do = torch.empty_like(q)
+    lse = torch.empty((batch, hq, sq), device="meta", dtype=torch.float32)
+    launches = []
+    workspace = {}
+
+    def allocate(q_arg, k_arg):
+        lse_term, dk_part, dv_part = original_allocator(q_arg, k_arg)
+        workspace.update(
+            lse_term=lse_term,
+            dk_part=dk_part,
+            dv_part=dv_part,
+        )
+        return lse_term, dk_part, dv_part
+
+    def launch_dq(*args):
+        launches.append(("dq", args[6], args[7], args[-1]))
+
+    def launch_producer(*args):
+        launches.append(("producer", args[4], args[5], args[6], args[7], args[-1]))
+
+    def launch_reducer(*args):
+        launches.append(("reduce", args[0], args[1], args[2], args[3]))
+
+    def reject_legacy(*_args, **_kwargs):
+        raise AssertionError("selected signed GQA8 must not preprocess, convert, or use the retained producer")
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _device: Properties())
+    monkeypatch.setitem(globals(), "_allocate_bwd_d64_causal_gqa8_workspaces", allocate)
+    monkeypatch.setitem(globals(), "_launch_bwd_d64_causal_dq", launch_dq)
+    monkeypatch.setitem(globals(), "_launch_bwd_d64_causal_gqa8_dkdv", launch_producer)
+    monkeypatch.setitem(globals(), "_launch_bwd_d64_causal_gqa8_reduce", launch_reducer)
+    monkeypatch.setitem(globals(), "_run_bwd_preprocess", reject_legacy)
+    monkeypatch.setitem(globals(), "_launch_bwd_d64_fused_dq_convert", reject_legacy)
+    monkeypatch.setitem(globals(), "_launch_bwd_d64_dkdv", reject_legacy)
+
+    outputs = fa_backward(q, k, v, o, do, lse, 0.125, True)
+    assert [launch[0] for launch in launches] == ["dq", "producer", "reduce"]
+    dq_launch, producer_launch, reduce_launch = launches
+    dispatch = dq_launch[-1]
+    assert dispatch.family == "causal_gluon_gqa8"
+    assert dispatch.stat_mode == _D64_GQA_SIGNED
+    assert dispatch.kv_splits == 4
+    assert dq_launch[1] is producer_launch[2]
+    assert dq_launch[2] is workspace["lse_term"] is producer_launch[1]
+    assert producer_launch[3] is workspace["dk_part"] is reduce_launch[1]
+    assert producer_launch[4] is workspace["dv_part"] is reduce_launch[2]
+    partial_shape = (batch, hkv, 4, skv, head_dim)
+    assert tuple(workspace["lse_term"].shape) == (batch, hq, sq)
+    assert workspace["lse_term"].dtype == torch.float32
+    for partial in (workspace["dk_part"], workspace["dv_part"]):
+        assert tuple(partial.shape) == partial_shape
+        assert partial.dtype == torch.bfloat16
+        assert partial.is_contiguous()
+    for output in outputs:
+        assert output.dtype == torch.bfloat16
+        assert output.is_contiguous()
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_d64_causal_gqa8_tiny_scale_retained_accuracy_gfx950(monkeypatch):
+    shape = (8, 16, 2, 1024, 1024, 64)
+    case = _make_d64_aten_case(
+        shape,
+        seed=307,
+        causal=True,
+        sm_scale=1e-38,
+    )
+    dispatches = []
+    original_run = _run_bwd_d64
+
+    def record_run(*args):
+        dispatches.append(args[-1])
+        return original_run(*args)
+
+    def reject_selected_workspace(*_args, **_kwargs):
+        raise AssertionError("tiny scale must use retained D64 workspaces")
+
+    monkeypatch.setitem(globals(), "_run_bwd_d64", record_run)
+    monkeypatch.setitem(
+        globals(),
+        "_allocate_bwd_d64_causal_gqa8_workspaces",
+        reject_selected_workspace,
+    )
+    actual = fa_backward(*case.kernel_args)
+
+    assert len(dispatches) == 1
+    assert dispatches[0].family == "causal_m192"
+    assert not dispatches[0].selected_causal
+    relative_l2s = {}
+    for name, result, expected in zip(("dq", "dk", "dv"), actual, case.grads):
+        assert torch.isfinite(result).all(), name
+        error_norm = torch.linalg.vector_norm((result.float() - expected.float()).double())
+        reference_norm = torch.linalg.vector_norm(expected.double())
+        assert reference_norm.item() > 0.0, name
+        relative_l2 = error_norm / reference_norm
+        relative_l2s[name] = relative_l2.item()
+        assert relative_l2.item() < 5e-3, (name, relative_l2.item())
+    print({"d64_tiny_scale_retained_relative_l2": relative_l2s})
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_d64_causal_gqa8_cyclic_analytic_accuracy_gfx950(monkeypatch):
+    batch, hq, hkv, sequence, head_dim = 8, 64, 8, 16384, 64
+    sm_scale = head_dim**-0.5
+    counts = torch.arange(
+        1,
+        sequence + 1,
+        device="cuda",
+        dtype=torch.float64,
+    )
+    v_values = torch.linspace(
+        -1.0,
+        1.0,
+        sequence,
+        device="cuda",
+        dtype=torch.float32,
+    ).to(torch.bfloat16)
+    prefix_mean = (torch.cumsum(v_values.double(), dim=0) / counts).to(torch.bfloat16)
+
+    q = torch.zeros(
+        (batch, hq, sequence, head_dim),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    k = torch.zeros(
+        (batch, hkv, sequence, head_dim),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v = torch.zeros_like(k)
+    o = torch.zeros_like(q)
+    do = torch.zeros_like(q)
+    q[..., 0] = 1.0
+    v[..., 0] = v_values
+    o[..., 0] = prefix_mean
+    do[..., 0] = 1.0
+    lse = torch.log(counts).float()[None, None, :].expand(batch, hq, sequence).contiguous()
+
+    dispatches = []
+    producer_grids = []
+    producer_kernel = _attn_bwd_dkdv_d64_causal_gqa8_kernel
+    producer_kernel.device_caches.clear()
+    original_select = _select_d64_dispatch_for_device
+
+    def record_select(*args):
+        dispatch = original_select(*args)
+        dispatches.append(dispatch)
+        return dispatch
+
+    class RecordProducerGrid:
+
+        def __getitem__(self, grid):
+            producer_grids.append(grid)
+            return producer_kernel[grid]
+
+    monkeypatch.setitem(globals(), "_select_d64_dispatch_for_device", record_select)
+    monkeypatch.setitem(
+        globals(),
+        "_attn_bwd_dkdv_d64_causal_gqa8_kernel",
+        RecordProducerGrid(),
+    )
+    dq, dk, dv = fa_backward(q, k, v, o, do, lse, sm_scale, True)
+    torch.cuda.synchronize()
+
+    assert len(dispatches) == 1
+    dispatch = dispatches[0]
+    assert dispatch.family == "causal_gluon_gqa8"
+    assert dispatch.cyclic_query_split
+    assert dispatch.gqa_grid_mode == _D64_GQA_XCD_N_FAST
+    assert dispatch.dkdv_lifetime == _D64_GQA_DIRECT_D64
+    expected_grid = batch * hkv * 4 * triton.cdiv(sequence, 128)
+    assert producer_grids == [(expected_grid, )]
+
+    for name, result in (("dq", dq), ("dk", dk), ("dv", dv)):
+        assert torch.isfinite(result).all(), name
+    assert torch.count_nonzero(dq).item() == 0
+    assert torch.count_nonzero(dk[..., 1:]).item() == 0
+    assert torch.count_nonzero(dv[..., 1:]).item() == 0
+
+    inverse_counts = counts.reciprocal()
+    harmonic_tail = torch.flip(
+        torch.cumsum(torch.flip(inverse_counts, dims=(0, )), dim=0),
+        dims=(0, ),
+    )
+    weighted_output_tail = torch.flip(
+        torch.cumsum(
+            torch.flip(prefix_mean.double() * inverse_counts, dims=(0, )),
+            dim=0,
+        ),
+        dims=(0, ),
+    )
+    expected_dk = sm_scale * 8.0 * (v_values.double() * harmonic_tail - weighted_output_tail)
+    expected_dv = 8.0 * harmonic_tail
+    relative_l2s = {}
+    for name, result, expected in (
+        ("dk", dk[..., 0], expected_dk),
+        ("dv", dv[..., 0], expected_dv),
+    ):
+        expected = expected[None, None, :].expand_as(result)
+        relative_l2 = torch.linalg.vector_norm(result.double() - expected)
+        relative_l2 /= torch.linalg.vector_norm(expected)
+        relative_l2s[name] = relative_l2.item()
+        assert relative_l2.item() < 5e-3, (name, relative_l2.item())
+
+    device = torch.cuda.current_device()
+    objects = tuple(producer_kernel.device_caches[device][0].values())
+    assert len(objects) == 1
+    resources = _assert_d64_code_object_scratch_free("cyclic_analytic", objects[0])
+    assert resources["lds_bytes"] == 33792
+    assert not re.search(r"\b\w*atomic\w*\b", objects[0].asm["amdgcn"])
+    print({
+        "d64_cyclic_analytic_relative_l2": relative_l2s,
+        "producer_grid": producer_grids[0],
+        "resources": resources,
+    })
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("ticket", ("t04", "t05", "t06", "t07", "t08"))
+def test_d64_causal_gqa8_ticket_accuracy_gfx950(ticket):
+    assert _launch_bwd_d64_causal_gqa8_dkdv is not None
+    batch, sq, skv, hq, hkv, head_dim, causal = D64_BENCHMARK_SHAPES[ticket]
+    assert causal
+    case = _make_d64_aten_case(
+        (batch, hq, hkv, sq, skv, head_dim),
+        seed=211 + int(ticket[1:]),
+        causal=True,
+    )
+    actual = fa_backward(*case.kernel_args)
+    relative_l2s = {}
+    for name, result, expected in zip(("dq", "dk", "dv"), actual, case.grads):
+        assert torch.isfinite(result).all(), (ticket, name)
+        relative_l2 = torch.linalg.vector_norm(result.float() - expected.float()) / torch.linalg.vector_norm(
+            expected.float())
+        relative_l2s[name] = relative_l2.item()
+        assert relative_l2.item() < 5e-3, (ticket, name, relative_l2.item())
+    print({"d64_causal_gqa8_accuracy": ticket, "relative_l2": relative_l2s})
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_d64_causal_gqa8_odd_frontier_accuracy_gfx950():
+    shape = (8, 64, 8, 1088, 1152, 64)
+    batch, hq, hkv, sq, skv, _head_dim = shape
+    dispatch = _select_d64_dispatch(
+        (batch, hq, sq, 64),
+        (batch, hkv, skv, 64),
+        True,
+        arch="gfx950:sramecc+:xnack-",
+        cu_count=256,
+        sm_scale=0.125,
+        bases_aligned_16=True,
+    )
+    assert dispatch.family == "causal_gluon_gqa8"
+    assert dispatch.dkdv_lifetime == _D64_GQA_INTERLEAVED_D32
+    assert dispatch.gqa_grid_mode == _D64_GQA_XCD
+    start_m_blk, _masked = _d64_causal_physical_frontier(128, sq, skv, 64, 128)
+    assert start_m_blk == 1
+
+    case = _make_d64_aten_case(shape, seed=293, causal=True)
+    actual = fa_backward(*case.kernel_args)
+    relative_l2s = {}
+    for name, result, expected in zip(("dq", "dk", "dv"), actual, case.grads):
+        assert torch.isfinite(result).all(), name
+        relative_l2 = torch.linalg.vector_norm(result.float() - expected.float()) / torch.linalg.vector_norm(
+            expected.float())
+        relative_l2s[name] = relative_l2.item()
+        assert relative_l2.item() < 5e-3, (name, relative_l2.item())
+
+    compiled_dispatch, obj = _compile_d64_causal_gqa8_producer_variant("odd_frontier", shape)
+    assert compiled_dispatch == dispatch
+    resources = _assert_d64_code_object_scratch_free("odd_frontier", obj)
+    assert resources["lds_bytes"] == 33792
+    assert not re.search(r"\b\w*atomic\w*\b", obj.asm["amdgcn"])
+    print({
+        "d64_causal_gqa8_odd_frontier": relative_l2s,
+        "resources": resources,
+    })
+
+
+_D64_GQA8_COMPILED_VARIANTS = {}
+
+
+def _compile_d64_causal_gqa8_producer_variant(name, shape, *, lifetime_mode=None):
+    cache_key = (name, tuple(shape), lifetime_mode)
+    cached = _D64_GQA8_COMPILED_VARIANTS.get(cache_key)
+    if cached is not None:
+        return cached
+    batch, hq, hkv, sq, skv, head_dim = shape
+    q = torch.empty((batch, hq, sq, head_dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.empty((batch, hkv, skv, head_dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.empty_like(k)
+    do = torch.empty_like(q)
+    lse_term, dk_part, dv_part = _allocate_bwd_d64_causal_gqa8_workspaces(q, k)
+    delta = torch.empty_like(lse_term)
+    dispatch = _select_d64_dispatch(
+        tuple(q.shape),
+        tuple(k.shape),
+        True,
+        arch="gfx950:sramecc+:xnack-",
+        cu_count=256,
+        sm_scale=0.125,
+        bases_aligned_16=True,
+    )
+    assert dispatch.family == "causal_gluon_gqa8"
+    if lifetime_mode is not None:
+        dispatch = dataclasses.replace(dispatch, dkdv_lifetime=lifetime_mode)
+    _attn_bwd_dkdv_d64_causal_gqa8_kernel.device_caches.clear()
+    _launch_bwd_d64_causal_gqa8_dkdv(
+        q,
+        k,
+        v,
+        do,
+        lse_term,
+        delta,
+        dk_part,
+        dv_part,
+        0.125,
+        dispatch,
+    )
+    torch.cuda.synchronize()
+    device = torch.cuda.current_device()
+    objects = tuple(_attn_bwd_dkdv_d64_causal_gqa8_kernel.device_caches[device][0].values())
+    assert len(objects) == 1, (name, len(objects))
+    result = dispatch, objects[0]
+    _D64_GQA8_COMPILED_VARIANTS[cache_key] = result
+    return result
+
+
+def test_d64_causal_gqa8_compiled_variant_cache_identity(monkeypatch):
+    compiled_objects = []
+
+    class FakeProducerKernel:
+
+        def __init__(self):
+            self.device_caches = {}
+
+        def __getitem__(self, _grid):
+
+            def launch(*_args, **_kwargs):
+                compiled = object()
+                compiled_objects.append(compiled)
+                self.device_caches[0] = ({"variant": compiled}, )
+
+            return launch
+
+    real_empty = torch.empty
+
+    def meta_empty(*args, **kwargs):
+        kwargs["device"] = "meta"
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setitem(globals(), "_D64_GQA8_COMPILED_VARIANTS", {})
+    monkeypatch.setitem(
+        globals(),
+        "_attn_bwd_dkdv_d64_causal_gqa8_kernel",
+        FakeProducerKernel(),
+    )
+    monkeypatch.setattr(torch, "empty", meta_empty)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+
+    first_shape = (4, 48, 6, 4096, 4096, 64)
+    second_shape = (4, 48, 6, 4096, 8192, 64)
+    first = _compile_d64_causal_gqa8_producer_variant("shared", first_shape)
+    repeated = _compile_d64_causal_gqa8_producer_variant("shared", first_shape)
+    different_shape = _compile_d64_causal_gqa8_producer_variant("shared", second_shape)
+    different_lifetime = _compile_d64_causal_gqa8_producer_variant(
+        "shared",
+        first_shape,
+        lifetime_mode=_D64_GQA_INTERLEAVED_D32,
+    )
+
+    assert repeated is first
+    assert different_shape is not first
+    assert different_lifetime is not first
+    assert different_lifetime is not different_shape
+    assert len(compiled_objects) == 3
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_d64_causal_gqa8_lifetime_codegen_gfx950():
+    assert _attn_bwd_dkdv_d64_causal_gqa8_kernel is not None
+    same_shape = (4, 48, 6, 4096, 4096, 64)
+    d32_objects = {}
+    for lifetime in (
+            _D64_GQA_INDEPENDENT_D32,
+            _D64_GQA_INTERLEAVED_D32,
+    ):
+        dispatch, obj = _compile_d64_causal_gqa8_producer_variant(
+            f"same_shape_{lifetime}",
+            same_shape,
+            lifetime_mode=lifetime,
+        )
+        assert dispatch.dkdv_lifetime == lifetime
+        assert dispatch.gqa_grid_mode == _D64_GQA_XCD
+        assert not dispatch.cyclic_query_split
+        ttgir = obj.asm.get("ttgir", "")
+        assert ttgir, lifetime
+        assert "tensor<128x32xf32" in ttgir, lifetime
+        resource = _assert_d64_code_object_scratch_free(lifetime, obj)
+        assert resource["lds_bytes"] == 33792
+        d32_objects[lifetime] = obj
+    independent = d32_objects[_D64_GQA_INDEPENDENT_D32]
+    interleaved = d32_objects[_D64_GQA_INTERLEAVED_D32]
+    assert independent.asm["ttgir"] != interleaved.asm["ttgir"]
+    assert independent.asm["amdgcn"] != interleaved.asm["amdgcn"]
+
+    direct_dispatch, direct = _compile_d64_causal_gqa8_producer_variant("t04_direct_d64", (2, 32, 4, 16384, 16384, 64))
+    assert direct_dispatch.dkdv_lifetime == _D64_GQA_DIRECT_D64
+    assert "tensor<128x32xf32" not in direct.asm.get("ttgir", "")
+    direct_resource = _assert_d64_code_object_scratch_free("direct", direct)
+    assert direct_resource["lds_bytes"] == 33792
+
+    source = _attn_bwd_dkdv_d64_causal_gqa8_kernel.src
+    assert "_d64_gqa8_direct_d64_impl" in source
+    assert "_d64_gqa8_d32_impl" in source
+    assert "LIFETIME_MODE == _D64_GQA_DIRECT_D64_JIT" in source
+    assert "INTERLEAVED_D32" in source
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_d64_causal_gqa8_reducer_order_left_associated_fp32_gfx950():
+    dk_values_cpu = torch.tensor([0.5, 1.0, 2**24, -(2**24)], dtype=torch.bfloat16)
+    dv_values_cpu = torch.tensor([0.5, 2**24, -1.0, -(2**24)], dtype=torch.bfloat16)
+    assert dk_values_cpu[3].item() != 0
+    assert dv_values_cpu[3].item() != 0
+
+    def fp32_add(left, right):
+        return torch.add(left.to(torch.float32), right.to(torch.float32))
+
+    def reference_orders(values):
+        left = fp32_add(
+            fp32_add(fp32_add(values[0], values[1]), values[2]),
+            values[3],
+        )
+        balanced = fp32_add(
+            fp32_add(values[0], values[1]),
+            fp32_add(values[2], values[3]),
+        )
+        alternate_pairs = fp32_add(
+            fp32_add(values[0], values[2]),
+            fp32_add(values[1], values[3]),
+        )
+        reordered = fp32_add(
+            fp32_add(fp32_add(values[0], values[2]), values[1]),
+            values[3],
+        )
+        reverse = fp32_add(
+            fp32_add(fp32_add(values[3], values[2]), values[1]),
+            values[0],
+        )
+        return left, (balanced, alternate_pairs, reordered, reverse)
+
+    dk_expected, dk_forbidden = reference_orders(dk_values_cpu)
+    dv_expected, dv_forbidden = reference_orders(dv_values_cpu)
+    dk_expected = dk_expected.to(torch.bfloat16)
+    dv_expected = dv_expected.to(torch.bfloat16)
+    assert dk_expected.item() == 2.0
+    assert dv_expected.item() == -1.0
+    assert all(not torch.equal(dk_expected, result.to(torch.bfloat16)) for result in dk_forbidden)
+    assert all(not torch.equal(dv_expected, result.to(torch.bfloat16)) for result in dv_forbidden)
+
+    dk_values = dk_values_cpu.to(device="cuda")
+    dv_values = dv_values_cpu.to(device="cuda")
+    dk_part = (dk_values.view(1, 1, 4, 1, 1).expand(1, 1, 4, 128, 64).contiguous())
+    dv_part = (dv_values.view(1, 1, 4, 1, 1).expand(1, 1, 4, 128, 64).contiguous())
+    dk = torch.full((1, 1, 128, 64), 7, device="cuda", dtype=torch.bfloat16)
+    dv = torch.full_like(dk, -7)
+    _launch_bwd_d64_causal_gqa8_reduce(dk_part, dv_part, dk, dv)
+    torch.cuda.synchronize()
+
+    assert dk.dtype == dv.dtype == torch.bfloat16
+    assert torch.equal(dk, torch.full_like(dk, dk_expected.item()))
+    assert torch.equal(dv, torch.full_like(dv, dv_expected.item()))
+
+    reducer_source = _attn_bwd_dkdv_d64_causal_gqa8_reduce_kernel.src
+    reducer_ast = ast.parse(reducer_source).body[0]
+
+    def accumulator_chain(name):
+        return [
+            ast.unparse(statement.value)
+            for statement in reducer_ast.body
+            if isinstance(statement, ast.Assign) and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name) and statement.targets[0].id == name
+        ]
+
+    assert accumulator_chain("dk_acc") == [
+        "dk_split0.to(tl.float32)",
+        "dk_acc + dk_split1.to(tl.float32)",
+        "dk_acc + dk_split2.to(tl.float32)",
+        "dk_acc + dk_split3.to(tl.float32)",
+    ]
+    assert accumulator_chain("dv_acc") == [
+        "dv_split0.to(tl.float32)",
+        "dv_acc + dv_split1.to(tl.float32)",
+        "dv_acc + dv_split2.to(tl.float32)",
+        "dv_acc + dv_split3.to(tl.float32)",
+    ]
+    assert reducer_source.count("dk_acc.to(tl.bfloat16)") == 1
+    assert reducer_source.count("dv_acc.to(tl.bfloat16)") == 1
+    for split in range(4):
+        assert f"dk_split{split}.to(tl.bfloat16)" not in reducer_source
+        assert f"dv_split{split}.to(tl.bfloat16)" not in reducer_source
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_d64_causal_gqa8_reducer_determinism_gfx950():
+    assert _launch_bwd_d64_causal_gqa8_reduce is not None
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(271)
+    dk_part = torch.randn(
+        (1, 2, 4, 256, 64),
+        generator=generator,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    dv_part = torch.randn(
+        (1, 2, 4, 256, 64),
+        generator=generator,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    baseline = None
+    for run in range(20):
+        dk = torch.full(
+            (1, 2, 256, 64),
+            run + 1,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        dv = torch.full_like(dk, -(run + 1))
+        _launch_bwd_d64_causal_gqa8_reduce(dk_part, dv_part, dk, dv)
+        torch.cuda.synchronize()
+        current = (dk.clone(), dv.clone())
+        if baseline is None:
+            baseline = current
+        else:
+            assert torch.equal(current[0], baseline[0]), run
+            assert torch.equal(current[1], baseline[1]), run
+    assert torch.isfinite(baseline[0]).all()
+    assert torch.isfinite(baseline[1]).all()
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_d64_causal_gqa8_end_to_end_determinism_gfx950():
+    assert _launch_bwd_d64_causal_gqa8_dkdv is not None
+    case = _make_d64_aten_case((4, 48, 6, 4096, 4096, 64), seed=277, causal=True)
+    baseline = None
+    for run in range(5):
+        _dq, dk, dv = fa_backward(*case.kernel_args)
+        torch.cuda.synchronize()
+        current = (dk.clone(), dv.clone())
+        if baseline is None:
+            baseline = current
+        else:
+            assert torch.equal(current[0], baseline[0]), run
+            assert torch.equal(current[1], baseline[1]), run
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_d64_causal_gqa8_codegen_gfx950():
+    assert _attn_bwd_dkdv_d64_causal_gqa8_kernel is not None
+    assert _attn_bwd_dkdv_d64_causal_gqa8_reduce_kernel is not None
+    producer_variants = {
+        "split_fast": (
+            (2, 32, 4, 16384, 16384, 64),
+            _D64_GQA_SPLIT_FAST,
+            False,
+        ),
+        "xcd": (
+            (4, 48, 6, 4096, 4096, 64),
+            _D64_GQA_XCD,
+            False,
+        ),
+        "xcd_n_fast": (
+            (4, 48, 6, 4096, 16384, 64),
+            _D64_GQA_XCD_N_FAST,
+            False,
+        ),
+        "cyclic": (
+            (8, 64, 8, 16384, 16384, 64),
+            _D64_GQA_XCD_N_FAST,
+            True,
+        ),
+    }
+    resources = {}
+    producer_objects = {}
+    for name, (shape, expected_mode, expected_cyclic) in producer_variants.items():
+        dispatch, obj = _compile_d64_causal_gqa8_producer_variant(name, shape)
+        producer_objects[name] = obj
+        resources[name] = _assert_d64_code_object_scratch_free(name, obj)
+        assert resources[name]["lds_bytes"] == 33792, (name, resources[name])
+        assert dispatch.gqa_grid_mode == expected_mode, name
+        assert dispatch.cyclic_query_split is expected_cyclic, name
+        amdgcn = obj.asm["amdgcn"]
+        assert not re.search(r"\b\w*atomic\w*\b", amdgcn), name
+        assert re.search(r"\bbuffer_store_dwordx4\b", amdgcn), name
+
+    dk_part = torch.empty((1, 1, 4, 256, 64), device="cuda", dtype=torch.bfloat16)
+    dv_part = torch.empty_like(dk_part)
+    dk = torch.empty((1, 1, 256, 64), device="cuda", dtype=torch.bfloat16)
+    dv = torch.empty_like(dk)
+    _attn_bwd_dkdv_d64_causal_gqa8_reduce_kernel.device_caches.clear()
+    _launch_bwd_d64_causal_gqa8_reduce(dk_part, dv_part, dk, dv)
+    torch.cuda.synchronize()
+    device = torch.cuda.current_device()
+    reducer_objects = tuple(_attn_bwd_dkdv_d64_causal_gqa8_reduce_kernel.device_caches[device][0].values())
+    assert len(reducer_objects) == 1
+    reducer = reducer_objects[0]
+    resources["reducer"] = _assert_d64_code_object_scratch_free("reducer", reducer)
+    assert resources["reducer"]["lds_bytes"] == 0
+    reducer_asm = reducer.asm["amdgcn"]
+    assert not re.search(r"\b\w*atomic\w*\b", reducer_asm)
+    assert re.search(r"\bbuffer_store_dwordx4\b", reducer_asm)
+
+    producer_source = _attn_bwd_dkdv_d64_causal_gqa8_kernel.src
+    consume_source = _d64_gqa8_d32_consume.src
+    assert "tlx.buffer_load(K" in producer_source
+    assert "tlx.buffer_load(V" in producer_source
+    assert "tlx.local_alloc((BLOCK_M, D), tl.bfloat16, 2" in producer_source
+    assert "n0 + BLOCK_N - 1 > m_blk * BLOCK_M + (SKV - SQ)" in consume_source
+    assert "LSE_MODE == _D64_LSE_NEG_INV_SCALE_JIT" in producer_source
+    assert "DELTA_MODE == _D64_DELTA_NEGATED_JIT" in producer_source
+    assert "atomic" not in producer_source.lower()
+
+    reducer_source = _attn_bwd_dkdv_d64_causal_gqa8_reduce_kernel.src
+    load_positions = [reducer_source.index(f"dk_split{split}") for split in range(4)]
+    assert load_positions == sorted(load_positions)
+    assert reducer_source.index("dk_split3") < reducer_source.index("dk_out")
+    assert reducer_source.index("dv_split3") < reducer_source.index("dv_out")
+    print({"d64_causal_gqa8_resources": resources})
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_d64_fused_n256_gqa8_correctness_and_partials_gfx950(monkeypatch):
+    case = _make_d64_aten_case((1, 16, 2, 4096, 4096, 64), seed=53)
+    launches = []
+    original_producer = _launch_bwd_d64_fused_n256
+    original_convert = _launch_bwd_d64_fused_dq_convert
+    original_reduce = _launch_bwd_d64_kv_reduce
+
+    def record_producer(
+        q,
+        k,
+        v,
+        do,
+        lse,
+        delta,
+        dq_acc,
+        dk_owner,
+        dv_owner,
+        sm_scale,
+        dispatch,
+    ):
+        launches.append((
+            "producer",
+            tuple(dk_owner.shape),
+            tuple(dv_owner.shape),
+            dk_owner.dtype,
+            dv_owner.dtype,
+            dispatch.kv_splits,
+        ))
+        return original_producer(
+            q,
+            k,
+            v,
+            do,
+            lse,
+            delta,
+            dq_acc,
+            dk_owner,
+            dv_owner,
+            sm_scale,
+            dispatch,
+        )
+
+    def record_convert(dq_acc, dq):
+        launches.append(("convert", dq_acc.dtype, dq.dtype))
+        return original_convert(dq_acc, dq)
+
+    def record_reduce(dk_part, dv_part, dk, dv, dispatch):
+        launches.append((
+            "reduce",
+            tuple(dk_part.shape),
+            tuple(dv_part.shape),
+            dk_part.dtype,
+            dv_part.dtype,
+            dispatch.kv_splits,
+        ))
+        return original_reduce(dk_part, dv_part, dk, dv, dispatch)
+
+    monkeypatch.setitem(globals(), "_launch_bwd_d64_fused_n256", record_producer)
+    monkeypatch.setitem(globals(), "_launch_bwd_d64_fused_dq_convert", record_convert)
+    monkeypatch.setitem(globals(), "_launch_bwd_d64_kv_reduce", record_reduce)
+    _attn_bwd_dq_d64_direct_kernel.device_caches.clear()
+    _attn_bwd_dkdv_d64_direct_kernel.device_caches.clear()
+    _attn_bwd_d64_fused_n256_kernel.device_caches.clear()
+    _attn_bwd_d64_fused_dq_convert_kernel.device_caches.clear()
+    _attn_bwd_dkdv_d64_reduce_kernel.device_caches.clear()
+
+    actual = fa_backward(*case.kernel_args)
+
+    partial_shape = (1, 2, 8, 4096, 64)
+    assert launches == [
+        (
+            "producer",
+            partial_shape,
+            partial_shape,
+            torch.bfloat16,
+            torch.bfloat16,
+            8,
+        ),
+        ("convert", torch.float32, torch.bfloat16),
+        (
+            "reduce",
+            partial_shape,
+            partial_shape,
+            torch.bfloat16,
+            torch.bfloat16,
+            8,
+        ),
+    ]
+    producer_source = _attn_bwd_d64_fused_n256_kernel.src
+    assert "pid_split = pid_hq % group_size" in producer_source
+    assert ("((pid_b * HKV + pid_hkv) * KV_SPLITS + pid_split)" in producer_source)
+
+    relative_l2s = {}
+    for name, result, expected in zip(("dq", "dk", "dv"), actual, case.grads):
+        assert torch.isfinite(result).all(), name
+        relative_l2 = torch.linalg.vector_norm(result.float() - expected.float()) / torch.linalg.vector_norm(
+            expected.float())
+        relative_l2s[name] = relative_l2.item()
+        assert relative_l2.item() < 5e-3, (name, relative_l2.item())
+
+    device = torch.cuda.current_device()
+    assert (device not in _attn_bwd_dq_d64_direct_kernel.device_caches
+            or not _attn_bwd_dq_d64_direct_kernel.device_caches[device][0])
+    assert (device not in _attn_bwd_dkdv_d64_direct_kernel.device_caches
+            or not _attn_bwd_dkdv_d64_direct_kernel.device_caches[device][0])
+    code_objects = {
+        "producer": tuple(_attn_bwd_d64_fused_n256_kernel.device_caches[device][0].values()),
+        "convert": tuple(_attn_bwd_d64_fused_dq_convert_kernel.device_caches[device][0].values()),
+        "reduce": tuple(_attn_bwd_dkdv_d64_reduce_kernel.device_caches[device][0].values()),
+    }
+    assert all(len(objects) == 1 for objects in code_objects.values())
+    resources = {name: _assert_d64_code_object_scratch_free(name, objects[0]) for name, objects in code_objects.items()}
+    producer_asm = code_objects["producer"][0].asm["amdgcn"]
+    assert re.search(r"\bbuffer_atomic_add_f32\b", producer_asm)
+    assert "buffer_atomic_pk_add_bf16" not in producer_asm
+    print({"fused_gqa8_relative_l2": relative_l2s})
+    print({"fused_gqa8_resources": resources})
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_d64_fused_n256_mha_correctness_and_codegen_gfx950():
+    case = _make_d64_aten_case((1, 16, 16, 4096, 4096, 64), seed=47)
+    _attn_bwd_dq_d64_direct_kernel.device_caches.clear()
+    _attn_bwd_dkdv_d64_direct_kernel.device_caches.clear()
+    _attn_bwd_d64_fused_n256_kernel.device_caches.clear()
+    _attn_bwd_d64_fused_dq_convert_kernel.device_caches.clear()
+    _attn_bwd_dkdv_d64_reduce_kernel.device_caches.clear()
+
+    actual = fa_backward(*case.kernel_args)
+
+    relative_l2s = {}
+    for name, result, expected in zip(("dq", "dk", "dv"), actual, case.grads):
+        assert torch.isfinite(result).all(), name
+        relative_l2 = torch.linalg.vector_norm(result.float() - expected.float()) / torch.linalg.vector_norm(
+            expected.float())
+        relative_l2s[name] = relative_l2.item()
+        assert relative_l2.item() < 5e-3, (name, relative_l2.item())
+
+    device = torch.cuda.current_device()
+    assert (device not in _attn_bwd_dq_d64_direct_kernel.device_caches
+            or not _attn_bwd_dq_d64_direct_kernel.device_caches[device][0])
+    assert (device not in _attn_bwd_dkdv_d64_direct_kernel.device_caches
+            or not _attn_bwd_dkdv_d64_direct_kernel.device_caches[device][0])
+    assert (device not in _attn_bwd_dkdv_d64_reduce_kernel.device_caches
+            or not _attn_bwd_dkdv_d64_reduce_kernel.device_caches[device][0])
+    producer = tuple(_attn_bwd_d64_fused_n256_kernel.device_caches[device][0].values())
+    convert = tuple(_attn_bwd_d64_fused_dq_convert_kernel.device_caches[device][0].values())
+    assert len(producer) == len(convert) == 1
+    resources = {
+        name: _assert_d64_code_object_scratch_free(name, obj)
+        for name, obj in (("producer", producer[0]), ("convert", convert[0]))
+    }
+    producer_asm = producer[0].asm["amdgcn"]
+    assert re.search(r"\bbuffer_atomic_add_f32\b", producer_asm)
+    assert "buffer_atomic_pk_add_bf16" not in producer_asm
+    print({"fused_mha_relative_l2": relative_l2s})
+    print({"fused_mha_resources": resources})
+
+
+@pytest.mark.parametrize(
+    ("q_shape", "k_shape", "causal", "expected"),
+    [
+        ((2, 32, 16384, 64), (2, 32, 16384, 64), False, 1),
+        ((2, 32, 16384, 64), (2, 4, 16384, 64), False, 8),
+        ((2, 32, 16384, 64), (2, 4, 16384, 64), True, 4),
+        ((4, 48, 4096, 64), (4, 6, 16384, 64), True, 4),
+    ],
+)
+def test_d64_gqa_kv_split_policy(q_shape, k_shape, causal, expected):
+    assert _select_d64_dispatch(q_shape, k_shape, causal).kv_splits == expected
+
+
+@pytest.mark.parametrize(
+    ("owner_start", "owner_rows", "sq", "skv", "block_n", "expected"),
+    [
+        (0, 192, 4096, 4096, 32, 6),
+        (192, 192, 4096, 4096, 32, 12),
+        (0, 192, 4096, 16384, 64, 195),
+        (3840, 192, 4096, 4096, 32, 126),
+    ],
+)
+def test_d64_causal_dq_compact_key_frontier(owner_start, owner_rows, sq, skv, block_n, expected):
+    assert _d64_causal_dq_key_blocks(owner_start, owner_rows, sq, skv, block_n) == expected
+
+
+@pytest.mark.parametrize(
+    ("key_start", "sq", "skv", "block_m", "expected"),
+    [
+        (0, 4096, 4096, 64, 0),
+        (256, 4096, 4096, 64, 4),
+        (12288, 4096, 16384, 64, 0),
+        (16320, 4096, 16384, 64, 63),
+    ],
+)
+def test_d64_causal_dkdv_compact_query_frontier(key_start, sq, skv, block_m, expected):
+    assert _d64_causal_dkdv_first_query_block(key_start, sq, skv, block_m) == expected
+
+
+@pytest.mark.parametrize(
+    ("q_shape", "k_shape", "causal"),
+    [
+        ((2, 32, 16384, 64), (2, 32, 16384, 64), False),
+        ((2, 32, 16384, 64), (2, 4, 16384, 64), True),
+        ((4, 48, 4096, 64), (4, 6, 4096, 64), True),
+        ((4, 48, 4096, 64), (4, 6, 16384, 64), True),
+    ],
+)
+def test_d64_launch_uses_structural_dq_owner(monkeypatch, q_shape, k_shape, causal):
+
+    class LaunchRecorder:
+
+        def __init__(self):
+            self.calls = []
+
+        def __getitem__(self, grid):
+
+            def record(*args, **kwargs):
+                self.calls.append((grid, args, kwargs))
+
+            return record
+
+    dq_launch = LaunchRecorder()
+    dkdv_launch = LaunchRecorder()
+    reduce_launch = LaunchRecorder()
+    monkeypatch.setitem(globals(), "_attn_bwd_dq_d64_direct_kernel", dq_launch)
+    monkeypatch.setitem(globals(), "_attn_bwd_dkdv_d64_direct_kernel", dkdv_launch)
+    monkeypatch.setitem(globals(), "_attn_bwd_dkdv_d64_reduce_kernel", reduce_launch)
+    q = torch.empty(q_shape, device="meta", dtype=torch.bfloat16)
+    k = torch.empty(k_shape, device="meta", dtype=torch.bfloat16)
+    dispatch = _select_d64_dispatch(q_shape, k_shape, causal)
+
+    _run_bwd_d64_direct(q, k, k, q, object(), object(), q, k, k, 0.125, causal, dispatch)
+
+    assert len(dq_launch.calls) == 1
+    grid, _args, kwargs = dq_launch.calls[0]
+    assert grid == (triton.cdiv(q_shape[2], dispatch.owner_rows), q_shape[1], q_shape[0])
+    assert kwargs["OWNER_ROWS"] == dispatch.owner_rows
+    assert kwargs["BLOCK_N"] == dispatch.key_rows
+    assert len(dkdv_launch.calls) == 1
+    dkdv_grid, _args, dkdv_kwargs = dkdv_launch.calls[0]
+    assert dkdv_grid == (
+        triton.cdiv(k_shape[2], 64),
+        k_shape[1] * dispatch.kv_splits,
+        k_shape[0],
+    )
+    assert dkdv_kwargs["KV_SPLITS"] == dispatch.kv_splits
+    assert dkdv_kwargs["BLOCK_N"] == 64
+    assert len(reduce_launch.calls) == (1 if dispatch.kv_splits > 1 else 0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(
+    ("q_shape", "k_shape", "causal"),
+    [
+        pytest.param((1, 1, 256, 64), (1, 1, 256, 64), False, id="noncausal-n256-mha"),
+        pytest.param((1, 8, 256, 64), (1, 1, 256, 64), False, id="noncausal-n256-gqa8"),
+        pytest.param((1, 1, 256, 64), (1, 1, 256, 64), True, id="causal-m192-square"),
+        pytest.param((1, 8, 256, 64), (1, 1, 256, 64), True, id="causal-m192-square-gqa8"),
+        pytest.param((1, 8, 256, 64), (1, 1, 512, 64), True, id="causal-m192-rect-gqa8"),
+        pytest.param((1, 1, 16384, 64), (1, 1, 16384, 64), True, id="causal-m256-deep"),
+        pytest.param((1, 8, 16384, 64), (1, 1, 16384, 64), True, id="causal-m256-deep-gqa8"),
+    ],
+)
+def test_d64_retained_specializations_are_scratch_free_gfx950(q_shape, k_shape, causal):
+    q = torch.zeros(q_shape, device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros(k_shape, device="cuda", dtype=torch.bfloat16)
+    lse = torch.zeros(q_shape[:-1], device="cuda", dtype=torch.float32)
+    delta = torch.zeros_like(lse)
+    dq = torch.empty_like(q)
+    dk = torch.empty_like(k)
+    dv = torch.empty_like(k)
+    _attn_bwd_dq_d64_direct_kernel.device_caches.clear()
+    _attn_bwd_dkdv_d64_direct_kernel.device_caches.clear()
+    _attn_bwd_dkdv_d64_reduce_kernel.device_caches.clear()
+
+    dispatch = _select_d64_dispatch(q_shape, k_shape, causal)
+    _run_bwd_d64_direct(q, k, k, q, lse, delta, dq, dk, dv, 0.125, causal, dispatch)
+    torch.cuda.synchronize()
+
+    device = torch.cuda.current_device()
+    resources = {}
+    kernels = [
+        ("dq", _attn_bwd_dq_d64_direct_kernel),
+        ("dkdv", _attn_bwd_dkdv_d64_direct_kernel),
+    ]
+    if dispatch.kv_splits > 1:
+        kernels.append(("reduce", _attn_bwd_dkdv_d64_reduce_kernel))
+    for name, kernel in kernels:
+        compiled = tuple(kernel.device_caches[device][0].values())
+        assert len(compiled) == 1, (name, len(compiled))
+        resources[name] = _assert_d64_code_object_scratch_free(name, compiled[0])
+    print({"q_shape": q_shape, "k_shape": k_shape, "causal": causal, "resources": resources})
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
