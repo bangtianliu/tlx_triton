@@ -1,4 +1,5 @@
-// RUN: triton-opt %s  -split-input-file --convert-triton-amdgpu-to-llvm="gfx-arch=gfx950" | FileCheck %s
+// RUN: triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm="gfx-arch=gfx950" | FileCheck %s
+// RUN: triton-opt %s -split-input-file --cse | FileCheck %s --check-prefix=CSE
 
 // CHECK-LABEL:mfma_16x16x32_f16
 
@@ -187,5 +188,50 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
         : tensor<16x16xf32, #scheduled_mma>,
           tensor<32x16xbf16, #scheduled_rhs>
     tt.return
+  }
+}
+
+// -----
+
+// CHECK-LABEL: llvm.func @register_handoff_vgpr_groups
+// CSE-LABEL: tt.func public @register_handoff_vgpr_groups
+// CSE-COUNT-2: amdg.register_handoff
+// CHECK: llvm.inline_asm
+// CHECK-SAME: "=v,=v,0,1"
+// CHECK: llvm.inline_asm
+// CHECK-SAME: "=v,=v,0,1"
+// CHECK: llvm.inline_asm
+// CHECK-SAME: "=v,=v,0,1"
+// CHECK: llvm.inline_asm
+// CHECK-SAME: "=v,=v,0,1"
+// CHECK-NOT: amdg.register_handoff
+
+#handoff_fp32 = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @register_handoff_vgpr_groups(
+      %arg: tensor<256xf32, #handoff_fp32>) -> tensor<256xf32, #handoff_fp32> {
+    %result = amdg.register_handoff %arg class "vgpr" groups 2
+        : tensor<256xf32, #handoff_fp32>
+    %independent = amdg.register_handoff %arg class "vgpr" groups 2
+        : tensor<256xf32, #handoff_fp32>
+    %sum = arith.addf %result, %independent : tensor<256xf32, #handoff_fp32>
+    tt.return %sum : tensor<256xf32, #handoff_fp32>
+  }
+}
+
+// -----
+
+// CHECK-LABEL: llvm.func @register_handoff_packs_fp16_registers
+// CHECK: llvm.inline_asm
+// CHECK-SAME: "=a,=a,0,1"
+// CHECK-NOT: amdg.register_handoff
+
+#handoff_fp16 = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @register_handoff_packs_fp16_registers(
+      %arg: tensor<256xf16, #handoff_fp16>) -> tensor<256xf16, #handoff_fp16> {
+    %result = amdg.register_handoff %arg class "agpr" groups 2
+        : tensor<256xf16, #handoff_fp16>
+    tt.return %result : tensor<256xf16, #handoff_fp16>
   }
 }

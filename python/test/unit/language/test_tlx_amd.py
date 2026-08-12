@@ -316,6 +316,12 @@ def test_d64_ticket_dispatch_contract_is_ci_discovered(q_shape, k_shape, causal,
     amd_fa_bwd._validate_d64_dispatch(q_shape, k_shape, causal, dispatch)
 
 
+def test_d64_causal_gqa_score_prescaling_ast_contract():
+    from triton.language.extra.tlx.tutorials import amd_fa_bwd
+
+    amd_fa_bwd.test_d64_causal_common_dq_direct_load_ast_contract()
+
+
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 @pytest.mark.parametrize(
     ("shape", "causal", "family", "kernel_names"),
@@ -1073,6 +1079,137 @@ def test_amd_late_address_compute_compiles_gfx950():
     assert "tlx.rematerialize_coordinates" in compiled.asm["ttgir"]
     assert compiled.asm["llir"].count('asm sideeffect "", "=v,0"') >= 2
     assert "amdgcn" in compiled.asm
+
+
+@triton.jit
+def _amd_register_handoff_kernel(x_ptr, y_ptr, REGISTER_CLASS: tl.constexpr):
+    offsets = tl.arange(0, 1024)
+    values = tl.load(x_ptr + offsets)
+    singles = tlx.amd_register_handoff(values, register_class=REGISTER_CLASS, registers_per_group=1)
+    grouped0 = tlx.amd_register_handoff(values, register_class=REGISTER_CLASS, registers_per_group=2)
+    grouped1 = tlx.amd_register_handoff(values, register_class=REGISTER_CLASS, registers_per_group=2)
+    tl.store(y_ptr + offsets, singles + (grouped0 - grouped1))
+
+
+@pytest.mark.parametrize(
+    ("register_class", "element_type"),
+    [
+        pytest.param("vgpr", "fp32", id="vgpr-fp32"),
+        pytest.param("vgpr", "fp16", id="vgpr-fp16"),
+        pytest.param("agpr", "fp32", id="agpr-fp32"),
+    ],
+)
+def test_amd_register_handoff_compiles_gfx950(register_class, element_type):
+    compiled = compile_for_gfx950(
+        _amd_register_handoff_kernel,
+        signature={"x_ptr": f"*{element_type}", "y_ptr": f"*{element_type}"},
+        constexprs={"REGISTER_CLASS": register_class},
+    )
+    ttir = compiled.asm["ttir"]
+    assert ttir.count("amdg.register_handoff") == 3
+    assert f'class "{register_class}" groups 1' in ttir
+    assert ttir.count(f'class "{register_class}" groups 2') == 2
+    assert "tt.elementwise_inline_asm" not in ttir
+    assert "amdg.register_resident" not in ttir
+    llir = compiled.asm["llir"]
+    assert "amdg.register_handoff" not in llir
+    register_constraint = "a" if register_class == "agpr" else "v"
+    grouped_constraint = f'"={register_constraint},={register_constraint},0,1"'
+    grouped_asm = [line for line in llir.splitlines() if grouped_constraint in line]
+    expected_grouped_asm = 2 if element_type == "fp16" else 4
+    assert len(grouped_asm) == expected_grouped_asm
+    assert all("sideeffect" in line for line in grouped_asm)
+
+
+@triton.jit
+def _invalid_amd_register_handoff_kernel(
+    x_ptr,
+    y_ptr,
+    REGISTER_CLASS: tl.constexpr,
+    REGISTERS_PER_GROUP: tl.constexpr,
+):
+    offsets = tl.arange(0, 1024)
+    values = tl.load(x_ptr + offsets)
+    values = tlx.amd_register_handoff(
+        values,
+        register_class=REGISTER_CLASS,
+        registers_per_group=REGISTERS_PER_GROUP,
+    )
+    tl.store(y_ptr + offsets, values)
+
+
+@pytest.mark.parametrize(
+    ("register_class", "registers_per_group", "element_type", "message"),
+    [
+        pytest.param("sgpr", 1, "fp32", 'register_class must be either "agpr" or "vgpr"', id="register-class"),
+        pytest.param("vgpr", 3, "fp32", "registers_per_group must be a power of two", id="group-size"),
+        pytest.param("vgpr", 1, "i8", "value elements must be 16 or 32 bits", id="element-width"),
+    ],
+)
+def test_amd_register_handoff_rejects_invalid_contract(register_class, registers_per_group, element_type, message):
+    with pytest.raises(CompilationError, match=message):
+        compile_for_gfx950(
+            _invalid_amd_register_handoff_kernel,
+            signature={"x_ptr": f"*{element_type}", "y_ptr": f"*{element_type}"},
+            constexprs={
+                "REGISTER_CLASS": register_class,
+                "REGISTERS_PER_GROUP": registers_per_group,
+            },
+        )
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_amd_register_handoff_correct_gfx950():
+    x = torch.arange(1024, device="cuda", dtype=torch.float32)
+    actual = torch.empty_like(x)
+    _amd_register_handoff_kernel[(1, )](x, actual, "vgpr", num_warps=4)
+    torch.testing.assert_close(actual, x)
+
+
+@triton.jit
+def _release_dot_layout_reduce_kernel(x_ptr, y_ptr):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[4, 1],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    rows = tl.arange(0, 64)
+    cols = tl.arange(0, 64)
+    values = tl.load(x_ptr + rows[:, None] * 64 + cols[None, :]).to(tl.float32)
+    values = tlx.require_layout(values, dot0, pin=False)
+    values = tlx.release_layout(values)
+    reduced = tl.sum(values, axis=1)
+    tl.store(y_ptr + rows, reduced)
+
+
+def test_release_dot_layout_reduce_compiles_gfx950():
+    compiled = compile_for_gfx950(
+        _release_dot_layout_reduce_kernel,
+        signature={"x_ptr": "*bf16", "y_ptr": "*fp32"},
+        constexprs={},
+    )
+    assert "tlx.release_layout" in compiled.asm["ttir"]
+    assert "tt.reduce" in compiled.asm["ttgir"]
+    assert "amdgcn" in compiled.asm
+
+
+@triton.jit
+def _invalid_release_layout_kernel(x_ptr, y_ptr):
+    offsets = tl.arange(0, 64)
+    values = tl.load(x_ptr + offsets)
+    values = tlx.release_layout(values)
+    tl.store(y_ptr + offsets, values)
+
+
+def test_release_layout_rejects_unencoded_source():
+    with pytest.raises(CompilationError, match="release_layout requires an explicit source layout"):
+        compile_for_gfx950(
+            _invalid_release_layout_kernel,
+            signature={"x_ptr": "*fp32", "y_ptr": "*fp32"},
+            constexprs={},
+        )
 
 
 @triton.jit

@@ -158,6 +158,18 @@ void init_triton_tlx_ir(py::module &&m) {
                  input.getType(), input, registerClassAttr,
                  registersPerGroupAttr);
            })
+      .def("create_amd_register_handoff",
+           [](TritonOpBuilder &self, Value input,
+              const std::string &registerClass,
+              int32_t registersPerGroup) -> Value {
+             auto registerClassAttr =
+                 self.getBuilder().getStringAttr(registerClass);
+             auto registersPerGroupAttr =
+                 self.getBuilder().getI32IntegerAttr(registersPerGroup);
+             return self.create<amdgpu::RegisterHandoffOp>(
+                 input.getType(), input, registerClassAttr,
+                 registersPerGroupAttr);
+           })
       .def("create_amd_mfma_commit",
            [](TritonOpBuilder &self,
               std::vector<Value> inputs) -> std::vector<Value> {
@@ -246,7 +258,9 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_release_layout",
            [](TritonOpBuilder &self, Value &v) -> Value {
              if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
-               assert(type.getEncoding() && "Expect layout encoding");
+               if (!type.getEncoding())
+                 throw std::runtime_error(
+                     "release_layout requires an explicit source layout");
                auto newType = RankedTensorType::get(type.getShape(),
                                                     type.getElementType());
                return self.create<tlx::ReleaseLayoutOp>(newType, v);

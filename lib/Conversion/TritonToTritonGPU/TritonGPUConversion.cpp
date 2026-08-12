@@ -118,7 +118,8 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
       triton::tlx::ReleaseLayoutOp, triton::tlx::LocalAliasOp,
       triton::tlx::DumpLayoutOp, triton::amdgpu::BufferLoadOp,
       triton::amdgpu::BufferStoreOp, triton::amdgpu::BufferLoadToLocalOp,
-      triton::amdgpu::RematerializedRangeOp>([&](Operation *op) -> bool {
+      triton::amdgpu::RematerializedRangeOp,
+      triton::amdgpu::RegisterHandoffOp>([&](Operation *op) -> bool {
     // make sure every RankedTensorType operand has encoding
     for (auto operandType : op->getOperandTypes()) {
       if (auto rankedTensorType = dyn_cast<RankedTensorType>(operandType)) {

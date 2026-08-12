@@ -795,6 +795,40 @@ def RegisterResidentOp : TT_AMDGPU_Op<"register_resident", [
 }
 
 //===----------------------------------------------------------------------===//
+// RegisterHandoffOp
+//===----------------------------------------------------------------------===//
+
+def RegisterHandoffOp : TT_AMDGPU_Op<"register_handoff", [
+    SameOperandsAndResultType]> {
+  let summary = "Start independent native AMD register-allocation intervals";
+  let description = [{
+    Returns `input` unchanged while passing each per-thread register group
+    through tied native-register constraints. Each group is constrained
+    independently, so the operation starts local allocation intervals without
+    requiring the complete tensor to be resident at one point.
+
+    `registers_per_group` is the power-of-two number of 32-bit native register
+    values handled together by one constraint group. Use `register_resident`
+    instead when simultaneous whole-tensor residency is the software-pipeline
+    contract. Neither operation prescribes physical register numbers or
+    changes numerical results. The operation is intentionally side-effecting:
+    distinct source occurrences are distinct allocation boundaries and must not
+    be merged by CSE or moved out of their surrounding software-pipeline stage.
+  }];
+
+  let arguments = (ins TT_Tensor:$input, StrAttr:$register_class,
+      I32Attr:$registers_per_group);
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = [{
+    $input `class` $register_class `groups` $registers_per_group
+    attr-dict `:` type($input)
+  }];
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // MfmaCommitOp
 //===----------------------------------------------------------------------===//
 

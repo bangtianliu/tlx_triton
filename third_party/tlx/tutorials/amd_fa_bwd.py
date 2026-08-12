@@ -106,11 +106,11 @@ def _is_d64_fused_n256_eligible(q_shape, k_shape, causal, *, arch, cu_count):
 _D64_MHA_POSITIVE = 0
 _D64_GQA_SIGNED = 1
 _D64_LSE_NATURAL_LOG = 0
-_D64_LSE_NEG_INV_SCALE = 1
+_D64_LSE_NEG_LOG2E = 1
 _D64_DELTA_POSITIVE = 0
 _D64_DELTA_NEGATED = 1
 
-# With zero QK scores, selected dQ and the signed GQA ABI represent LSE as
+# With zero QK scores, selected dQ internally represents LSE as
 # -log(valid_keys) / scale. Keep that unavoidable entropy term within half
 # the FP32 range so the input-dependent score contribution retains headroom.
 _D64_RECIP_LSE_ENTROPY_LIMIT = torch.finfo(torch.float32).max / 2.0
@@ -118,7 +118,7 @@ _D64_RECIP_LSE_ENTROPY_LIMIT = torch.finfo(torch.float32).max / 2.0
 _D64_MHA_POSITIVE_JIT = tl.constexpr(_D64_MHA_POSITIVE)
 _D64_GQA_SIGNED_JIT = tl.constexpr(_D64_GQA_SIGNED)
 _D64_LSE_NATURAL_LOG_JIT = tl.constexpr(_D64_LSE_NATURAL_LOG)
-_D64_LSE_NEG_INV_SCALE_JIT = tl.constexpr(_D64_LSE_NEG_INV_SCALE)
+_D64_LSE_NEG_LOG2E_JIT = tl.constexpr(_D64_LSE_NEG_LOG2E)
 _D64_DELTA_POSITIVE_JIT = tl.constexpr(_D64_DELTA_POSITIVE)
 _D64_DELTA_NEGATED_JIT = tl.constexpr(_D64_DELTA_NEGATED)
 
@@ -165,6 +165,40 @@ _D64_NONCAUSAL_FAMILIES = frozenset({"noncausal_direct_n256", "noncausal_fused_n
 _D64_RETAINED_CAUSAL_FAMILIES = frozenset({"causal_m192", "causal_m256"})
 _D64_SELECTED_CAUSAL_FAMILIES = frozenset({"causal_gluon_mha", "causal_gluon_gqa8"})
 _D64_DISPATCH_FAMILIES = (_D64_NONCAUSAL_FAMILIES | _D64_RETAINED_CAUSAL_FAMILIES | _D64_SELECTED_CAUSAL_FAMILIES)
+
+_D64_DQ_SQUARE_LLVM_ATTRS = (("amdgpu-post-ra-direction", "bidirectional"), )
+_D64_DQ_RECTANGLE_LLVM_ATTRS = (("amdgpu-agpr-alloc", "0,0"), )
+
+
+def _d64_selected_causal_owner_rows(sq, skv, group_size):
+    deep_square = sq == skv and sq >= 16384 and sq % 256 == 0
+    deep_gqa8_rectangle = (
+        group_size == 8 and sq >= 4096 and skv >= 2 * sq and sq % 256 == 0
+    )
+    return 256 if deep_square or deep_gqa8_rectangle else 192
+
+
+def _d64_selected_causal_logical_n(sq, skv, group_size):
+    # Deep GQA8 rectangles use two N32 slices.  Before the occupancy-oriented
+    # register cap below, this keeps four-fragment M256 owners scratch-free
+    # while publishing K/V once per owner; N64 remains better for shallower
+    # rectangular recurrences.
+    return 32 if sq == skv or (group_size == 8 and skv >= 2 * sq) else 64
+
+
+def _d64_causal_dq_llvm_attrs(sq, skv, dispatch):
+    if (
+        dispatch.stat_mode != _D64_GQA_SIGNED
+        or dispatch.owner_rows != 256
+        or dispatch.dq_logical_n != 32
+    ):
+        return ()
+    if sq == skv:
+        return _D64_DQ_SQUARE_LLVM_ATTRS
+    # Deep rectangles naturally allocate 256 VGPR + 48 AGPR.  Constraining
+    # AGPR allocation to zero caps the unified footprint at 256 and admits a
+    # second resident wave; that latency coverage outweighs the folded spills.
+    return _D64_DQ_RECTANGLE_LLVM_ATTRS
 
 
 def _invalid_d64_dispatch(dispatch, reason):
@@ -227,11 +261,11 @@ def _validate_d64_dispatch(q_shape, k_shape, causal, dispatch):
         require_unselected_defaults()
         return
 
-    owner_rows = (256 if sq == skv and sq >= 16384 and sq % 256 == 0 else 192)
+    retained_owner_rows = (256 if sq == skv and sq >= 16384 and sq % 256 == 0 else 192)
     if family in _D64_RETAINED_CAUSAL_FAMILIES:
-        expected_family = "causal_m256" if owner_rows == 256 else "causal_m192"
+        expected_family = "causal_m256" if retained_owner_rows == 256 else "causal_m192"
         require_field("family", expected_family)
-        require_field("owner_rows", owner_rows)
+        require_field("owner_rows", retained_owner_rows)
         require_field("key_rows", 32 if sq == skv else 64)
         require_field("kv_splits", 4 if group_size == 8 else 1)
         require_unselected_defaults()
@@ -240,15 +274,16 @@ def _validate_d64_dispatch(q_shape, k_shape, causal, dispatch):
     expected_family = ("causal_gluon_gqa8" if group_size == 8 else "causal_gluon_mha")
     if group_size not in (1, 8):
         _invalid_d64_dispatch(dispatch, "selected causal family requires MHA or GQA8")
+    owner_rows = _d64_selected_causal_owner_rows(sq, skv, group_size)
     require_field("family", expected_family)
     require_field("owner_rows", owner_rows)
     require_field("selected_causal", True)
-    require_field("dq_logical_n", 32 if sq == skv else 64)
+    require_field("dq_logical_n", _d64_selected_causal_logical_n(sq, skv, group_size))
     require_field("dq_use_xcd", _d64_use_dq_xcd(_batch, hkv, sq, skv, owner_rows))
 
     def require_valid_dq_launches():
         owners = triton.cdiv(sq, owner_rows)
-        fragments = 4 if owner_rows == 256 else 3
+        fragments = owner_rows // 64
         valid_dq_launches = {
             (_D64DQLaunch(owners, True, 0, 0, fragments, 0), ),
         }
@@ -337,7 +372,7 @@ def _is_d64_causal_gluon_eligible(
     else:
         return False
 
-    owner_rows = (256 if sq == skv and sq >= 16384 and sq % 256 == 0 else 192)
+    owner_rows = _d64_selected_causal_owner_rows(sq, skv, group_size)
     if batch * hq * triton.cdiv(sq, owner_rows) < 2 * cu_count:
         return False
     if group_size == 8:
@@ -396,7 +431,8 @@ def _select_d64_dispatch(
     ):
         return retained
 
-    owner_rows = retained.owner_rows
+    owner_rows = _d64_selected_causal_owner_rows(sq, skv, group_size)
+    dq_logical_n = _d64_selected_causal_logical_n(sq, skv, group_size)
     dq_use_xcd = _d64_use_dq_xcd(_batch, hkv, sq, skv, owner_rows)
     dq_launches = _d64_dq_launch_plan(
         _batch,
@@ -417,7 +453,7 @@ def _select_d64_dispatch(
             kv_splits=4,
             selected_causal=True,
             stat_mode=_D64_GQA_SIGNED,
-            dq_logical_n=32 if sq == skv else 64,
+            dq_logical_n=dq_logical_n,
             dq_use_xcd=dq_use_xcd,
             dq_launches=dq_launches,
             gqa_grid_mode=grid_mode,
@@ -431,7 +467,7 @@ def _select_d64_dispatch(
         kv_splits=1,
         selected_causal=True,
         stat_mode=_D64_MHA_POSITIVE,
-        dq_logical_n=32 if sq == skv else 64,
+        dq_logical_n=dq_logical_n,
         dq_use_xcd=dq_use_xcd,
         dq_launches=dq_launches,
     )
@@ -442,7 +478,7 @@ def _d64_causal_stat_values(o, do, lse, sm_scale, stat_mode):
     if stat_mode == _D64_MHA_POSITIVE:
         return positive, None
     if stat_mode == _D64_GQA_SIGNED:
-        return -positive, -lse.float() / float(sm_scale)
+        return -positive, -lse.float() * math.log2(math.e)
     raise ValueError(f"unknown D64 stat mode {stat_mode!r}")
 
 
@@ -590,7 +626,7 @@ def _d64_dq_launch_plan(
     host_skip_owner_tail,
 ):
     owners = triton.cdiv(sq, owner_rows)
-    fragments = 4 if owner_rows == 256 else 3
+    fragments = owner_rows // 64
     use_xcd = _d64_use_dq_xcd(batch, hkv, sq, skv, owner_rows)
     peel = (owner_rows == 192 and sq >= 8192 and use_xcd and batch * hq >= cu_count and host_skip_owner_tail
             and sq % 192 == 128 and owners > 1)
@@ -1250,26 +1286,50 @@ def _attn_bwd_dq_d64_causal_load_q64(
     q_op0_mn: tl.constexpr,
 ):
     rows = row_start + tl.arange(0, 64)
-    cols = tl.arange(0, D)
-    offsets = q_base + rows[:, None] * D + cols[None, :]
-    mask = rows[:, None] < store_end
-    q = tl.load(Q + offsets, mask=mask, other=0.0)
-    do = tl.load(DO + offsets, mask=mask, other=0.0)
-    o = tl.load(O + offsets, mask=mask, other=0.0)
     lse = tl.load(LSE + stats_base + rows, mask=rows < store_end, other=0.0)
-    positive = tl.sum(o.to(tl.float32) * do.to(tl.float32), axis=1)
-    lse_term = -lse * (1.0 / SM_SCALE)
+    cols = tl.arange(0, D)
+    offsets = (rows[:, None] * D + cols[None, :]).to(tl.int32)
+    offsets = tlx.require_layout(offsets, q_op0_mn, pin=False)
+    mask = tlx.require_layout(tl.broadcast_to(rows[:, None] < store_end, offsets.shape), q_op0_mn, pin=False)
+    zero = tlx.zeros((64, D), tl.bfloat16, layout=q_op0_mn)
+    do = tlx.buffer_load(DO + q_base, offsets, mask=mask, other=zero, contiguity=8)
+    o = tlx.buffer_load(O + q_base, offsets, mask=mask, other=zero, contiguity=8)
+    product = o.to(tl.float32) * do.to(tl.float32)
+    product = tlx.release_layout(product)
+    positive = tl.sum(product, axis=1)
+    # Q is independent of the O*dO reduction. Loading it after that short-lived
+    # product keeps the scheduler from extending Q's interval through the
+    # reduction prologue of every resident owner fragment.
+    q = tlx.buffer_load(Q + q_base, offsets, mask=mask, other=zero, contiguity=8)
     stat_mask = rows < store_end
     if STAT_MODE == _D64_MHA_POSITIVE_JIT:
+        score_lse_term = -lse * (1.0 / SM_SCALE)
         tl.store(DELTA + stats_base + rows, positive, mask=stat_mask)
     else:
         tl.static_assert(STAT_MODE == _D64_GQA_SIGNED_JIT)
         signed = -positive
         tl.store(DELTA + stats_base + rows, signed, mask=stat_mask)
-        tl.store(LSE_TERM + stats_base + rows, lse_term, mask=stat_mask)
+        # dQ and the producer share the log2-domain term. Publish it once per
+        # row instead of rescaling it in every resident K owner.
+        producer_lse_term = -lse * 1.4426950408889634
+        tl.store(LSE_TERM + stats_base + rows, producer_lse_term, mask=stat_mask)
+        score_lse_term = producer_lse_term
+        # Q is score-only and remains resident across every owned K slice.
+        # Fold the constant log2 softmax scale here once per owner rather
+        # than multiplying every score fragment after its MFMA.
+        q_scale = tlx.require_layout(
+            tl.full((64, D), SM_SCALE * 1.4426950408889634, tl.float32),
+            q_op0_mn,
+            pin=False,
+        )
+        q = tlx.require_layout(
+            (q.to(tl.float32) * q_scale).to(tl.bfloat16),
+            q_op0_mn,
+            pin=False,
+        )
     q = tlx.require_layout(q, q_op0_mn, pin=False)
     do = tlx.require_layout(do, q_op0_mn, pin=False)
-    return q, do, lse_term, positive, rows
+    return q, do, score_lse_term, positive, rows
 
 
 @triton.jit
@@ -1280,18 +1340,18 @@ def _attn_bwd_dq_d64_causal_step(
     row_lse,
     row_delta,
     rows,
-    k_view,
-    v_view,
-    kv_wait,
+    k_source,
+    v_source,
+    kv_source,
     n0,
     SM_SCALE: tl.constexpr,
     SQ: tl.constexpr,
     SKV: tl.constexpr,
     D: tl.constexpr,
-    STAT_MODE: tl.constexpr,
     N_OFFSET: tl.constexpr,
     BLOCK_N: tl.constexpr,
     APPLY_MASK: tl.constexpr,
+    SCORE_PRE_SCALED: tl.constexpr,
     mma_mn: tl.constexpr,
     mma_md: tl.constexpr,
     kt_op1_mn: tl.constexpr,
@@ -1303,12 +1363,9 @@ def _attn_bwd_dq_d64_causal_step(
     dq = tlx.require_layout(dq, mma_md, pin=False)
     q = tlx.require_layout(q, tlx.dot_operand_layout(0, mma_mn, k_width=8), pin=False)
     do = tlx.require_layout(do, tlx.dot_operand_layout(0, mma_mn, k_width=8), pin=False)
-    k_slice = tlx.local_slice(k_view, [N_OFFSET, 0], [BLOCK_N, D])
-    v_slice = tlx.local_slice(v_view, [N_OFFSET, 0], [BLOCK_N, D])
-    kt = tlx.local_load(tlx.local_trans(k_slice), token=kv_wait, layout=kt_op1_mn)
-    vt = tlx.local_load(tlx.local_trans(v_slice), token=kv_wait, layout=vt_op1_mn)
-    k_nd = tlx.local_load(k_slice, token=kv_wait, layout=k_op1_md)
-
+    kt = tlx.require_layout(k_source, kt_op1_mn, pin=False)
+    vt = tlx.require_layout(v_source, vt_op1_mn, pin=False)
+    k_nd = tlx.require_layout(kv_source, k_op1_md, pin=False)
     row_lse_full = tlx.require_layout(
         tl.broadcast_to(row_lse[:, None], (64, BLOCK_N)),
         mma_mn,
@@ -1317,12 +1374,33 @@ def _attn_bwd_dq_d64_causal_step(
     scores = tlx.zeros((64, BLOCK_N), tl.float32, layout=mma_mn)
     scores = scores + row_lse_full
     scores = tl.dot(q, kt, acc=scores, out_dtype=tl.float32)
-    scale = tlx.require_layout(
-        tl.full((64, BLOCK_N), SM_SCALE * log2e, tl.float32),
+    if BLOCK_N == 64:
+        # End the score-MFMA allocation interval before the exp tail. N32
+        # uses the same contract below to keep its lower-pressure native form.
+        scores = tlx.amd_register_handoff(scores, register_class="vgpr", registers_per_group=1)
+        scores = tlx.require_layout(scores, mma_mn, pin=False)
+
+    # Match the independent MFMA cadence used by the tuned reference: issue
+    # dP while the score recurrence is ready, before its scale/exp tail.
+    row_delta_full = tlx.require_layout(
+        tl.broadcast_to(row_delta[:, None], (64, BLOCK_N)),
         mma_mn,
         pin=False,
     )
-    scores = scores * scale
+    dp = tlx.zeros((64, BLOCK_N), tl.float32, layout=mma_mn)
+    dp = dp - row_delta_full
+    dp = tl.dot(do, vt, acc=dp, out_dtype=tl.float32)
+
+    if not SCORE_PRE_SCALED:
+        scale = tlx.require_layout(
+            tl.full((64, BLOCK_N), SM_SCALE * log2e, tl.float32),
+            mma_mn,
+            pin=False,
+        )
+        scores = scores * scale
+    if BLOCK_N == 32:
+        scores = tlx.amd_register_handoff(scores, register_class="vgpr", registers_per_group=1)
+        scores = tlx.require_layout(scores, mma_mn, pin=False)
     if APPLY_MASK:
         cols = n0 + N_OFFSET + tl.arange(0, BLOCK_N)
         valid = cols[None, :] <= rows[:, None] + (SKV - SQ)
@@ -1334,19 +1412,146 @@ def _attn_bwd_dq_d64_causal_step(
         )
         scores = tl.where(valid, scores, negative_inf)
     p = tlx.require_layout(tl.math.exp2(scores), mma_mn, pin=False)
-
-    row_delta_full = tlx.require_layout(
-        tl.broadcast_to(row_delta[:, None], (64, BLOCK_N)),
-        mma_mn,
-        pin=False,
-    )
-    dp = tlx.zeros((64, BLOCK_N), tl.float32, layout=mma_mn)
-    dp = dp - row_delta_full
-    dp = tl.dot(do, vt, acc=dp, out_dtype=tl.float32)
     ds = p * dp
     ds = tlx.require_layout(ds.to(tl.bfloat16), ds_op0_md, pin=False)
     dq = tl.dot(ds, k_nd, acc=dq, out_dtype=tl.float32)
     return tlx.require_layout(dq, mma_md, pin=False)
+
+
+@triton.jit
+def _attn_bwd_dq_d64_causal_score32(
+    q,
+    row_lse,
+    kt,
+    SM_SCALE: tl.constexpr,
+    mma_mn: tl.constexpr,
+    q_op0_mn: tl.constexpr,
+    kt_op1_mn: tl.constexpr,
+    PACK_TIE: tl.constexpr,
+    SCORE_PRE_SCALED: tl.constexpr,
+):
+    log2e: tl.constexpr = 1.4426950408889634
+    q = tlx.require_layout(q, q_op0_mn, pin=False)
+    kt = tlx.require_layout(kt, kt_op1_mn, pin=False)
+    row_lse_full = tlx.require_layout(tl.broadcast_to(row_lse[:, None], (64, 32)), mma_mn, pin=False)
+    scores = tlx.zeros((64, 32), tl.float32, layout=mma_mn) + row_lse_full
+    scores = tl.dot(q, kt, acc=scores, out_dtype=tl.float32)
+    if not SCORE_PRE_SCALED:
+        scores *= tlx.require_layout(
+            tl.full((64, 32), SM_SCALE * log2e, tl.float32), mma_mn, pin=False)
+    if PACK_TIE:
+        scores = tlx.amd_register_handoff(scores, register_class="vgpr", registers_per_group=2)
+    else:
+        scores = tlx.amd_register_handoff(scores, register_class="vgpr", registers_per_group=1)
+    return tlx.require_layout(scores, mma_mn, pin=False)
+
+
+@triton.jit
+def _attn_bwd_dq_d64_causal_dp32(
+    do,
+    row_delta,
+    vt,
+    mma_mn: tl.constexpr,
+    q_op0_mn: tl.constexpr,
+    vt_op1_mn: tl.constexpr,
+):
+    do = tlx.require_layout(do, q_op0_mn, pin=False)
+    vt = tlx.require_layout(vt, vt_op1_mn, pin=False)
+    row_delta_full = tlx.require_layout(tl.broadcast_to(row_delta[:, None], (64, 32)), mma_mn, pin=False)
+    dp = tlx.zeros((64, 32), tl.float32, layout=mma_mn) - row_delta_full
+    return tlx.require_layout(tl.dot(do, vt, acc=dp, out_dtype=tl.float32), mma_mn, pin=False)
+
+
+@triton.jit
+def _attn_bwd_dq_d64_causal_finish32(
+    dq,
+    scores,
+    dp,
+    k_nd,
+    mma_mn: tl.constexpr,
+    mma_md: tl.constexpr,
+    ds_op0_md: tl.constexpr,
+    k_op1_md: tl.constexpr,
+):
+    dq = tlx.require_layout(dq, mma_md, pin=False)
+    scores = tlx.require_layout(scores, mma_mn, pin=False)
+    dp = tlx.require_layout(dp, mma_mn, pin=False)
+    k_nd = tlx.require_layout(k_nd, k_op1_md, pin=False)
+    ds = tlx.require_layout((tl.math.exp2(scores) * dp).to(tl.bfloat16), ds_op0_md, pin=False)
+    dq = tl.dot(ds, k_nd, acc=dq, out_dtype=tl.float32)
+    return tlx.require_layout(dq, mma_md, pin=False)
+
+
+@triton.jit
+def _attn_bwd_dq_d64_causal_m256_unmasked_n32(
+    dq0,
+    dq1,
+    dq2,
+    dq3,
+    q0,
+    q1,
+    q2,
+    do0,
+    do1,
+    do2,
+    lse0,
+    lse1,
+    lse2,
+    lse3,
+    delta0,
+    delta1,
+    delta2,
+    delta3,
+    rows1,
+    rows2,
+    rows3,
+    q3_view,
+    do3,
+    k_view,
+    v_view,
+    kv_wait,
+    n0,
+    SM_SCALE: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    N_OFFSET: tl.constexpr,
+    SCORE_PRE_SCALED: tl.constexpr,
+    mma_mn: tl.constexpr,
+    mma_md: tl.constexpr,
+    q_op0_mn: tl.constexpr,
+    kt_op1_mn: tl.constexpr,
+    vt_op1_mn: tl.constexpr,
+    ds_op0_md: tl.constexpr,
+    k_op1_md: tl.constexpr,
+):
+    """Consume one unmasked N32 half of a four-fragment D64 owner."""
+    tl.static_assert(D == 64)
+    k_slice = tlx.local_slice(k_view, [N_OFFSET, 0], [32, D])
+    v_slice = tlx.local_slice(v_view, [N_OFFSET, 0], [32, D])
+    kt = tlx.local_load(tlx.local_trans(k_slice), token=kv_wait, layout=kt_op1_mn)
+    k_nd = tlx.local_load(k_slice, token=kv_wait, layout=k_op1_md)
+    scores0 = _attn_bwd_dq_d64_causal_score32(
+        q0, lse0, kt, SM_SCALE, mma_mn, q_op0_mn, kt_op1_mn, N_OFFSET == 0, SCORE_PRE_SCALED)
+    vt = tlx.local_load(tlx.local_trans(v_slice), token=kv_wait, layout=vt_op1_mn)
+    dp0 = _attn_bwd_dq_d64_causal_dp32(do0, delta0, vt, mma_mn, q_op0_mn, vt_op1_mn)
+    dq0 = _attn_bwd_dq_d64_causal_finish32(
+        dq0, scores0, dp0, k_nd, mma_mn, mma_md, ds_op0_md, k_op1_md)
+    dq1 = _attn_bwd_dq_d64_causal_step(
+        dq1, q1, do1, lse1, delta1, rows1, kt, vt, k_nd, n0, SM_SCALE, SQ, SKV, D, N_OFFSET, 32,
+        False, SCORE_PRE_SCALED, mma_mn, mma_md, kt_op1_mn, vt_op1_mn, ds_op0_md, k_op1_md)
+    # Consume the LDS-resident Q3 before Q2. This separates the Q3 read from
+    # the next K/V request without keeping Q3 live across another recurrence.
+    q3 = tlx.local_load(q3_view, layout=q_op0_mn)
+    dq3 = _attn_bwd_dq_d64_causal_step(
+        dq3, q3, do3, lse3, delta3, rows3, kt, vt, k_nd, n0, SM_SCALE, SQ, SKV, D, N_OFFSET, 32,
+        False, SCORE_PRE_SCALED, mma_mn, mma_md, kt_op1_mn, vt_op1_mn, ds_op0_md, k_op1_md)
+    scores2 = _attn_bwd_dq_d64_causal_score32(
+        q2, lse2, kt, SM_SCALE, mma_mn, q_op0_mn, kt_op1_mn, N_OFFSET == 32, SCORE_PRE_SCALED)
+    dp2 = _attn_bwd_dq_d64_causal_dp32(do2, delta2, vt, mma_mn, q_op0_mn, vt_op1_mn)
+    dq2 = _attn_bwd_dq_d64_causal_finish32(
+        dq2, scores2, dp2, k_nd, mma_mn, mma_md, ds_op0_md, k_op1_md)
+    return dq0, dq1, dq2, dq3
 
 
 @triton.jit
@@ -1385,13 +1590,13 @@ def _attn_bwd_dq_d64_causal_nslice(
     SQ: tl.constexpr,
     SKV: tl.constexpr,
     D: tl.constexpr,
-    STAT_MODE: tl.constexpr,
     OWNER_FRAGMENTS: tl.constexpr,
     SKIP_OWNER_TAIL: tl.constexpr,
     N_OFFSET: tl.constexpr,
     BLOCK_N: tl.constexpr,
     APPLY_MASK: tl.constexpr,
     TRIANGULAR_TAIL: tl.constexpr,
+    SCORE_PRE_SCALED: tl.constexpr,
     mma_mn: tl.constexpr,
     mma_md: tl.constexpr,
     q_op0_mn: tl.constexpr,
@@ -1404,6 +1609,11 @@ def _attn_bwd_dq_d64_causal_nslice(
     dq1 = tlx.require_layout(dq1, mma_md, pin=False)
     dq2 = tlx.require_layout(dq2, mma_md, pin=False)
     dq3 = tlx.require_layout(dq3, mma_md, pin=False)
+    k_slice = tlx.local_slice(k_view, [N_OFFSET, 0], [BLOCK_N, D])
+    v_slice = tlx.local_slice(v_view, [N_OFFSET, 0], [BLOCK_N, D])
+    k_source = tlx.local_load(tlx.local_trans(k_slice), token=kv_wait, layout=kt_op1_mn)
+    kv_source = tlx.local_load(k_slice, token=kv_wait, layout=k_op1_md)
+    v_source = tlx.local_load(tlx.local_trans(v_slice), token=kv_wait, layout=vt_op1_mn)
     if TRIANGULAR_TAIL:
         # Tail K/V block j intersects fragment j. Earlier fragments are
         # wholly future and skipped; later valid fragments are fully causal.
@@ -1415,18 +1625,18 @@ def _attn_bwd_dq_d64_causal_nslice(
                 lse0,
                 delta0,
                 rows0,
-                k_view,
-                v_view,
-                kv_wait,
+                k_source,
+                v_source,
+                kv_source,
                 n0,
                 SM_SCALE,
                 SQ,
                 SKV,
                 D,
-                STAT_MODE,
                 N_OFFSET,
                 BLOCK_N,
                 True,
+                SCORE_PRE_SCALED,
                 mma_mn,
                 mma_md,
                 kt_op1_mn,
@@ -1446,18 +1656,18 @@ def _attn_bwd_dq_d64_causal_nslice(
                     lse1,
                     delta1,
                     rows1,
-                    k_view,
-                    v_view,
-                    kv_wait,
+                    k_source,
+                    v_source,
+                    kv_source,
                     n0,
                     SM_SCALE,
                     SQ,
                     SKV,
                     D,
-                    STAT_MODE,
                     N_OFFSET,
                     BLOCK_N,
                     False,
+                    SCORE_PRE_SCALED,
                     mma_mn,
                     mma_md,
                     kt_op1_mn,
@@ -1474,18 +1684,18 @@ def _attn_bwd_dq_d64_causal_nslice(
                     lse1,
                     delta1,
                     rows1,
-                    k_view,
-                    v_view,
-                    kv_wait,
+                    k_source,
+                    v_source,
+                    kv_source,
                     n0,
                     SM_SCALE,
                     SQ,
                     SKV,
                     D,
-                    STAT_MODE,
                     N_OFFSET,
                     BLOCK_N,
                     True,
+                    SCORE_PRE_SCALED,
                     mma_mn,
                     mma_md,
                     kt_op1_mn,
@@ -1506,18 +1716,18 @@ def _attn_bwd_dq_d64_causal_nslice(
                         lse2,
                         delta2,
                         rows2,
-                        k_view,
-                        v_view,
-                        kv_wait,
+                        k_source,
+                        v_source,
+                        kv_source,
                         n0,
                         SM_SCALE,
                         SQ,
                         SKV,
                         D,
-                        STAT_MODE,
                         N_OFFSET,
                         BLOCK_N,
                         False,
+                        SCORE_PRE_SCALED,
                         mma_mn,
                         mma_md,
                         kt_op1_mn,
@@ -1534,18 +1744,18 @@ def _attn_bwd_dq_d64_causal_nslice(
                         lse2,
                         delta2,
                         rows2,
-                        k_view,
-                        v_view,
-                        kv_wait,
+                        k_source,
+                        v_source,
+                        kv_source,
                         n0,
                         SM_SCALE,
                         SQ,
                         SKV,
                         D,
-                        STAT_MODE,
                         N_OFFSET,
                         BLOCK_N,
                         True,
+                        SCORE_PRE_SCALED,
                         mma_mn,
                         mma_md,
                         kt_op1_mn,
@@ -1567,18 +1777,18 @@ def _attn_bwd_dq_d64_causal_nslice(
                         lse3,
                         delta3,
                         rows3,
-                        k_view,
-                        v_view,
-                        kv_wait,
+                        k_source,
+                        v_source,
+                        kv_source,
                         n0,
                         SM_SCALE,
                         SQ,
                         SKV,
                         D,
-                        STAT_MODE,
                         N_OFFSET,
                         BLOCK_N,
                         False,
+                        SCORE_PRE_SCALED,
                         mma_mn,
                         mma_md,
                         kt_op1_mn,
@@ -1596,18 +1806,18 @@ def _attn_bwd_dq_d64_causal_nslice(
                         lse3,
                         delta3,
                         rows3,
-                        k_view,
-                        v_view,
-                        kv_wait,
+                        k_source,
+                        v_source,
+                        kv_source,
                         n0,
                         SM_SCALE,
                         SQ,
                         SKV,
                         D,
-                        STAT_MODE,
                         N_OFFSET,
                         BLOCK_N,
                         True,
+                        SCORE_PRE_SCALED,
                         mma_mn,
                         mma_md,
                         kt_op1_mn,
@@ -1625,18 +1835,18 @@ def _attn_bwd_dq_d64_causal_nslice(
             lse0,
             delta0,
             rows0,
-            k_view,
-            v_view,
-            kv_wait,
+            k_source,
+            v_source,
+            kv_source,
             n0,
             SM_SCALE,
             SQ,
             SKV,
             D,
-            STAT_MODE,
             N_OFFSET,
             BLOCK_N,
             APPLY_MASK,
+            SCORE_PRE_SCALED,
             mma_mn,
             mma_md,
             kt_op1_mn,
@@ -1653,18 +1863,18 @@ def _attn_bwd_dq_d64_causal_nslice(
                 lse1,
                 delta1,
                 rows1,
-                k_view,
-                v_view,
-                kv_wait,
+                k_source,
+                v_source,
+                kv_source,
                 n0,
                 SM_SCALE,
                 SQ,
                 SKV,
                 D,
-                STAT_MODE,
                 N_OFFSET,
                 BLOCK_N,
                 APPLY_MASK,
+                SCORE_PRE_SCALED,
                 mma_mn,
                 mma_md,
                 kt_op1_mn,
@@ -1682,18 +1892,18 @@ def _attn_bwd_dq_d64_causal_nslice(
                     lse2,
                     delta2,
                     rows2,
-                    k_view,
-                    v_view,
-                    kv_wait,
+                    k_source,
+                    v_source,
+                    kv_source,
                     n0,
                     SM_SCALE,
                     SQ,
                     SKV,
                     D,
-                    STAT_MODE,
                     N_OFFSET,
                     BLOCK_N,
                     APPLY_MASK,
+                    SCORE_PRE_SCALED,
                     mma_mn,
                     mma_md,
                     kt_op1_mn,
@@ -1712,18 +1922,18 @@ def _attn_bwd_dq_d64_causal_nslice(
                     lse3,
                     delta3,
                     rows3,
-                    k_view,
-                    v_view,
-                    kv_wait,
+                    k_source,
+                    v_source,
+                    kv_source,
                     n0,
                     SM_SCALE,
                     SQ,
                     SKV,
                     D,
-                    STAT_MODE,
                     N_OFFSET,
                     BLOCK_N,
                     APPLY_MASK,
+                    SCORE_PRE_SCALED,
                     mma_mn,
                     mma_md,
                     kt_op1_mn,
@@ -1752,7 +1962,8 @@ def _attn_bwd_dq_d64_causal_store_q64(
 ):
     rows = row_start + tl.arange(0, 64)
     cols = tl.arange(0, D)
-    offsets = (rows[:, None] * D + cols[None, :]).to(tl.int32)
+    local_rows = tl.arange(0, 64)
+    offsets = (local_rows[:, None] * D + cols[None, :]).to(tl.int32)
     offsets = tlx.require_layout(offsets, out_layout, pin=False)
     mask = tl.broadcast_to(rows[:, None] < store_end, offsets.shape)
     mask = tlx.require_layout(mask, out_layout, pin=False)
@@ -1777,7 +1988,7 @@ def _attn_bwd_dq_d64_causal_store_q64(
         pin=False,
     )
     out = tlx.require_layout((dq * scale).to(tl.bfloat16), out_layout, pin=False)
-    tlx.buffer_store(out, DQ + q_base, offsets, mask=mask)
+    tlx.buffer_store(out, DQ + q_base + row_start * D, offsets, mask=mask)
 
 
 @triton.jit
@@ -1814,6 +2025,7 @@ def _attn_bwd_dq_d64_causal_impl(
     tl.static_assert(OWNER_FRAGMENTS == 2 or OWNER_FRAGMENTS == 3 or OWNER_FRAGMENTS == 4)
     tl.static_assert(LOGICAL_N == 32 or LOGICAL_N == 64)
     tl.static_assert(STAT_MODE == _D64_MHA_POSITIVE_JIT or STAT_MODE == _D64_GQA_SIGNED_JIT)
+    score_pre_scaled: tl.constexpr = STAT_MODE == _D64_GQA_SIGNED_JIT
 
     grid_owner_m: tl.constexpr = (OWNER_FRAGMENTS * 64 if GRID_OWNER_M == 0 else GRID_OWNER_M)
     tl.static_assert(grid_owner_m == OWNER_ROWS)
@@ -2022,26 +2234,37 @@ def _attn_bwd_dq_d64_causal_impl(
         k_view = tlx.local_view(k_buffers, current_slot)
         v_view = tlx.local_view(v_buffers, current_slot)
         n0 = n_block * 64
-        if LOGICAL_N == 32:
+        if LOGICAL_N == 32 and OWNER_FRAGMENTS == 4:
+            dq0, dq1, dq2, dq3 = _attn_bwd_dq_d64_causal_m256_unmasked_n32(
+                dq0, dq1, dq2, dq3, q0, q1, q2, do0, do1, do2, lse0, lse1, lse2, lse3, delta0, delta1, delta2,
+                delta3, rows1, rows2, rows3, tlx.local_view(q3_buffer, 0), do3, k_view, v_view, kv_wait, n0,
+                SM_SCALE, SQ, SKV, D, 0, score_pre_scaled, mma_mn, mma_md, q_op0_mn, kt_op1_mn, vt_op1_mn, ds_op0_md,
+                k_op1_md)
+            dq0, dq1, dq2, dq3 = _attn_bwd_dq_d64_causal_m256_unmasked_n32(
+                dq0, dq1, dq2, dq3, q0, q1, q2, do0, do1, do2, lse0, lse1, lse2, lse3, delta0, delta1, delta2,
+                delta3, rows1, rows2, rows3, tlx.local_view(q3_buffer, 0), do3, k_view, v_view, kv_wait, n0,
+                SM_SCALE, SQ, SKV, D, 32, score_pre_scaled, mma_mn, mma_md, q_op0_mn, kt_op1_mn, vt_op1_mn, ds_op0_md,
+                k_op1_md)
+        elif LOGICAL_N == 32:
             dq0, dq1, dq2, dq3 = _attn_bwd_dq_d64_causal_nslice(
                 dq0, dq1, dq2, dq3, q0, q1, q2, do0, do1, do2, lse0,
                 lse1, lse2, lse3, delta0, delta1, delta2, delta3, rows0, rows1, rows2, rows3,
-                tlx.local_view(q3_buffer, 0), do3, k_view, v_view, kv_wait, valid_fragments, 0, n0, SM_SCALE, SQ, SKV,
-                D, STAT_MODE, OWNER_FRAGMENTS, SKIP_OWNER_TAIL, 0, 32, False, False, mma_mn, mma_md, q_op0_mn,
-                kt_op1_mn, vt_op1_mn, ds_op0_md, k_op1_md)
+                tlx.local_view(q3_buffer, 0), do3, k_view, v_view, kv_wait, valid_fragments, 0, n0,
+                SM_SCALE, SQ, SKV, D, OWNER_FRAGMENTS, SKIP_OWNER_TAIL, 0, 32, False, False, score_pre_scaled, mma_mn,
+                mma_md, q_op0_mn, kt_op1_mn, vt_op1_mn, ds_op0_md, k_op1_md)
             dq0, dq1, dq2, dq3 = _attn_bwd_dq_d64_causal_nslice(
                 dq0, dq1, dq2, dq3, q0, q1, q2, do0, do1, do2, lse0,
                 lse1, lse2, lse3, delta0, delta1, delta2, delta3, rows0, rows1, rows2, rows3,
-                tlx.local_view(q3_buffer, 0), do3, k_view, v_view, kv_wait, valid_fragments, 0, n0, SM_SCALE, SQ, SKV,
-                D, STAT_MODE, OWNER_FRAGMENTS, SKIP_OWNER_TAIL, 32, 32, False, False, mma_mn, mma_md, q_op0_mn,
-                kt_op1_mn, vt_op1_mn, ds_op0_md, k_op1_md)
+                tlx.local_view(q3_buffer, 0), do3, k_view, v_view, kv_wait, valid_fragments, 0, n0,
+                SM_SCALE, SQ, SKV, D, OWNER_FRAGMENTS, SKIP_OWNER_TAIL, 32, 32, False, False, score_pre_scaled, mma_mn,
+                mma_md, q_op0_mn, kt_op1_mn, vt_op1_mn, ds_op0_md, k_op1_md)
         else:
             dq0, dq1, dq2, dq3 = _attn_bwd_dq_d64_causal_nslice(
                 dq0, dq1, dq2, dq3, q0, q1, q2, do0, do1, do2, lse0,
                 lse1, lse2, lse3, delta0, delta1, delta2, delta3, rows0, rows1, rows2, rows3,
-                tlx.local_view(q3_buffer, 0), do3, k_view, v_view, kv_wait, valid_fragments, 0, n0, SM_SCALE, SQ, SKV,
-                D, STAT_MODE, OWNER_FRAGMENTS, SKIP_OWNER_TAIL, 0, 64, False, False, mma_mn, mma_md, q_op0_mn,
-                kt_op1_mn, vt_op1_mn, ds_op0_md, k_op1_md)
+                tlx.local_view(q3_buffer, 0), do3, k_view, v_view, kv_wait, valid_fragments, 0, n0,
+                SM_SCALE, SQ, SKV, D, OWNER_FRAGMENTS, SKIP_OWNER_TAIL, 0, 64, False, False, score_pre_scaled, mma_mn,
+                mma_md, q_op0_mn, kt_op1_mn, vt_op1_mn, ds_op0_md, k_op1_md)
 
     for n_block in range(bulk_end_block, end_n_block):
         current_slot = n_block % 2
@@ -2071,22 +2294,25 @@ def _attn_bwd_dq_d64_causal_impl(
             dq0, dq1, dq2, dq3 = _attn_bwd_dq_d64_causal_nslice(
                 dq0, dq1, dq2, dq3, q0, q1, q2, do0, do1, do2, lse0,
                 lse1, lse2, lse3, delta0, delta1, delta2, delta3, rows0, rows1, rows2, rows3,
-                tlx.local_view(q3_buffer, 0), do3, k_view, v_view, kv_wait, valid_fragments, n_block - bulk_end_block,
-                n0, SM_SCALE, SQ, SKV, D, STAT_MODE, OWNER_FRAGMENTS, SKIP_OWNER_TAIL, 0, 32, True, True, mma_mn,
-                mma_md, q_op0_mn, kt_op1_mn, vt_op1_mn, ds_op0_md, k_op1_md)
+                tlx.local_view(q3_buffer, 0), do3, k_view, v_view, kv_wait, valid_fragments,
+                n_block - bulk_end_block, n0, SM_SCALE, SQ, SKV, D, OWNER_FRAGMENTS, SKIP_OWNER_TAIL, 0,
+                32, True, True, score_pre_scaled, mma_mn, mma_md, q_op0_mn, kt_op1_mn, vt_op1_mn, ds_op0_md,
+                k_op1_md)
             dq0, dq1, dq2, dq3 = _attn_bwd_dq_d64_causal_nslice(
                 dq0, dq1, dq2, dq3, q0, q1, q2, do0, do1, do2, lse0,
                 lse1, lse2, lse3, delta0, delta1, delta2, delta3, rows0, rows1, rows2, rows3,
-                tlx.local_view(q3_buffer, 0), do3, k_view, v_view, kv_wait, valid_fragments, n_block - bulk_end_block,
-                n0, SM_SCALE, SQ, SKV, D, STAT_MODE, OWNER_FRAGMENTS, SKIP_OWNER_TAIL, 32, 32, True, True, mma_mn,
-                mma_md, q_op0_mn, kt_op1_mn, vt_op1_mn, ds_op0_md, k_op1_md)
+                tlx.local_view(q3_buffer, 0), do3, k_view, v_view, kv_wait, valid_fragments,
+                n_block - bulk_end_block, n0, SM_SCALE, SQ, SKV, D, OWNER_FRAGMENTS, SKIP_OWNER_TAIL, 32,
+                32, True, True, score_pre_scaled, mma_mn, mma_md, q_op0_mn, kt_op1_mn, vt_op1_mn, ds_op0_md,
+                k_op1_md)
         else:
             dq0, dq1, dq2, dq3 = _attn_bwd_dq_d64_causal_nslice(
                 dq0, dq1, dq2, dq3, q0, q1, q2, do0, do1, do2, lse0,
                 lse1, lse2, lse3, delta0, delta1, delta2, delta3, rows0, rows1, rows2, rows3,
-                tlx.local_view(q3_buffer, 0), do3, k_view, v_view, kv_wait, valid_fragments, n_block - bulk_end_block,
-                n0, SM_SCALE, SQ, SKV, D, STAT_MODE, OWNER_FRAGMENTS, SKIP_OWNER_TAIL, 0, 64, True, True, mma_mn,
-                mma_md, q_op0_mn, kt_op1_mn, vt_op1_mn, ds_op0_md, k_op1_md)
+                tlx.local_view(q3_buffer, 0), do3, k_view, v_view, kv_wait, valid_fragments,
+                n_block - bulk_end_block, n0, SM_SCALE, SQ, SKV, D, OWNER_FRAGMENTS, SKIP_OWNER_TAIL, 0,
+                64, True, True, score_pre_scaled, mma_mn, mma_md, q_op0_mn, kt_op1_mn, vt_op1_mn, ds_op0_md,
+                k_op1_md)
     tlx.async_load_wait_group(0)
     tl.debug_barrier()
 
@@ -2714,36 +2940,27 @@ def _d64_gqa8_signed_front(
     D: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    APPLY_CAUSAL_MASK: tl.constexpr,
+    APPLY_CAUSAL_MASK,
+    LATE_DO_T: tl.constexpr,
     mma_nm: tl.constexpr,
     q_t_op1_nm: tl.constexpr,
     p_op0_nd: tl.constexpr,
 ):
     """Compute signed-ABI P and dS from one staged BM64 query tile."""
-    log2e: tl.constexpr = 1.4426950408889634
     q_t = tlx.local_load(tlx.local_trans(q_view), token=stage_wait, layout=q_t_op1_nm)
-    do_t = tlx.local_load(tlx.local_trans(do_view), token=stage_wait, layout=q_t_op1_nm)
+    if not LATE_DO_T:
+        do_t = tlx.local_load(tlx.local_trans(do_view), token=stage_wait, layout=q_t_op1_nm)
     lse_term = tlx.local_load(lse_view, token=stage_wait, relaxed=True)
     negative_delta = tlx.local_load(delta_view, token=stage_wait, relaxed=True)
 
-    # Selected GQA publishes lse_term=-LSE/sm_scale, so this is exactly
-    # P=exp2((QK+lse_term)*(sm_scale*log2(e))).
+    # Selected GQA publishes the log2-domain -LSE term. K is resident and
+    # pre-scaled once, so no per-score or per-owner scaling remains here.
     scores = tlx.require_layout(
         tl.broadcast_to(lse_term[None, :], (BLOCK_N, BLOCK_M)),
         mma_nm,
         pin=False,
     )
     scores = tl.dot(k_nm, q_t, acc=scores, out_dtype=tl.float32)
-    score_scale = tlx.require_layout(
-        tl.full(
-            (BLOCK_N, BLOCK_M),
-            SM_SCALE * log2e,
-            tl.float32,
-        ),
-        mma_nm,
-        pin=False,
-    )
-    scores = scores * score_scale
     if APPLY_CAUSAL_MASK:
         rows = m_blk * BLOCK_M + tl.arange(0, BLOCK_M)
         cols = n0 + tl.arange(0, BLOCK_N)
@@ -2768,8 +2985,20 @@ def _d64_gqa8_signed_front(
         mma_nm,
         pin=False,
     )
+    if LATE_DO_T:
+        # The full-width gradient recurrence benefits when dO starts after the
+        # independent score/exp work and does not remain live across it.
+        do_t = tlx.local_load(tlx.local_trans(do_view), token=stage_wait, layout=q_t_op1_nm)
     dp = tl.dot(v_nm, do_t, acc=dp, out_dtype=tl.float32)
     ds = p * dp
+    # Direct D64 keeps each native pair together; split D32 starts independent
+    # intervals so its narrower recurrences retain scheduler flexibility.
+    handoff_group: tl.constexpr = 2 if LATE_DO_T else 1
+    ds = tlx.amd_register_handoff(
+        ds,
+        register_class="vgpr",
+        registers_per_group=handoff_group,
+    )
     p_nd = tlx.require_layout(p.to(tl.bfloat16), p_op0_nd, pin=False)
     ds_nd = tlx.require_layout(ds.to(tl.bfloat16), p_op0_nd, pin=False)
     return p_nd, ds_nd
@@ -2794,7 +3023,7 @@ def _d64_gqa8_direct_d64_step(
     D: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    APPLY_CAUSAL_MASK: tl.constexpr,
+    APPLY_CAUSAL_MASK,
     mma_nm: tl.constexpr,
     mma_nd: tl.constexpr,
     q_t_op1_nm: tl.constexpr,
@@ -2820,6 +3049,7 @@ def _d64_gqa8_direct_d64_step(
         BLOCK_M,
         BLOCK_N,
         APPLY_CAUSAL_MASK,
+        True,
         mma_nm,
         q_t_op1_nm,
         p_op0_nd,
@@ -2855,7 +3085,7 @@ def _d64_gqa8_d32_step(
     D: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    APPLY_CAUSAL_MASK: tl.constexpr,
+    APPLY_CAUSAL_MASK,
     INTERLEAVED_D32: tl.constexpr,
     mma_nm: tl.constexpr,
     mma_nd: tl.constexpr,
@@ -2884,6 +3114,7 @@ def _d64_gqa8_d32_step(
         BLOCK_M,
         BLOCK_N,
         APPLY_CAUSAL_MASK,
+        False,
         mma_nm,
         q_t_op1_nm,
         p_op0_nd,
@@ -2976,18 +3207,10 @@ def _d64_gqa8_direct_consume(
 ):
     dk = tlx.require_layout(dk, mma_nd, pin=False)
     dv = tlx.require_layout(dv, mma_nd, pin=False)
-    if n0 + BLOCK_N - 1 > m_blk * BLOCK_M + (SKV - SQ):
-        dk, dv = _d64_gqa8_direct_d64_step(dk, dv, q_view, do_view, lse_view, delta_view, stage_wait, k_nm, v_nm, m_blk,
-                                           n0, SM_SCALE, SQ, SKV, D, BLOCK_M, BLOCK_N, True, mma_nm, mma_nd, q_t_op1_nm,
-                                           p_op0_nd, q_op1_nd)
-        dk = tlx.require_layout(dk, mma_nd, pin=False)
-        dv = tlx.require_layout(dv, mma_nd, pin=False)
-    else:
-        dk, dv = _d64_gqa8_direct_d64_step(dk, dv, q_view, do_view, lse_view, delta_view, stage_wait, k_nm, v_nm, m_blk,
-                                           n0, SM_SCALE, SQ, SKV, D, BLOCK_M, BLOCK_N, False, mma_nm, mma_nd,
-                                           q_t_op1_nm, p_op0_nd, q_op1_nd)
-        dk = tlx.require_layout(dk, mma_nd, pin=False)
-        dv = tlx.require_layout(dv, mma_nd, pin=False)
+    apply_causal_mask = n0 + BLOCK_N - 1 > m_blk * BLOCK_M + (SKV - SQ)
+    dk, dv = _d64_gqa8_direct_d64_step(dk, dv, q_view, do_view, lse_view, delta_view, stage_wait, k_nm, v_nm, m_blk,
+                                       n0, SM_SCALE, SQ, SKV, D, BLOCK_M, BLOCK_N, apply_causal_mask, mma_nm, mma_nd,
+                                       q_t_op1_nm, p_op0_nd, q_op1_nd)
     dk = tlx.require_layout(dk, mma_nd, pin=False)
     dv = tlx.require_layout(dv, mma_nd, pin=False)
     return dk, dv
@@ -3025,24 +3248,11 @@ def _d64_gqa8_d32_consume(
     dk_d1 = tlx.require_layout(dk_d1, mma_nd, pin=False)
     dv_d0 = tlx.require_layout(dv_d0, mma_nd, pin=False)
     dv_d1 = tlx.require_layout(dv_d1, mma_nd, pin=False)
-    if n0 + BLOCK_N - 1 > m_blk * BLOCK_M + (SKV - SQ):
-        dk_d0, dk_d1, dv_d0, dv_d1 = _d64_gqa8_d32_step(dk_d0, dk_d1, dv_d0, dv_d1, q_view, do_view, lse_view,
-                                                        delta_view, stage_wait, k_nm, v_nm, m_blk, n0, SM_SCALE, SQ,
-                                                        SKV, D, BLOCK_M, BLOCK_N, True, INTERLEAVED_D32, mma_nm, mma_nd,
-                                                        q_t_op1_nm, p_op0_nd, q_op1_nd)
-        dk_d0 = tlx.require_layout(dk_d0, mma_nd, pin=False)
-        dk_d1 = tlx.require_layout(dk_d1, mma_nd, pin=False)
-        dv_d0 = tlx.require_layout(dv_d0, mma_nd, pin=False)
-        dv_d1 = tlx.require_layout(dv_d1, mma_nd, pin=False)
-    else:
-        dk_d0, dk_d1, dv_d0, dv_d1 = _d64_gqa8_d32_step(dk_d0, dk_d1, dv_d0, dv_d1, q_view, do_view, lse_view,
-                                                        delta_view, stage_wait, k_nm, v_nm, m_blk, n0, SM_SCALE, SQ,
-                                                        SKV, D, BLOCK_M, BLOCK_N, False, INTERLEAVED_D32, mma_nm,
-                                                        mma_nd, q_t_op1_nm, p_op0_nd, q_op1_nd)
-        dk_d0 = tlx.require_layout(dk_d0, mma_nd, pin=False)
-        dk_d1 = tlx.require_layout(dk_d1, mma_nd, pin=False)
-        dv_d0 = tlx.require_layout(dv_d0, mma_nd, pin=False)
-        dv_d1 = tlx.require_layout(dv_d1, mma_nd, pin=False)
+    apply_causal_mask = n0 + BLOCK_N - 1 > m_blk * BLOCK_M + (SKV - SQ)
+    dk_d0, dk_d1, dv_d0, dv_d1 = _d64_gqa8_d32_step(dk_d0, dk_d1, dv_d0, dv_d1, q_view, do_view, lse_view,
+                                                    delta_view, stage_wait, k_nm, v_nm, m_blk, n0, SM_SCALE, SQ, SKV,
+                                                    D, BLOCK_M, BLOCK_N, apply_causal_mask, INTERLEAVED_D32, mma_nm,
+                                                    mma_nd, q_t_op1_nm, p_op0_nd, q_op1_nd)
     dk_d0 = tlx.require_layout(dk_d0, mma_nd, pin=False)
     dk_d1 = tlx.require_layout(dk_d1, mma_nd, pin=False)
     dv_d0 = tlx.require_layout(dv_d0, mma_nd, pin=False)
@@ -3155,7 +3365,7 @@ def _d64_gqa8_direct_d64_impl(
                 tl.debug_barrier()
     else:
         pair_start = (start_m_blk // 2) * 2
-        for local_head in range(0, 2):
+        for local_head in tl.static_range(0, 2):
             query_in_group = off_split * 2 + local_head
             q_head = (pid_b * HQ + pid_hkv * 8 + query_in_group).to(tl.int64)
             q_base = Q + q_head * SQ * D
@@ -3253,7 +3463,7 @@ def _d64_gqa8_d32_impl(
     peel_frontier = (start_m_blk % 2) != 0
     pair_start = start_m_blk + (start_m_blk % 2)
 
-    for local_head in range(0, 2):
+    for local_head in tl.static_range(0, 2):
         query_in_group = off_split * 2 + local_head
         q_head = (pid_b * HQ + pid_hkv * 8 + query_in_group).to(tl.int64)
         q_base = Q + q_head * SQ * D
@@ -3390,7 +3600,7 @@ def _attn_bwd_dkdv_d64_causal_gqa8_kernel(
     tl.static_assert(HQ == HKV * 8)
     tl.static_assert(SQ % BLOCK_M == 0 and SKV % BLOCK_N == 0)
     tl.static_assert(SQ <= SKV)
-    tl.static_assert(LSE_MODE == _D64_LSE_NEG_INV_SCALE_JIT)
+    tl.static_assert(LSE_MODE == _D64_LSE_NEG_LOG2E_JIT)
     tl.static_assert(DELTA_MODE == _D64_DELTA_NEGATED_JIT)
     tl.static_assert(LIFETIME_MODE == _D64_GQA_INDEPENDENT_D32_JIT or LIFETIME_MODE == _D64_GQA_INTERLEAVED_D32_JIT
                      or LIFETIME_MODE == _D64_GQA_DIRECT_D64_JIT)
@@ -3506,6 +3716,15 @@ def _attn_bwd_dkdv_d64_causal_gqa8_kernel(
     k_offsets = tlx.require_layout(kv_offsets, k_op0_nm, pin=False)
     v_offsets = tlx.require_layout(kv_offsets, v_op0_nm, pin=False)
     k_nm = tlx.buffer_load(K + kv_base, k_offsets)
+    # K participates only in the score MFMA. Folding the constant softmax
+    # scale into this resident operand amortizes it over every owned query
+    # tile and head.
+    k_scale = tlx.require_layout(
+        tl.full((BLOCK_N, D), SM_SCALE * 1.4426950408889634, tl.float32),
+        k_op0_nm,
+        pin=False,
+    )
+    k_nm = (k_nm.to(tl.float32) * k_scale).to(tl.bfloat16)
     k_nm = tlx.require_layout(k_nm, k_op0_nm, pin=False)
     v_nm = tlx.buffer_load(V + kv_base, v_offsets)
     v_nm = tlx.require_layout(v_nm, v_op0_nm, pin=False)
@@ -3553,21 +3772,27 @@ def _attn_bwd_dkdv_d64_causal_gqa8_reduce_kernel(
     BLOCK_N: tl.constexpr,
 ):
     """Reduce split 0,1,2,3 in FP32, then narrow exactly once."""
-    tl.static_assert(D == 64 and BLOCK_N == 128 and SKV % BLOCK_N == 0)
+    tl.static_assert(D == 64 and (BLOCK_N == 64 or BLOCK_N == 128) and SKV % BLOCK_N == 0)
     pid_n = tl.program_id(0)
     pid_hkv = tl.program_id(1)
     pid_b = tl.program_id(2)
     n0 = pid_n * BLOCK_N
-    out_layout: tl.constexpr = tlx.layout(
-        shape=(
-            (2, 2, 2, 2, 2, 2, 2, 2),
-            (2, 2, 2, 2, 2),
-        ),
-        stride=(
-            (64, 128, 256, 512, 8, 16, 1024, 2048),
-            (1, 2, 4, 32, 4096),
-        ),
-    )
+    if BLOCK_N == 64:
+        out_layout: tl.constexpr = tlx.layout(
+            shape=((2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2)),
+            stride=((64, 128, 256, 512, 8, 16, 1024, 2048), (1, 2, 4, 32)),
+        )
+    else:
+        out_layout: tl.constexpr = tlx.layout(
+            shape=(
+                (2, 2, 2, 2, 2, 2, 2, 2),
+                (2, 2, 2, 2, 2),
+            ),
+            stride=(
+                (64, 128, 256, 512, 8, 16, 1024, 2048),
+                (1, 2, 4, 32, 4096),
+            ),
+        )
     offsets = (tl.arange(0, BLOCK_N)[:, None] * D + tl.arange(0, D)[None, :]).to(tl.int32)
     offsets = tlx.require_layout(offsets, out_layout, pin=False)
     owner = (pid_b * HKV + pid_hkv).to(tl.int64)
@@ -3976,6 +4201,7 @@ def _launch_bwd_d64_causal_dq(
             GRID_OWNER_M=launch.grid_owner_m,
             num_warps=4,
             matrix_instr_nonkdim=_matrix_instr_nonkdim(),
+            llvm_fn_attrs=_d64_causal_dq_llvm_attrs(sq, skv, dispatch),
         )
 
 
@@ -4035,6 +4261,10 @@ def _launch_bwd_d64_causal_gqa8_dkdv(
     )
     use_gqa_xcd = dispatch.gqa_grid_mode != _D64_GQA_SPLIT_FAST
     use_xcd_n_fast = dispatch.gqa_grid_mode == _D64_GQA_XCD_N_FAST
+    producer_llvm_attrs = (
+        (("amdgpu-max-memory-cluster-dwords", "32"), )
+        if sq == skv else ()
+    )
     grid = (batch * hkv * 4 * triton.cdiv(skv, 128), )
     _attn_bwd_dkdv_d64_causal_gqa8_kernel[grid](
         q,
@@ -4057,16 +4287,17 @@ def _launch_bwd_d64_causal_gqa8_dkdv(
         USE_XCD_N_FAST=use_xcd_n_fast,
         CYCLIC_QUERY_SPLIT=dispatch.cyclic_query_split,
         LIFETIME_MODE=dispatch.dkdv_lifetime,
-        LSE_MODE=_D64_LSE_NEG_INV_SCALE,
+        LSE_MODE=_D64_LSE_NEG_LOG2E,
         DELTA_MODE=_D64_DELTA_NEGATED,
         num_warps=4,
         matrix_instr_nonkdim=_matrix_instr_nonkdim(),
+        llvm_fn_attrs=producer_llvm_attrs,
     )
 
 
 def _launch_bwd_d64_causal_gqa8_reduce(dk_part, dv_part, dk, dv):
     batch, hkv, skv, head_dim = dk.shape
-    block_n = 128
+    block_n = 64
     _attn_bwd_dkdv_d64_causal_gqa8_reduce_kernel[(triton.cdiv(skv, block_n), hkv, batch)](
         dk_part,
         dv_part,
@@ -9047,7 +9278,7 @@ def test_d64_causal_stat_contract_formulas():
 
     delta_positive = torch.sum(o.float() * do.float(), dim=-1)
     delta_signed = -delta_positive
-    lse_term = -lse.float() / sm_scale
+    lse_term = -lse.float() * math.log2(math.e)
 
     torch.testing.assert_close(delta_mha, delta_positive)
     torch.testing.assert_close(delta_gqa, delta_signed)
@@ -9061,7 +9292,7 @@ def test_d64_causal_stat_contract_formulas():
     ds_mha = p_mha * (do.float() @ v.float().mT - delta_positive[..., None])
 
     scores_gqa = q.float() @ k.float().mT
-    p_gqa = torch.exp2((scores_gqa + lse_term[..., None]) * (sm_scale * math.log2(math.e)))
+    p_gqa = torch.exp2(scores_gqa * (sm_scale * math.log2(math.e)) + lse_term[..., None])
     ds_gqa = p_gqa * (do.float() @ v.float().mT + delta_signed[..., None])
 
     torch.testing.assert_close(p_mha, p_gqa)
@@ -9273,7 +9504,7 @@ def test_d64_structural_dispatch_locked_host_interface():
             _D64_MHA_POSITIVE,
             _D64_GQA_SIGNED,
             _D64_LSE_NATURAL_LOG,
-            _D64_LSE_NEG_INV_SCALE,
+            _D64_LSE_NEG_LOG2E,
             _D64_DELTA_POSITIVE,
             _D64_DELTA_NEGATED,
     ):
@@ -9729,17 +9960,79 @@ def test_d64_causal_gqa8_helper_ast_contract():
     assert len(commits) == 1
     assert ast.unparse(commits[0].args[0]) == ("[q_token, do_token, lse_token, delta_token]")
 
-    consume = function_ast(_d64_gqa8_d32_consume)
-    causal_if = next(node for node in consume.body if isinstance(node, ast.If))
-    assert ast.unparse(causal_if.test) == ("n0 + BLOCK_N - 1 > m_blk * BLOCK_M + (SKV - SQ)")
-    masked_steps = [
-        node for node in ast.walk(causal_if) if isinstance(node, ast.Call) and dotted_name(node) == "_d64_gqa8_d32_step"
+    def assert_runtime_causal_mask(jit_function, step_name, mask_arg):
+        consume = function_ast(jit_function)
+        mask_assignment = next(
+            node for node in consume.body
+            if isinstance(node, ast.Assign) and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "apply_causal_mask")
+        assert ast.unparse(mask_assignment.value) == ("n0 + BLOCK_N - 1 > m_blk * BLOCK_M + (SKV - SQ)")
+        steps = [
+            node for node in ast.walk(consume)
+            if isinstance(node, ast.Call) and dotted_name(node) == step_name
+        ]
+        assert len(steps) == 1
+        assert ast.unparse(steps[0].args[mask_arg]) == "apply_causal_mask"
+        assert not any(isinstance(node, ast.If) for node in consume.body)
+
+    assert_runtime_causal_mask(_d64_gqa8_direct_consume, "_d64_gqa8_direct_d64_step", 17)
+    assert_runtime_causal_mask(_d64_gqa8_d32_consume, "_d64_gqa8_d32_step", 19)
+
+    signed_front = function_ast(_d64_gqa8_signed_front)
+    vgpr_handoffs = [
+        node for node in ast.walk(signed_front)
+        if isinstance(node, ast.Call) and dotted_name(node) == "tlx.amd_register_handoff"
     ]
-    assert len(masked_steps) == 2
-    assert [ast.unparse(call.args[19]) for call in masked_steps] == [
-        "True",
-        "False",
-    ]
+    assert len(vgpr_handoffs) == 1
+    assert ast.unparse(vgpr_handoffs[0].args[0]) == "ds"
+    assert ast.literal_eval(next(keyword.value for keyword in vgpr_handoffs[0].keywords
+                                 if keyword.arg == "register_class")) == "vgpr"
+    assert ast.unparse(next(keyword.value for keyword in vgpr_handoffs[0].keywords
+                            if keyword.arg == "registers_per_group")) == "handoff_group"
+    handoff_assignment = next(
+        node for node in signed_front.body
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+        and node.target.id == "handoff_group"
+    )
+    assert ast.unparse(handoff_assignment.annotation) == "tl.constexpr"
+    assert ast.unparse(handoff_assignment.value) == "2 if LATE_DO_T else 1"
+
+    def assignment_call(statement, target, call_name):
+        return (
+            isinstance(statement, ast.Assign) and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name) and statement.targets[0].id == target
+            and isinstance(statement.value, ast.Call) and dotted_name(statement.value) == call_name
+        )
+
+    early_do_index = next(
+        index for index, statement in enumerate(signed_front.body)
+        if isinstance(statement, ast.If) and ast.unparse(statement.test) == "not LATE_DO_T"
+    )
+    p_index = next(
+        index for index, statement in enumerate(signed_front.body)
+        if assignment_call(statement, "p", "tlx.require_layout")
+    )
+    late_do_index = next(
+        index for index, statement in enumerate(signed_front.body)
+        if isinstance(statement, ast.If) and ast.unparse(statement.test) == "LATE_DO_T"
+    )
+    dp_dot_index = next(
+        index for index, statement in enumerate(signed_front.body)
+        if assignment_call(statement, "dp", "tl.dot")
+    )
+    assert early_do_index < p_index < late_do_index < dp_dot_index
+    for index in (early_do_index, late_do_index):
+        assert any(assignment_call(statement, "do_t", "tlx.local_load") for statement in signed_front.body[index].body)
+
+    for step_function, expected_late_do in (
+        (_d64_gqa8_direct_d64_step, "True"),
+        (_d64_gqa8_d32_step, "False"),
+    ):
+        signed_call = next(
+            node for node in ast.walk(function_ast(step_function))
+            if isinstance(node, ast.Call) and dotted_name(node) == "_d64_gqa8_signed_front"
+        )
+        assert ast.unparse(signed_call.args[16]) == expected_late_do
 
     step = function_ast(_d64_gqa8_d32_step)
     lifetime_ifs = [
@@ -9766,6 +10059,16 @@ def test_d64_causal_gqa8_helper_ast_contract():
         "dk_d0",
         "dk_d1",
     ]
+
+    for loop_impl, expected_iters in (
+        (_d64_gqa8_direct_d64_impl, {"range(0, 8)", "tl.static_range(0, 2)"}),
+        (_d64_gqa8_d32_impl, {"tl.static_range(0, 2)"}),
+    ):
+        local_head_loops = [
+            node for node in ast.walk(function_ast(loop_impl))
+            if isinstance(node, ast.For) and ast.unparse(node.target) == "local_head"
+        ]
+        assert {ast.unparse(loop.iter) for loop in local_head_loops} == expected_iters
 
     impl = function_ast(_d64_gqa8_d32_impl)
     head_loop = next(node for node in impl.body
@@ -9872,7 +10175,7 @@ def test_d64_causal_gqa8_launch_mode_kwargs_same_shape(monkeypatch):
         assert kwargs["USE_XCD_N_FAST"] is use_n_fast
         assert kwargs["CYCLIC_QUERY_SPLIT"] is cyclic
         assert kwargs["LIFETIME_MODE"] == lifetime
-        assert kwargs["LSE_MODE"] == _D64_LSE_NEG_INV_SCALE
+        assert kwargs["LSE_MODE"] == _D64_LSE_NEG_LOG2E
         assert kwargs["DELTA_MODE"] == _D64_DELTA_NEGATED
 
 
@@ -10105,6 +10408,11 @@ def test_d64_causal_selected_dispatch_contract():
     for q_shape, k_shape in (mha_m192, mha_m256):
         assert is_eligible(q_shape, k_shape)
         dispatch = select(q_shape, k_shape)
+        assert dispatch.owner_rows == _d64_selected_causal_owner_rows(
+            q_shape[2],
+            k_shape[2],
+            q_shape[1] // k_shape[1],
+        )
         assert dispatch.family == "causal_gluon_mha"
         assert dispatch.selected_causal
         assert dispatch.stat_mode == _D64_MHA_POSITIVE
@@ -10148,6 +10456,11 @@ def test_d64_causal_selected_dispatch_contract():
         assert q_shape[1] == 8 * k_shape[1]
         assert is_eligible(q_shape, k_shape)
         dispatch = select(q_shape, k_shape)
+        assert dispatch.owner_rows == _d64_selected_causal_owner_rows(
+            q_shape[2],
+            k_shape[2],
+            q_shape[1] // k_shape[1],
+        )
         expected_grid, expected_cyclic = _d64_gqa_grid_policy(q_shape[0], k_shape[1], q_shape[2], k_shape[2], cu_count)
         assert dispatch.family == "causal_gluon_gqa8"
         assert dispatch.selected_causal
@@ -10157,7 +10470,11 @@ def test_d64_causal_selected_dispatch_contract():
         assert dispatch.gqa_grid_mode == expected_grid
         assert dispatch.cyclic_query_split is expected_cyclic
         assert dispatch.dkdv_lifetime == _d64_gqa_lifetime(q_shape[2], k_shape[2])
-        assert dispatch.dq_logical_n == (32 if q_shape[2] == k_shape[2] else 64)
+        assert dispatch.dq_logical_n == _d64_selected_causal_logical_n(
+            q_shape[2],
+            k_shape[2],
+            q_shape[1] // k_shape[1],
+        )
         assert dispatch.dq_use_xcd is _d64_use_dq_xcd(q_shape[0], k_shape[1], q_shape[2], k_shape[2],
                                                       dispatch.owner_rows)
         assert dispatch.dq_launches == _d64_dq_launch_plan(
@@ -10170,6 +10487,33 @@ def test_d64_causal_selected_dispatch_contract():
             cu_count,
             True,
         )
+    assert [
+        select(
+            (batch, hq, sq, head_dim),
+            (batch, hkv, skv, head_dim),
+        ).owner_rows
+        for ticket in ("t04", "t05", "t06", "t07", "t08")
+        for batch, sq, skv, hq, hkv, head_dim, _causal in (D64_BENCHMARK_SHAPES[ticket], )
+    ] == [256, 192, 256, 256, 256]
+    assert [
+        _d64_causal_dq_llvm_attrs(
+            sq,
+            skv,
+            select(
+                (batch, hq, sq, head_dim),
+                (batch, hkv, skv, head_dim),
+            ),
+        )
+        for ticket in ("t04", "t05", "t06", "t07", "t08")
+        for batch, sq, skv, hq, hkv, head_dim, _causal in (D64_BENCHMARK_SHAPES[ticket], )
+    ] == [
+        _D64_DQ_SQUARE_LLVM_ATTRS,
+        (),
+        _D64_DQ_RECTANGLE_LLVM_ATTRS,
+        _D64_DQ_RECTANGLE_LLVM_ATTRS,
+        _D64_DQ_RECTANGLE_LLVM_ATTRS,
+    ]
+    assert _d64_causal_dq_llvm_attrs(16384, 16384, select(*mha_m256)) == ()
 
     negative_cases = (
         (
@@ -10877,7 +11221,7 @@ def test_d64_causal_common_dq_stat_modes_gfx950(shape, expected_logical_n, expec
             kv_splits=1,
             selected_causal=True,
             stat_mode=stat_mode,
-            dq_logical_n=32 if sq == skv else 64,
+            dq_logical_n=_d64_selected_causal_logical_n(sq, skv, hq // hkv),
             dq_use_xcd=_d64_use_dq_xcd(batch, hkv, sq, skv, 192),
             dq_launches=launches,
         )
@@ -10927,7 +11271,7 @@ def test_d64_causal_common_dq_stat_modes_gfx950(shape, expected_logical_n, expec
     torch.testing.assert_close(delta_gqa, -positive, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(
         lse_term_gqa,
-        -case.lse.float() / case.sm_scale,
+        -case.lse.float() * math.log2(math.e),
         rtol=1e-5,
         atol=1e-5,
     )
@@ -11014,6 +11358,270 @@ def test_d64_causal_common_dq_peeled_m128_accuracy_gfx950():
     device = torch.cuda.current_device()
     objects = tuple(_attn_bwd_dq_d64_causal_mha_kernel.device_caches[device][0].values())
     assert len(objects) == 2
+
+
+def test_d64_causal_common_dq_direct_load_ast_contract():
+    helper = ast.parse(_attn_bwd_dq_d64_causal_load_q64.src).body[0]
+
+    def dotted_name(call):
+        value = call.func
+        parts = []
+        while isinstance(value, ast.Attribute):
+            parts.append(value.attr)
+            value = value.value
+        if isinstance(value, ast.Name):
+            parts.append(value.id)
+        return ".".join(reversed(parts))
+
+    direct_loads = [
+        statement.targets[0].id for statement in helper.body
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1
+        and isinstance(statement.targets[0], ast.Name) and isinstance(statement.value, ast.Call)
+        and dotted_name(statement.value) == "tlx.buffer_load"
+    ]
+    assert direct_loads == ["do", "o", "q"]
+
+    stat_mode_branch = next(
+        statement for statement in helper.body
+        if isinstance(statement, ast.If)
+        and ast.unparse(statement.test) == "STAT_MODE == _D64_MHA_POSITIVE_JIT"
+    )
+    producer_lse_term = next(
+        statement.value for statement in ast.walk(stat_mode_branch)
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1
+        and isinstance(statement.targets[0], ast.Name)
+        and statement.targets[0].id == "producer_lse_term"
+    )
+    assert ast.unparse(producer_lse_term) == "-lse * 1.4426950408889634"
+    lse_term_store = next(
+        node for node in ast.walk(stat_mode_branch)
+        if isinstance(node, ast.Call) and dotted_name(node) == "tl.store"
+        and ast.unparse(node.args[0]) == "LSE_TERM + stats_base + rows"
+    )
+    assert ast.unparse(lse_term_store.args[1]) == "producer_lse_term"
+
+    q_scale = next(
+        statement.value for statement in ast.walk(stat_mode_branch)
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1
+        and isinstance(statement.targets[0], ast.Name) and statement.targets[0].id == "q_scale"
+    )
+    q_scale_fill = next(
+        node for node in ast.walk(q_scale)
+        if isinstance(node, ast.Call) and dotted_name(node) == "tl.full"
+    )
+    assert ast.unparse(q_scale_fill.args[1]) == "SM_SCALE * 1.4426950408889634"
+    q_scale_products = [
+        node for node in ast.walk(stat_mode_branch)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult)
+        and ast.unparse(node.right) == "q_scale"
+    ]
+    assert len(q_scale_products) == 1
+    assert ast.unparse(q_scale_products[0].left) == "q.to(tl.float32)"
+
+    handoff = next(
+        statement.value for statement in helper.body
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1
+        and isinstance(statement.targets[0], ast.Name) and statement.targets[0].id == "product"
+        and isinstance(statement.value, ast.Call) and dotted_name(statement.value) == "tlx.release_layout")
+    assert ast.unparse(handoff.args[0]) == "product"
+
+    reduction = next(
+        statement.value for statement in helper.body
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1
+        and isinstance(statement.targets[0], ast.Name) and statement.targets[0].id == "positive")
+    assert dotted_name(reduction) == "tl.sum"
+    assert ast.unparse(reduction.args[0]) == "product"
+    assert ast.literal_eval(reduction.keywords[0].value) == 1
+
+    step = ast.parse(_attn_bwd_dq_d64_causal_step.src).body[0]
+    n64_handoff = next(
+        statement for statement in step.body
+        if isinstance(statement, ast.If) and ast.unparse(statement.test) == "BLOCK_N == 64"
+    )
+    score_tie = next(
+        statement.value for statement in n64_handoff.body
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1
+        and isinstance(statement.targets[0], ast.Name) and statement.targets[0].id == "scores"
+        and isinstance(statement.value, ast.Call)
+        and dotted_name(statement.value) == "tlx.amd_register_handoff"
+    )
+    assert ast.unparse(score_tie.args[0]) == "scores"
+    assert ast.literal_eval(next(keyword.value for keyword in score_tie.keywords
+                                 if keyword.arg == "registers_per_group")) == 1
+    n32_handoff = next(
+        statement for statement in step.body
+        if isinstance(statement, ast.If) and ast.unparse(statement.test) == "BLOCK_N == 32"
+    )
+    n32_score_tie = next(
+        statement.value for statement in n32_handoff.body
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1
+        and isinstance(statement.targets[0], ast.Name) and statement.targets[0].id == "scores"
+        and isinstance(statement.value, ast.Call)
+        and dotted_name(statement.value) == "tlx.amd_register_handoff"
+    )
+    assert ast.unparse(n32_score_tie.args[0]) == "scores"
+    assert ast.literal_eval(next(keyword.value for keyword in n32_score_tie.keywords
+                                 if keyword.arg == "registers_per_group")) == 1
+    assert not any(
+        isinstance(node, ast.Call) and dotted_name(node) == "tlx.local_load"
+        for node in ast.walk(step)
+    )
+    score_scale_guard = next(
+        statement for statement in step.body
+        if isinstance(statement, ast.If) and ast.unparse(statement.test) == "not SCORE_PRE_SCALED"
+    )
+    assert any(
+        isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult)
+        and ast.unparse(node.left) == "scores"
+        for node in ast.walk(score_scale_guard)
+    )
+
+    score32 = ast.parse(_attn_bwd_dq_d64_causal_score32.src).body[0]
+    score32_scale_guard = next(
+        statement for statement in score32.body
+        if isinstance(statement, ast.If) and ast.unparse(statement.test) == "not SCORE_PRE_SCALED"
+    )
+    assert any(
+        isinstance(node, ast.AugAssign) and isinstance(node.op, ast.Mult)
+        and ast.unparse(node.target) == "scores"
+        for node in ast.walk(score32_scale_guard)
+    )
+
+    def positional_argument(call, function, name):
+        parameter_names = [argument.arg for argument in function.args.args]
+        return ast.unparse(call.args[parameter_names.index(name)])
+
+    nslice = ast.parse(_attn_bwd_dq_d64_causal_nslice.src).body[0]
+    shared_operand_assignments = [
+        statement for statement in ast.walk(nslice)
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1
+        and isinstance(statement.targets[0], ast.Name)
+        and statement.targets[0].id in {"k_source", "kv_source", "v_source"}
+    ]
+    assert [statement.targets[0].id for statement in shared_operand_assignments] == [
+        "k_source",
+        "kv_source",
+        "v_source",
+    ]
+    assert all(
+        isinstance(statement.value, ast.Call) and dotted_name(statement.value) == "tlx.local_load"
+        for statement in shared_operand_assignments
+    )
+    fragment_steps = [
+        node for node in ast.walk(nslice)
+        if isinstance(node, ast.Call) and dotted_name(node) == "_attn_bwd_dq_d64_causal_step"
+    ]
+    assert len(fragment_steps) == 11
+    assert all(
+        [ast.unparse(arg) for arg in call.args[6:9]] == ["k_source", "v_source", "kv_source"]
+        for call in fragment_steps
+    )
+    assert all(
+        positional_argument(call, step, "SCORE_PRE_SCALED") == "SCORE_PRE_SCALED"
+        for call in fragment_steps
+    )
+
+    m256 = ast.parse(_attn_bwd_dq_d64_causal_m256_unmasked_n32.src).body[0]
+    ordered_assignments = [
+        statement.targets[0].id for statement in m256.body
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1
+        and isinstance(statement.targets[0], ast.Name)
+        and statement.targets[0].id in {
+            "kt",
+            "k_nd",
+            "scores0",
+            "vt",
+            "dp0",
+            "dq0",
+            "dq1",
+            "q3",
+            "dq3",
+            "scores2",
+            "dp2",
+            "dq2",
+        }
+    ]
+    assert ordered_assignments == [
+        "kt",
+        "k_nd",
+        "scores0",
+        "vt",
+        "dp0",
+        "dq0",
+        "dq1",
+        "q3",
+        "dq3",
+        "scores2",
+        "dp2",
+        "dq2",
+    ]
+    m256_fragment_steps = [
+        statement.value for statement in m256.body
+        if isinstance(statement, ast.Assign) and isinstance(statement.value, ast.Call)
+        and dotted_name(statement.value) == "_attn_bwd_dq_d64_causal_step"
+    ]
+    assert [ast.unparse(call.args[0]) for call in m256_fragment_steps] == ["dq1", "dq3"]
+    assert all(ast.unparse(call.args[15]) == "32" for call in m256_fragment_steps)
+    assert all(ast.unparse(call.args[16]) == "False" for call in m256_fragment_steps)
+    assert all(
+        positional_argument(call, step, "SCORE_PRE_SCALED") == "SCORE_PRE_SCALED"
+        for call in m256_fragment_steps
+    )
+    score32_calls = [
+        statement.value for statement in m256.body
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1
+        and isinstance(statement.targets[0], ast.Name)
+        and statement.targets[0].id in {"scores0", "scores2"}
+        and isinstance(statement.value, ast.Call)
+        and dotted_name(statement.value) == "_attn_bwd_dq_d64_causal_score32"
+    ]
+    assert [ast.unparse(call.args[7]) for call in score32_calls] == [
+        "N_OFFSET == 0",
+        "N_OFFSET == 32",
+    ]
+    assert all(
+        positional_argument(call, score32, "SCORE_PRE_SCALED") == "SCORE_PRE_SCALED"
+        for call in score32_calls
+    )
+
+    impl = ast.parse(_attn_bwd_dq_d64_causal_impl.src).body[0]
+    score_pre_scaled = next(
+        statement for statement in impl.body
+        if isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name)
+        and statement.target.id == "score_pre_scaled"
+    )
+    assert ast.unparse(score_pre_scaled.annotation) == "tl.constexpr"
+    assert ast.unparse(score_pre_scaled.value) == "STAT_MODE == _D64_GQA_SIGNED_JIT"
+    score_consumers = {
+        "_attn_bwd_dq_d64_causal_m256_unmasked_n32": m256,
+        "_attn_bwd_dq_d64_causal_nslice": nslice,
+    }
+    consumer_calls = [
+        node for node in ast.walk(impl)
+        if isinstance(node, ast.Call) and dotted_name(node) in score_consumers
+    ]
+    assert len(consumer_calls) == 8
+    assert all(
+        positional_argument(
+            call,
+            score_consumers[dotted_name(call)],
+            "SCORE_PRE_SCALED",
+        ) == "score_pre_scaled"
+        for call in consumer_calls
+    )
+
+    store = ast.parse(_attn_bwd_dq_d64_causal_store_q64.src).body[0]
+    offsets = next(
+        statement.value for statement in store.body
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1
+        and isinstance(statement.targets[0], ast.Name) and statement.targets[0].id == "offsets"
+    )
+    assert ast.unparse(offsets) == "(local_rows[:, None] * D + cols[None, :]).to(tl.int32)"
+    store_call = next(
+        node for node in ast.walk(store)
+        if isinstance(node, ast.Call) and dotted_name(node) == "tlx.buffer_store"
+    )
+    assert ast.unparse(store_call.args[1]) == "DQ + q_base + row_start * D"
 
 
 def test_d64_causal_common_dq_launch_order(monkeypatch):
@@ -11136,7 +11744,7 @@ def test_d64_causal_common_dq_launch_order(monkeypatch):
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_d64_causal_common_dq_codegen_gfx950():
 
-    def compile_variant(name, shape, owner_rows, launches, stat_mode, expected_lds):
+    def compile_variant(name, shape, owner_rows, launches, stat_mode, expected_lds, expected_private_segment):
         batch, hq, hkv, sq, skv, _head_dim = shape
         q = torch.zeros((batch, hq, sq, 64), device="cuda", dtype=torch.bfloat16)
         k = torch.zeros((batch, hkv, skv, 64), device="cuda", dtype=torch.bfloat16)
@@ -11152,7 +11760,7 @@ def test_d64_causal_common_dq_codegen_gfx950():
             kv_splits=1,
             selected_causal=True,
             stat_mode=stat_mode,
-            dq_logical_n=32 if sq == skv else 64,
+            dq_logical_n=_d64_selected_causal_logical_n(sq, skv, hq // hkv),
             dq_use_xcd=_d64_use_dq_xcd(batch, hkv, sq, skv, owner_rows),
             dq_launches=launches,
         )
@@ -11164,7 +11772,24 @@ def test_d64_causal_common_dq_codegen_gfx950():
         objects = tuple(kernel.device_caches[device][0].values())
         assert len(objects) == 1, (name, len(objects))
         obj = objects[0]
-        resource = _assert_d64_code_object_scratch_free(name, obj)
+        resource = _d64_code_object_resource(obj)
+        if expected_private_segment == 0:
+            for field in _D64_ZERO_RESOURCE_FIELDS:
+                assert resource[field] == 0, (name, resource)
+        else:
+            assert {
+                "n_spills": resource["n_spills"],
+                "global_scratch_bytes": resource["global_scratch_bytes"],
+                "private_segment_bytes": resource["private_segment_bytes"],
+                "scratch_load_instructions": resource["scratch_load_instructions"],
+                "scratch_store_instructions": resource["scratch_store_instructions"],
+            } == {
+                "n_spills": 73,
+                "global_scratch_bytes": 0,
+                "private_segment_bytes": expected_private_segment,
+                "scratch_load_instructions": 78,
+                "scratch_store_instructions": 52,
+            }, (name, resource)
         assert resource["unified_vgpr_count"] == resource["vgpr_count"]
         assert resource["unified_vgpr_count"] >= (resource["vector_vgpr_count"] + resource["agpr_count"])
         assert resource["lds_bytes"] == expected_lds, (name, resource)
@@ -11177,14 +11802,19 @@ def test_d64_causal_common_dq_codegen_gfx950():
     square_owners = triton.cdiv(square_sq, 192)
     rectangular_shape = (1, 8, 8, 256, 320, 64)
     rectangular_launches = _d64_dq_launch_plan(1, 8, 8, 256, 320, 192, 1, True)
+    deep_m192_gqa8_shape = (8, 8, 1, 1024, 2048, 64)
+    deep_m192_gqa8_launches = _d64_dq_launch_plan(8, 8, 1, 1024, 2048, 192, 256, True)
+    deep_m256_gqa8_shape = (8, 8, 1, 4096, 8192, 64)
+    deep_m256_gqa8_launches = _d64_dq_launch_plan(8, 8, 1, 4096, 8192, 256, 256, True)
     variants = (
         (
-            "m128_square",
+            "peeled_m128_square",
             (1, 8, 8, square_sq, square_sq, 64),
             192,
             (_D64DQLaunch(1, False, square_owners - 1, 1, 2, 192), ),
             _D64_MHA_POSITIVE,
-            41472,
+            33536,
+            0,
         ),
         (
             "m192_square",
@@ -11199,7 +11829,8 @@ def test_d64_causal_common_dq_codegen_gfx950():
                 0,
             ), ),
             _D64_MHA_POSITIVE,
-            41472,
+            33536,
+            0,
         ),
         (
             "m192_rectangular",
@@ -11207,7 +11838,8 @@ def test_d64_causal_common_dq_codegen_gfx950():
             192,
             rectangular_launches,
             _D64_MHA_POSITIVE,
-            41472,
+            33536,
+            0,
         ),
         (
             "m256_square",
@@ -11215,7 +11847,8 @@ def test_d64_causal_common_dq_codegen_gfx950():
             256,
             (_D64DQLaunch(64, True, 0, 0, 4, 0), ),
             _D64_MHA_POSITIVE,
-            49792,
+            41856,
+            0,
         ),
         (
             "gqa_signed_rectangular",
@@ -11223,7 +11856,26 @@ def test_d64_causal_common_dq_codegen_gfx950():
             192,
             rectangular_launches,
             _D64_GQA_SIGNED,
-            41472,
+            33536,
+            0,
+        ),
+        (
+            "gqa_signed_deep_m192_n32",
+            deep_m192_gqa8_shape,
+            192,
+            deep_m192_gqa8_launches,
+            _D64_GQA_SIGNED,
+            33536,
+            0,
+        ),
+        (
+            "gqa_signed_deep_m256_n32",
+            deep_m256_gqa8_shape,
+            256,
+            deep_m256_gqa8_launches,
+            _D64_GQA_SIGNED,
+            41856,
+            292,
         ),
     )
     resources = {
@@ -11234,6 +11886,7 @@ def test_d64_causal_common_dq_codegen_gfx950():
             launches,
             stat_mode,
             expected_lds,
+            expected_private_segment,
         )
         for (
             name,
@@ -11242,9 +11895,12 @@ def test_d64_causal_common_dq_codegen_gfx950():
             launches,
             stat_mode,
             expected_lds,
+            expected_private_segment,
         ) in variants
     }
     assert tuple(resources) == tuple(variant[0] for variant in variants)
+    assert resources["gqa_signed_deep_m192_n32"]["unified_vgpr_count"] <= 224
+    assert resources["gqa_signed_deep_m256_n32"]["unified_vgpr_count"] <= 256
     print({"common_dq_resources": resources})
 
 
@@ -12179,7 +12835,7 @@ def test_d64_causal_gqa8_codegen_gfx950():
     assert "tlx.buffer_load(V" in producer_source
     assert "tlx.local_alloc((BLOCK_M, D), tl.bfloat16, 2" in producer_source
     assert "n0 + BLOCK_N - 1 > m_blk * BLOCK_M + (SKV - SQ)" in consume_source
-    assert "LSE_MODE == _D64_LSE_NEG_INV_SCALE_JIT" in producer_source
+    assert "LSE_MODE == _D64_LSE_NEG_LOG2E_JIT" in producer_source
     assert "DELTA_MODE == _D64_DELTA_NEGATED_JIT" in producer_source
     assert "atomic" not in producer_source.lower()
 

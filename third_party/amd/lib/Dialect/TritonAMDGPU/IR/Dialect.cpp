@@ -719,32 +719,52 @@ LogicalResult RematerializedRangeOp::verify() {
   return success();
 }
 
-LogicalResult RegisterResidentOp::verify() {
+static LogicalResult verifyRegisterAllocationContract(Operation *op,
+                                                      RankedTensorType tensorTy,
+                                                      StringRef registerClass,
+                                                      int64_t registersPerGroup,
+                                                      bool allowUnencoded) {
   namespace ttg = mlir::triton::gpu;
 
-  auto tensorTy = getInput().getType();
-  if (!isa<ttg::DistributedEncodingTrait>(tensorTy.getEncoding()))
-    return emitOpError("requires a distributed tensor encoding");
+  Attribute encoding = tensorTy.getEncoding();
+  if (!encoding && !allowUnencoded)
+    return op->emitOpError("requires a distributed tensor encoding");
+  if (encoding && !isa<ttg::DistributedEncodingTrait>(encoding))
+    return op->emitOpError("requires a distributed tensor encoding");
   Type elementType = tensorTy.getElementType();
   if (!elementType.isIntOrFloat())
-    return emitOpError("requires an integer or floating-point element type");
+    return op->emitOpError(
+        "requires an integer or floating-point element type");
   unsigned bitWidth = elementType.getIntOrFloatBitWidth();
   if (bitWidth != 16 && bitWidth != 32)
-    return emitOpError("supports only 16-bit and 32-bit element types");
-  if (getRegisterClass() != "agpr" && getRegisterClass() != "vgpr")
-    return emitOpError("register_class must be \"agpr\" or \"vgpr\"");
-  int64_t registersPerGroup = getRegistersPerGroup();
+    return op->emitOpError("supports only 16-bit and 32-bit element types");
+  if (registerClass != "agpr" && registerClass != "vgpr")
+    return op->emitOpError("register_class must be \"agpr\" or \"vgpr\"");
   if (registersPerGroup <= 0 || registersPerGroup > 32 ||
       (registersPerGroup & (registersPerGroup - 1)) != 0)
-    return emitOpError(
+    return op->emitOpError(
         "registers_per_group must be a power of two between 1 and 32");
+  if (!encoding)
+    return success();
   int64_t elementsPerGroup = registersPerGroup * 32 / bitWidth;
   int64_t elementsPerThread = ttg::getTotalElemsPerThread(tensorTy);
   if (elementsPerThread % elementsPerGroup != 0)
-    return emitOpError() << "requires " << elementsPerThread
-                         << " elements per thread to be divisible by the "
-                         << elementsPerGroup << "-element native tuple";
+    return op->emitOpError() << "requires " << elementsPerThread
+                             << " elements per thread to be divisible by the "
+                             << elementsPerGroup << "-element native tuple";
   return success();
+}
+
+LogicalResult RegisterResidentOp::verify() {
+  return verifyRegisterAllocationContract(
+      getOperation(), getInput().getType(), getRegisterClass(),
+      getRegistersPerGroup(), /*allowUnencoded=*/false);
+}
+
+LogicalResult RegisterHandoffOp::verify() {
+  return verifyRegisterAllocationContract(
+      getOperation(), getInput().getType(), getRegisterClass(),
+      getRegistersPerGroup(), /*allowUnencoded=*/true);
 }
 
 LogicalResult MfmaCommitOp::inferReturnTypes(
