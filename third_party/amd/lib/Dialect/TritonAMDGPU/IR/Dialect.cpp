@@ -818,10 +818,11 @@ LogicalResult MfmaCommitOp::verify() {
       auto dot = dyn_cast<ttg::DotOperandEncodingAttr>(tensorTy.getEncoding());
       auto mfma = dot ? dyn_cast<ttg::AMDMfmaEncodingAttr>(dot.getParent())
                       : ttg::AMDMfmaEncodingAttr();
-      if (!dot || !mfma || mfma.getVersion() != 4 || dot.getKWidth() != 8)
+      if (!dot || !mfma || mfma.getVersion() != 4 ||
+          !llvm::is_contained({4u, 8u}, dot.getKWidth()))
         return emitOpError()
                << "input " << index
-               << " must use a CDNA4 BF16 dot-operand layout with kWidth=8";
+               << " must use a CDNA4 BF16 dot-operand layout with kWidth=4/8";
       ArrayRef<unsigned> instr = mfma.getInstrShape();
       int64_t fragmentElements =
           dot.getOpIdx() == 0 ? instr[0] * instr[2] : instr[2] * instr[1];
@@ -893,14 +894,18 @@ LogicalResult ScheduledMfmaOp::verify() {
 
   auto aDot = dyn_cast<ttg::DotOperandEncodingAttr>(aTy.getEncoding());
   auto bDot = dyn_cast<ttg::DotOperandEncodingAttr>(bTy.getEncoding());
-  if (!aDot || aDot.getOpIdx() != 0 || aDot.getKWidth() != 8 ||
+  if (!aDot || aDot.getOpIdx() != 0 ||
+      !llvm::is_contained({4u, 8u}, aDot.getKWidth()) ||
       aDot.getParent() != mfma)
     return emitOpError(
-        "operand A must use the matching opIdx=0, kWidth=8 dot layout");
-  if (!bDot || bDot.getOpIdx() != 1 || bDot.getKWidth() != 8 ||
+        "operand A must use the matching opIdx=0, kWidth=4/8 dot layout");
+  if (!bDot || bDot.getOpIdx() != 1 ||
+      !llvm::is_contained({4u, 8u}, bDot.getKWidth()) ||
       bDot.getParent() != mfma)
     return emitOpError(
-        "operand B must use the matching opIdx=1, kWidth=8 dot layout");
+        "operand B must use the matching opIdx=1, kWidth=4/8 dot layout");
+  if (aDot.getKWidth() != bDot.getKWidth())
+    return emitOpError("operand dot layouts must use the same kWidth");
 
   SmallVector<int64_t> aRep =
       mfma.getRepForOperand(aTy.getShape(), aDot.getKWidth(), 0);

@@ -314,6 +314,13 @@ def test_d64_ticket_dispatch_contract_is_ci_discovered(q_shape, k_shape, causal,
     assert dispatch.family == family
     assert dispatch.selected_causal is causal
     amd_fa_bwd._validate_d64_dispatch(q_shape, k_shape, causal, dispatch)
+    deep_gqa8_m256 = (
+        family == "causal_gluon_gqa8"
+        and dispatch.owner_rows == 256
+    )
+    assert amd_fa_bwd._d64_causal_dq_waves_per_eu(q_shape[2], k_shape[2], dispatch) == (
+        2 if deep_gqa8_m256 else 0
+    )
 
 
 def test_d64_causal_gqa_score_prescaling_ast_contract():
@@ -1213,15 +1220,15 @@ def test_release_layout_rejects_unencoded_source():
 
 
 @triton.jit
-def _amd_scheduled_mfma_kernel(a_ptr, b_ptr, output_ptr):
+def _amd_scheduled_mfma_kernel(a_ptr, b_ptr, output_ptr, K_WIDTH: tl.constexpr):
     mma: tl.constexpr = tlx.amd_mfma_layout(
         version=4,
         instr_shape=[16, 16, 32],
         transposed=True,
         warps_per_cta=[1, 4],
     )
-    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
-    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=K_WIDTH)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=K_WIDTH)
     rows = tl.arange(0, 16)
     reduction = tl.arange(0, 32)
     cols = tl.arange(0, 64)
@@ -1249,8 +1256,13 @@ def _amd_scheduled_mfma_kernel(a_ptr, b_ptr, output_ptr):
 def test_amd_scheduled_mfma_compiles_gfx950():
     compiled = compile_for_gfx950(
         _amd_scheduled_mfma_kernel,
-        signature={"a_ptr": "*bf16", "b_ptr": "*bf16", "output_ptr": "*fp32"},
-        constexprs={},
+        signature={
+            "a_ptr": "*bf16",
+            "b_ptr": "*bf16",
+            "output_ptr": "*fp32",
+            "K_WIDTH": "constexpr",
+        },
+        constexprs={"K_WIDTH": 8},
     )
     assert "amdg.register_resident" in compiled.asm["ttir"]
     assert 'class "agpr" groups 4' in compiled.asm["ttir"]
@@ -1271,8 +1283,9 @@ def test_amd_scheduled_mfma_rejects_non_cdna4():
                 "a_ptr": "*bf16",
                 "b_ptr": "*bf16",
                 "output_ptr": "*fp32",
+                "K_WIDTH": "constexpr",
             },
-            constexprs={},
+            constexprs={"K_WIDTH": 8},
             target=GFX942,
         )
 
@@ -1287,6 +1300,24 @@ def test_amd_scheduled_mfma_initialize_discards_acc_gfx950():
         a,
         b,
         actual,
+        K_WIDTH=8,
+        num_warps=4,
+        matrix_instr_nonkdim=16,
+    )
+    torch.testing.assert_close(actual, a.float() @ b.float(), atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_amd_scheduled_mfma_kwidth4_correct_gfx950():
+    torch.manual_seed(0)
+    a = torch.randn((16, 32), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((32, 64), device="cuda", dtype=torch.bfloat16)
+    actual = torch.empty((16, 64), device="cuda", dtype=torch.float32)
+    _amd_scheduled_mfma_kernel[(1, )](
+        a,
+        b,
+        actual,
+        K_WIDTH=4,
         num_warps=4,
         matrix_instr_nonkdim=16,
     )

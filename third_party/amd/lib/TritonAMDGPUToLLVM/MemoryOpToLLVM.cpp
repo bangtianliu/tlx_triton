@@ -725,7 +725,7 @@ packMfmaDotOperandFragments(Value value, RankedTensorType tensorTy,
           ? dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(dotEncoding.getParent())
           : triton::gpu::AMDMfmaEncodingAttr();
   if (!mfmaEncoding || dotEncoding.getOpIdx() != opIdx ||
-      dotEncoding.getKWidth() != 8)
+      !llvm::is_contained({4u, 8u}, dotEncoding.getKWidth()))
     return failure();
 
   SmallVector<int64_t> rep = mfmaEncoding.getRepForOperand(
@@ -1307,16 +1307,19 @@ public:
             : ROCDL::mfma_f32_16x16x32_bf16::getOperationName();
     bool useLatencyAwareIntrinsic = op.getAccumulatorRole() == "transient";
 
-    SmallVector<Value> updatedFragments(numRepM * numRepN);
+    SmallVector<Value> updatedFragments = accumulatorFragments;
     // Keep one SSA chain per output fragment while making source order
-    // explicit across the grid. Native intrinsics expose transient chains to
-    // AMDGPU's MFMA hazard recognizer and machine scheduler. Direct inline
-    // assembly preserves the requested register class for persistent chains.
-    for (int64_t n = 0; n < numRepN; ++n) {
-      for (int64_t m = 0; m < numRepM; ++m) {
-        int64_t accumulatorIndex = m * numRepN + n;
-        Value current = accumulatorFragments[accumulatorIndex];
-        for (int64_t k = 0; k < numRepK; ++k) {
+    // explicit across the grid. Round-robin the K slices over independent
+    // output fragments so persistent inline-assembly chains expose enough
+    // distance between dependent MFMAs. Native intrinsics expose transient
+    // chains to AMDGPU's MFMA hazard recognizer and machine scheduler. Direct
+    // inline assembly preserves the requested register class for persistent
+    // chains.
+    for (int64_t k = 0; k < numRepK; ++k) {
+      for (int64_t n = 0; n < numRepN; ++n) {
+        for (int64_t m = 0; m < numRepM; ++m) {
+          int64_t accumulatorIndex = m * numRepN + n;
+          Value current = updatedFragments[accumulatorIndex];
           Value operandA = (*maybeA)[m * numRepK + k];
           Value operandB = (*maybeB)[n * numRepK + k];
           if (!useLatencyAwareIntrinsic) {
@@ -1348,27 +1351,26 @@ public:
             loweredOp.addAttribute("abid", rewriter.getI32IntegerAttr(0));
             loweredOp.addAttribute("blgp", rewriter.getI32IntegerAttr(0));
             current = rewriter.create(loweredOp)->getResult(0);
-            continue;
+          } else {
+            std::string constraints = outputConstraint.str();
+            constraints += "," + inputConstraint(aRegisterClass).str();
+            constraints += "," + inputConstraint(bRegisterClass).str();
+            SmallVector<Value> asmOperands{operandA, operandB};
+            if (!zeroThisInstruction) {
+              asmOperands.push_back(current);
+              constraints += ",0";
+            }
+            std::string mfmaAsm = mfmaAsmPrefix;
+            mfmaAsm += zeroThisInstruction ? "0" : "$0";
+            auto inlineAsm = LLVM::InlineAsmOp::create(
+                rewriter, loc, fragmentTy, asmOperands, mfmaAsm, constraints,
+                /*has_side_effects=*/true,
+                /*is_align_stack=*/false, LLVM::TailCallKind::None, asmDialect,
+                operandAttrs);
+            current = inlineAsm->getResult(0);
           }
-
-          std::string constraints = outputConstraint.str();
-          constraints += "," + inputConstraint(aRegisterClass).str();
-          constraints += "," + inputConstraint(bRegisterClass).str();
-          SmallVector<Value> asmOperands{operandA, operandB};
-          if (!zeroThisInstruction) {
-            asmOperands.push_back(current);
-            constraints += ",0";
-          }
-          std::string mfmaAsm = mfmaAsmPrefix;
-          mfmaAsm += zeroThisInstruction ? "0" : "$0";
-          auto inlineAsm = LLVM::InlineAsmOp::create(
-              rewriter, loc, fragmentTy, asmOperands, mfmaAsm, constraints,
-              /*has_side_effects=*/true,
-              /*is_align_stack=*/false, LLVM::TailCallKind::None, asmDialect,
-              operandAttrs);
-          current = inlineAsm->getResult(0);
+          updatedFragments[accumulatorIndex] = current;
         }
-        updatedFragments[accumulatorIndex] = current;
       }
     }
 

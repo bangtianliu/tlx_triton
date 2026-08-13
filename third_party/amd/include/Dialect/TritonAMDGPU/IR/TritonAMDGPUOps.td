@@ -869,9 +869,10 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
   let description = [{
     Computes the full per-wave Cartesian product of the native fragments in
     `a` and `b`, replacing every corresponding fragment in `acc`. Native
-    instructions are emitted in N-major, M-minor, K-reduction order, so each
-    output fragment remains an independent dependency chain while consecutive
-    native K fragments stay on that chain.
+    instructions are emitted in K-major, N-major, M-minor order. This
+    round-robins each K slice over the independent output fragments before
+    returning to an accumulator dependency chain, while preserving one SSA
+    chain per output fragment.
 
     `resident_operand` is `none`, `lhs`, or `rhs` and identifies an input
     intentionally carried through the surrounding software pipeline.

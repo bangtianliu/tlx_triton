@@ -369,6 +369,54 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
 
 // -----
 
+#scheduled_mismatch_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#scheduled_mismatch_lhs = #ttg.dot_op<{opIdx = 0, parent = #scheduled_mismatch_mma, kWidth = 4}>
+#scheduled_mismatch_rhs = #ttg.dot_op<{opIdx = 1, parent = #scheduled_mismatch_mma, kWidth = 8}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_rejects_mismatched_kwidth(
+      %a: tensor<16x32xbf16, #scheduled_mismatch_lhs>,
+      %b: tensor<32x16xbf16, #scheduled_mismatch_rhs>) {
+    %acc = arith.constant dense<0.000000e+00> :
+        tensor<16x16xf32, #scheduled_mismatch_mma>
+    // expected-error @+1 {{operand dot layouts must use the same kWidth}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient"
+        register_class "auto" initialize true
+        : tensor<16x32xbf16, #scheduled_mismatch_lhs>,
+          tensor<32x16xbf16, #scheduled_mismatch_rhs>,
+          tensor<16x16xf32, #scheduled_mismatch_mma>
+          -> tensor<16x16xf32, #scheduled_mismatch_mma>
+    tt.return
+  }
+}
+
+// -----
+
+#scheduled_unsupported_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#scheduled_unsupported_lhs = #ttg.dot_op<{opIdx = 0, parent = #scheduled_unsupported_mma, kWidth = 16}>
+#scheduled_unsupported_rhs = #ttg.dot_op<{opIdx = 1, parent = #scheduled_unsupported_mma, kWidth = 16}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_rejects_unsupported_kwidth(
+      %a: tensor<16x64xbf16, #scheduled_unsupported_lhs>,
+      %b: tensor<64x16xbf16, #scheduled_unsupported_rhs>) {
+    %acc = arith.constant dense<0.000000e+00> :
+        tensor<16x16xf32, #scheduled_unsupported_mma>
+    // expected-error @+1 {{operand A must use the matching opIdx=0, kWidth=4/8 dot layout}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient"
+        register_class "auto" initialize true
+        : tensor<16x64xbf16, #scheduled_unsupported_lhs>,
+          tensor<64x16xbf16, #scheduled_unsupported_rhs>,
+          tensor<16x16xf32, #scheduled_unsupported_mma>
+          -> tensor<16x16xf32, #scheduled_unsupported_mma>
+    tt.return
+  }
+}
+
+// -----
+
 // Gather with an index layout that distributes values across lanes (invalid).
 // parent blocked: threadsPerWarp = [32, 1] → lanes map to dim 0.
 // slice dim 1 → 1D tensor where each lane holds a different value.
