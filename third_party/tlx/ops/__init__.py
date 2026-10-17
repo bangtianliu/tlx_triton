@@ -119,7 +119,7 @@ def flash_attn(q, k, v, causal=False, sm_scale=None, *, space="full"):
 
 
 def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full"):
-    """Differentiable Blackwell MXFP8 attention over BF16 master tensors.
+    """Differentiable Blackwell/gfx950 MXFP8 attention over BF16 master tensors.
 
     Q, K, and V are quantized internally to E4M3 data with E8M0 block scales.
     The initial implementation supports D128 and sequence lengths divisible by
@@ -130,6 +130,8 @@ def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full"):
     if q.shape != k.shape or q.shape != v.shape:
         raise InvalidInput("tlx.ops.flash_attn_mxfp8 expects Q/K/V to have identical shapes; "
                            f"got q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}")
+    if any(size == 0 for size in q.shape):
+        raise InvalidInput("tlx.ops.flash_attn_mxfp8 expects nonempty Q/K/V dimensions")
     if q.dtype != k.dtype or q.dtype != v.dtype or q.device != k.device or q.device != v.device:
         raise InvalidInput("tlx.ops.flash_attn_mxfp8 expects Q/K/V to have the same dtype and device")
     if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
@@ -139,7 +141,9 @@ def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full"):
     fn, spec = impl_for("flash_attn_mxfp8", device=q.device)
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[-1], N_CTX=q.shape[-2])
     check_backward(spec, q, k, v)
-    return fn(q, k, v, causal, sm_scale, space=space)
+    import torch
+    with torch.cuda.device(q.device):
+        return fn(q, k, v, causal, sm_scale, space=space)
 
 
 def hstu_attn_dev(q, k, v, seq_offsets, max_seq_len, attn_scale, alpha=None, causal=True, num_targets=None,

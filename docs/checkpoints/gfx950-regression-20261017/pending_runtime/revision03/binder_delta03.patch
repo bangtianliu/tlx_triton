@@ -1,0 +1,237 @@
+--- finalize_runtime02.py
++++ finalize_runtime03.py
+@@ -12,6 +12,7 @@
+ PHYSICAL = ROOT.parent / 'physical_plan01'
+ FROZEN = {'template_READY': {'path': '/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/SOURCE_READY_manifest01.json', 'sha256': 'bd44f992606dc5887f43bb3f9975b46d623416bfef988ece93f15298aa4727ff', 'bytes': 4142}, 'semantic_authorization': {'path': '/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/post_semantic_admission01.json', 'sha256': 'a6c103ccd26fdfecc30866171fdaa6fc523d2d9c93df2e2cd6b3023830b4f2a8', 'bytes': 8138}, 'plan_template': {'path': '/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/runtime_plan_template01.json', 'sha256': '51f1be2bd0e6eea12b3b4183571b34ca0b7e9174c23ac2aba55b755f6401b9a0', 'bytes': 19930}, 'pipeline_contracts': {'path': '/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/pipeline_contracts_template01.json', 'sha256': '116ba11601df81068705db4945654e711b990455ba784a2582bc38748695bb7f', 'bytes': 299800}, 'pair_template': {'path': '/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/pair_validate_template01.py', 'sha256': 'abff7702907711542dbdbce602b834821acb2dfde01640f895ffa53153f2f97b', 'bytes': 15551}, 'constructor_template': {'path': '/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/constructor_smoke_template02.py', 'sha256': '8761c763c86b9c387e19cbb8fe2a0190e07af8a1b5eb6dc5dcde3d31d628a809', 'bytes': 7940}, 'launcher_template': {'path': '/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/launch_pair_template02.py', 'sha256': '38e96a4908f2f25c7a8d335dae07fd377a4317aa8e2deb447a1864ce4bdc9777', 'bytes': 8568}, 'command_template': {'path': '/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/root_command_template01.json', 'sha256': 'b3cb2fa14e60a64ebb86890d7c171250c7bb57c1294e69a4e2ca4199ba8a1ef6', 'bytes': 7644}}
+ TEXT_SUFFIXES = {'.py', '.json', '.txt', '.md', '.amdgcn', '.ttir', '.ttgir', '.llir', '.patch', '.td', '.cpp', '.cc'}
++COMBINED_CONTRACT = {'path': '/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/combined_binding_revision03/binding_contract03.json', 'bytes': 12847, 'sha256': '471e503a23a06ae099c68b927ff04da844822dca31653fb60de6be07799edf31'}
+ 
+ 
+ def require(value, message):
+@@ -126,12 +127,67 @@
+         'constructor_executed': False, 'GPU_admission': False})
+ 
+ 
++def combined_contract():
++    contract = read(COMBINED_CONTRACT)
++    require(contract['schema'] == 'MHA_SINK_COMBINED_BINDER_CONTRACT_V3', 'Combined contract schema differs')
++    for record in contract['old_files'].values():
++        require(pin(record['path']) == record, 'A frozen constructor artifact changed')
++    for name in ('combiner_source', 'combination_plan', 'closure_result', 'closure_execution',
++                 'closure_independent_review', 'raw_physical_result', 'raw_physical_execution',
++                 'raw_memory_readiness', 'raw_native_audit'):
++        require(pin(contract[name]['path']) == contract[name], 'A combined contract input changed')
++    return contract
++
++
++def check_constructor_reuse(inputs):
++    contract = combined_contract()
++    old = contract['old_files']
++    require(inputs['constructor_preparation'] == old['constructor_preparation_receipt01.json']
++            and inputs['constructor_result'] == old['constructor_smoke_result01.json'], 'Constructor reuse pins differ')
++    preparation = read(inputs['constructor_preparation'])
++    old_inputs = read(old['root_binding_inputs_prepare01.json'])
++    old_ready = read(old['SOURCE_READY_manifest03.json'])
++    require(old_ready['binder'] == old['finalize_runtime02.py'], 'Old constructor binder differs')
++    require(old_inputs['binder_READY'] == old['SOURCE_READY_manifest03.json']
++            and old_inputs['binder_source_review'] == old['old_binder_review'], 'Old preparation bindings differ')
++    require(old['old_binder_review']['sha256'] == contract['old_constructor_binder_review_sha256']
++            == '69147bc9ca441ea1be26ecd17d25b8c506d747f80c5058c5a658f9c79240f823', 'Old constructor review differs')
++    check_review(old['old_binder_review'], 'MHA_SINK_RUNTIME_BINDER_SOURCE_REVIEW_V1', old_ready['files'])
++    require(preparation['inputs'] == old['root_binding_inputs_prepare01.json']
++            and preparation['binder_source_review'] == old['old_binder_review']
++            and preparation['runtime_source_review'] == inputs['runtime_source_review'], 'Constructor preparation provenance differs')
++    require(preparation['plan'] == old['constructor_plan01.json']
++            and preparation['source'] == old['constructor_smoke01.py']
++            and preparation['command'] == old['root_constructor_command01.json'], 'Old constructor source pins differ')
++    old_plan = read(preparation['plan'])
++    require(old_plan['constructor_preparation'] == {
++        'runtime_source_review': preparation['runtime_source_review'],
++        'binder_source_review': old['old_binder_review'], 'binder_READY': old['SOURCE_READY_manifest03.json'],
++        'inputs': old['root_binding_inputs_prepare01.json']}, 'Old constructor plan provenance differs')
++    for name, schema, result_name, command_name in (
++        ('root_prepare_execution01.json', 'ROOT_MHA_CONSTRUCTOR_PREPARATION_EXECUTION_V1',
++         'constructor_preparation_receipt01.json', 'root_prepare_command01.json'),
++        ('root_constructor_execution01.json', 'ROOT_MHA_SIX_CONSTRUCTORS_EXECUTION_V1',
++         'constructor_smoke_result01.json', 'root_constructor_execution_command01.json')):
++        execution = read(old[name])
++        require(execution['schema'] == schema and execution['returncode'] == 0
++                and execution['result'] == old[result_name] and execution['command'] == old[command_name]
++                and execution['GPU_admitted'] is False, 'Old constructor execution differs')
++    old_ast = ast.parse(Path(old['finalize_runtime02.py']['path']).read_text())
++    new_ast = ast.parse(Path(__file__).read_text())
++    def preparation_AST(tree):
++        node = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'prepare')
++        return ast.dump(node, include_attributes=False)
++    before, after = preparation_AST(old_ast), preparation_AST(new_ast)
++    require(before == after and hashlib.sha256(before.encode()).hexdigest()
++            == contract['prepare_function_AST_SHA256'], 'Constructor preparation AST changed')
++    return preparation
++
++
+ def check_constructor(inputs, contracts):
+-    preparation = read(inputs['constructor_preparation'])
++    preparation = check_constructor_reuse(inputs)
+     require(preparation['schema'] == 'MHA_SIX_CONSTRUCTOR_PREPARATION_V1' and preparation['passed'] is True,
+             'Constructor preparation failed')
+-    require(preparation['runtime_source_review'] == inputs['runtime_source_review']
+-            and preparation['binder_source_review'] == inputs['binder_source_review'], 'The source reviews changed')
+     require(preparation['plan'] == pin(ROOT / 'constructor_plan01.json')
+             and preparation['source'] == pin(ROOT / 'constructor_smoke01.py'), 'Constructor sources changed')
+     smoke = read(inputs['constructor_result'])
+@@ -166,11 +222,42 @@
+     require(ready['schema'] == 'MHA_SINK_ONE_IMAGE_PHYSICAL_SOURCE_READY_V1', 'The physical source schema differs')
+     for value in ready['files']:
+         require(pin(value['path']) == value, 'A physical source input changed')
+-    physical = read(inputs['physical_result'])
+-    require(Path(inputs['physical_result']['path']).resolve() == PHYSICAL / 'physical_result01/root_physical_readiness01.json',
++    contract = combined_contract()
++    combined = read(inputs['physical_result'])
++    require(Path(inputs['physical_result']['path']).resolve() == Path(contract['combined_result_path']),
++            'The combined output path differs')
++    require(combined['schema'] == 'MHA_SINK_COMBINED_PHYSICAL_READINESS_V2'
++            and combined['passed_bounded_checks'] is True and combined['v8_violations'] == 0,
++            'The combined physical check failed')
++    require(combined['raw_physical_result'] == contract['raw_physical_result']
++            and combined['raw_physical_execution'] == contract['raw_physical_execution']
++            and combined['raw_memory_readiness'] == contract['raw_memory_readiness']
++            and combined['saved_row_closure'] == contract['closure_result']
++            and combined['closure_execution'] == contract['closure_execution']
++            and combined['closure_independent_review'] == contract['closure_independent_review'],
++            'The raw failure and closure provenance differ')
++    require(combined['raw_passed_bounded_checks'] is False and combined['raw_returncode'] == 1
++            and combined['raw_readiness_counts'] == {'LDS': {'proofs': 2426, 'unresolved': 0},
++                                                   'VMEM': {'proofs': 308, 'unresolved': 81}},
++            'The combined result changed the raw failure')
++    require(combined['readiness_counts'] == {'LDS': {'proofs': 2426, 'unresolved': 0},
++                                           'VMEM': {'proofs': 389, 'unresolved': 0}}
++            and combined['closed_saved_row_count'] == 81 and combined['closure_negative_control_count'] == 5,
++            'The combined closure counts differ')
++    require(combined['combiner_source'] == contract['combiner_source']
++            and combined['combination_plan'] == contract['combination_plan']
++            and combined['combination_source_review'] == inputs['binder_source_review']
++            and combined['combination_command'] == inputs['physical_command'], 'Combined source bindings differ')
++    require(combined['aggregation_only'] is True and combined['audit_performed'] is False
++            and combined['physical_audit_count'] == 1 and combined['native_v8_rerun'] is False
++            and combined['original_native_parser_rerun'] is False
++            and combined['GPU_admitted'] is False and combined['runtime_admitted'] is False,
++            'Combined aggregation scope differs')
++    physical = read(combined['raw_physical_result'])
++    require(Path(combined['raw_physical_result']['path']).resolve() == PHYSICAL / 'physical_result01/root_physical_readiness01.json',
+             'The physical output path differs')
+     require(physical['schema'] == 'MHA_SINK_ONE_IMAGE_PHYSICAL_READINESS_V1'
+-            and physical['passed_bounded_checks'] is True and physical['v8_violations'] == 0, 'The physical check failed')
++            and physical['passed_bounded_checks'] is False and physical['v8_violations'] == 0, 'The raw physical result changed')
+     require(physical['CPU'] == plan['frozen_inputs']['candidate_CPU'] and physical['assembly'] == semantic['assembly']
+             and physical['candidate_image_reference_only'] == semantic['image'], 'The physical image binding differs')
+     require(physical['baseline_audit'] is False and physical['audit_count_limit'] == 1
+@@ -188,9 +275,25 @@
+     require(expected['adapter'] in ready['files'], 'The physical adapter was not in its READY manifest')
+     for value in expected.values():
+         require(pin(value['path']) == value, 'A physical bound input changed')
+-    for kind in ('LDS', 'VMEM'):
+-        require(physical['readiness_counts'][kind]['proofs'] > 0
+-                and physical['readiness_counts'][kind]['unresolved'] == 0, 'A direct-memory readiness gate failed')
++    require(physical['readiness_counts'] == combined['raw_readiness_counts'], 'Raw readiness counts differ')
++    ledger = read(combined['memory_readiness'])
++    raw_memory = read(physical['memory_readiness'])
++    closure = read(contract['closure_result'])
++    require(ledger['schema'] == 'MHA_SINK_COMBINED_MEMORY_LEDGER_V2'
++            and ledger['raw_memory_readiness'] == physical['memory_readiness']
++            and ledger['saved_row_closure'] == contract['closure_result']
++            and ledger['original_proofs_preserved'] is True and ledger['closed_saved_row_count'] == 81,
++            'Combined memory ledger provenance differs')
++    require(ledger['LDS'] == raw_memory['LDS'] and ledger['VMEM']['proofs'][:308] == raw_memory['VMEM']['proofs']
++            and ledger['VMEM']['unresolved'] == [] and len(ledger['VMEM']['proofs']) == 389,
++            'Original memory proofs changed')
++    require(ledger['VMEM']['proofs'][308:] == [dict(row['saved_row_exact'], valid_wait_lines=[row['wait_line']])
++            for row in closure['proofs']], 'Closed saved rows differ')
++    require(combined['audit'] == physical['audit'] == contract['raw_native_audit']
++            and combined['CPU'] == physical['CPU'] and combined['assembly'] == physical['assembly']
++            and combined['candidate_image_reference_only'] == physical['candidate_image_reference_only'],
++            'Combined image or native audit differs')
++    require(read(physical['audit'])['violations'] == [], 'Raw native audit has violations')
+     for key in ('native_v8', 'audit', 'memory_readiness'):
+         require(pin(physical[key]['path']) == physical[key], 'A physical output changed')
+     reservation_path = PHYSICAL / 'physical_result01/root_audit_reservation01.json'
+@@ -203,21 +306,44 @@
+             'The new-image audit reservation count differs')
+     require(len(list(PHYSICAL.glob('physical_result*/candidate_native_v8_audit01.json'))) == 1,
+             'The new-image audit count differs')
+-    execution = read(inputs['physical_execution'])
+-    require(execution['schema'] == 'ROOT_MHA_SINK_ONE_IMAGE_AUDIT_EXECUTION_V1' and execution['returncode'] == 0,
+-            'The root physical execution failed')
+-    require(execution['command'] == inputs['physical_command'] and execution['result'] == inputs['physical_result'],
++    execution = read(combined['raw_physical_execution'])
++    require(execution['schema'] == 'ROOT_MHA_SINK_ONE_IMAGE_AUDIT_EXECUTION_V1' and execution['returncode'] == 1,
++            'The raw physical execution changed')
++    require(execution['command'] == pin(PHYSICAL / 'root_command01.json')
++            and execution['result'] == combined['raw_physical_result'],
+             'The root physical execution pins differ')
+-    command = read(inputs['physical_command'])
++    command = read(execution['command'])
+     require(command['argv'] == ['/usr/bin/python3', '-B', expected['adapter']['path'],
+                                '--root-admission-sha256', FROZEN['semantic_authorization']['sha256']],
+             'The actual physical command differs')
+     require(command['cwd'] == str(PHYSICAL), 'The physical command directory differs')
++    aggregation_execution = read(inputs['physical_execution'])
++    require(aggregation_execution['schema'] == contract['combined_execution_schema']
++            and aggregation_execution['returncode'] == 0
++            and aggregation_execution['command'] == inputs['physical_command']
++            and aggregation_execution['result'] == inputs['physical_result'], 'Root aggregation execution differs')
++    require(aggregation_execution['aggregation_only'] is True and aggregation_execution['audit_performed'] is False
++            and aggregation_execution['physical_audit_count'] == 1
++            and aggregation_execution['GPU_admitted'] is False, 'Root aggregation scope differs')
++    command = read(inputs['physical_command'])
++    require(Path(inputs['physical_command']['path']).resolve() == Path(contract['combined_command_path'])
++            and command['schema'] == 'ROOT_MHA_COMBINED_READINESS_COMMAND_V2'
++            and command['source'] == contract['combiner_source'] and command['plan'] == contract['combination_plan']
++            and command['source_review'] == inputs['binder_source_review'], 'Aggregation command bindings differ')
++    require(command['argv'] == ['/usr/bin/python3', '-B', contract['combiner_source']['path'],
++            '--plan-sha256', contract['combination_plan']['sha256'],
++            '--source-sha256', contract['combiner_source']['sha256'],
++            '--source-review', inputs['binder_source_review']['path'],
++            '--source-review-sha256', inputs['binder_source_review']['sha256']], 'Aggregation arguments differ')
++    require(command['cwd'] == str(Path(contract['combiner_source']['path']).parent)
++            and command['aggregation_only'] is True, 'Aggregation command scope differs')
+     review = read(inputs['physical_result_review'])
+-    require(review['schema'] == 'MHA_SINK_ONE_IMAGE_PHYSICAL_RESULT_REVIEW_V1' and review['passed'] is True
++    require(review['schema'] == contract['combined_result_review_schema'] and review['passed'] is True
+             and review['findings'] == [] and review['physical_result'] == inputs['physical_result']
+-            and review['root_execution'] == inputs['physical_execution'], 'The independent physical review differs')
+-    return physical
++            and review['root_execution'] == inputs['physical_execution']
++            and review['raw_physical_result'] == contract['raw_physical_result']
++            and review['saved_row_closure'] == contract['closure_result'], 'Independent combined review differs')
++    return combined
+ 
+ 
+ def check_quiet(record, expected):
+@@ -243,7 +369,7 @@
+     plan, semantic = common(inputs)
+     contracts = read(FROZEN['pipeline_contracts'])
+     preparation = check_constructor(inputs, contracts)
+-    check_physical(inputs, plan, semantic)
++    combined = check_physical(inputs, plan, semantic)
+     check_quiet(inputs['fresh_quiet_window'], plan['physical_GPU'])
+     new_bindings = {'physical_readiness': inputs['physical_result'], 'root_physical_execution': inputs['physical_execution'],
+         'independent_physical_review': inputs['physical_result_review'], 'independent_runtime_source_review': inputs['runtime_source_review']}
+@@ -252,6 +378,10 @@
+         'baseline_CPU': plan['frozen_inputs']['baseline_CPU'], 'candidate_CPU': plan['frozen_inputs']['candidate_CPU'],
+         'recorded_main_images': plan['recorded_main_images'], 'required_new_bindings': new_bindings,
+         'physical_readiness_passed': True, 'physical_audit_count': 1, 'baseline_physical_audit_count': 0,
++        'raw_physical_result': combined['raw_physical_result'],
++        'raw_physical_execution': combined['raw_physical_execution'],
++        'saved_row_closure': combined['saved_row_closure'], 'closure_execution': combined['closure_execution'],
++        'aggregation_only_physical_revision': True, 'constructors_reused': True,
+         'constructor_plan': preparation['plan'], 'constructor_result': inputs['constructor_result'],
+         'binder_source_review': inputs['binder_source_review'], 'fresh_quiet_window': inputs['fresh_quiet_window'],
+         'original_zero_spill_gate_passed': False, 'production_adoption': False, 'performance_gain_proven': False,
+@@ -290,6 +420,7 @@
+     require(record['sha256'] == args.bindings_sha256, 'The root binding inputs changed')
+     inputs = read(record)
+     require(inputs['schema'] == 'ROOT_MHA_SINK_FINITE_BINDING_INPUTS_V1', 'The binding input schema differs')
++    require(args.phase == 'finalize', 'Reuse the completed constructor preparation')
+     if args.phase == 'prepare-constructors':
+         prepare(inputs, record)
+     else:

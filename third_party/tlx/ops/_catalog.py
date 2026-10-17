@@ -161,6 +161,17 @@ CATALOG: tuple[OpSpec, ...] = (
         supports_backward=True,
     ),
     OpSpec(
+        op="flash_attn_mxfp8",
+        arch="gfx950",
+        variant="scaled_mfma",
+        impl="triton.tlx.ops.kernels.flash_attn_mxfp8.gfx950:flash_attn_mxfp8",
+        dtypes=_BF16,
+        # Direct-LDS buffer loads use signed i32 offsets within each head.
+        accepts=lambda d:
+        (d.get("HEAD_DIM") == 128 and d.get("N_CTX", 0) > 0 and d["N_CTX"] % 256 == 0 and d["N_CTX"] * 128 < 2**31),
+        supports_backward=True,
+    ),
+    OpSpec(
         op="hstu_attn_dev",
         arch="sm100",
         variant="ws",

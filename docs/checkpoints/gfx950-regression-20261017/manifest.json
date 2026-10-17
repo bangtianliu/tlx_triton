@@ -1,0 +1,116 @@
+{
+  "schema": "GFX950_REGRESSION_CHECKPOINT_V1",
+  "base_commit": "223caf4a0",
+  "status": "incomplete",
+  "relocated_scripts_are_archival_only": true,
+  "files": [
+    {
+      "path": "evidence/all10_report.txt",
+      "original_path": ".campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/historical_all10_replay01/current_finalization04/all10_summary02/report02.txt",
+      "bytes": 5481,
+      "sha256": "6987514ae05c07dff366cbb01e09b03a6854bad98c82e8a918c3d5e29c08d15d"
+    },
+    {
+      "path": "evidence/pause.json",
+      "original_path": ".campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/tlx_redundant_accumulator_pin_recovery01/progress185_pause.json",
+      "bytes": 2155,
+      "sha256": "f5c2d199f1034122b188a7fed16dc6177976d730369f62587897f5effe319a07"
+    },
+    {
+      "path": "evidence/progress184.json",
+      "original_path": ".campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/tlx_redundant_accumulator_pin_recovery01/progress184.json",
+      "bytes": 4860,
+      "sha256": "603ea7e6053b4ce908d34e740f80cedbaeda3081cef16f6b22d5bf0634f475f0"
+    },
+    {
+      "path": "frozen_sources/accepted_gqa8_k3_gqa16_k5.py",
+      "original_path": ".campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/kernel_level_recovery01/candidates/gqa8_k3_gqa16_k5_recovery01.py",
+      "bytes": 557539,
+      "sha256": "0e54eeef59143160dd4c1514c2c844008089141d7d537dc60cb64b8a85a5746e"
+    },
+    {
+      "path": "frozen_sources/gqa16_phase1_early_Q_fragment_boundary01.py",
+      "original_path": ".campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/early_Q_fragment_boundary_recovery01/gqa16_phase1_early_Q_fragment_boundary01.py",
+      "bytes": 559846,
+      "sha256": "39763948c41ac2ac74eca0505aa276e7b4390be3e9520205632085a606fd7f04"
+    },
+    {
+      "path": "pending_runtime/finalize_runtime03.py",
+      "original_path": ".campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/finalize_runtime03.py",
+      "bytes": 34074,
+      "sha256": "ea88a238b6586c8ec1263c77f97b051937868603b9e17196fd980a2169bc6a3e"
+    },
+    {
+      "path": "pending_runtime/combine_readiness01.py",
+      "original_path": ".campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/physical_plan01/VMEM_saved_row_closure02/combine_readiness01.py",
+      "bytes": 12984,
+      "sha256": "e651e46c86e53b728cd44c3e4d5cb8c19b3a5afe0ebd56d20511064971e1e630"
+    },
+    {
+      "path": "pending_runtime/closure_result01.json",
+      "original_path": ".campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/physical_plan01/VMEM_saved_row_closure02/closure_result01/result01.json",
+      "bytes": 73796,
+      "sha256": "ee834b0514f6b57b49c1bdaeba87c72764101e58db50f956a09b77e9b100ad6d"
+    },
+    {
+      "path": "pending_runtime/revision03/SOURCE_READY_manifest03.json",
+      "original_path": ".campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/combined_binding_revision03/SOURCE_READY_manifest03.json",
+      "bytes": 9356,
+      "sha256": "90f19f55b1104d730c6b599bbabcd4046c351b111f16150a4c451a559dadaf13"
+    },
+    {
+      "path": "pending_runtime/revision03/review_request03.json",
+      "original_path": ".campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/combined_binding_revision03/review_request03.json",
+      "bytes": 8896,
+      "sha256": "5c2a1de84d0ff7e011cf0e3f5d040a9a270df2bb0805ede4c7d9a95e076e313e"
+    },
+    {
+      "path": "pending_runtime/revision03/binding_contract03.json",
+      "original_path": ".campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/combined_binding_revision03/binding_contract03.json",
+      "bytes": 12847,
+      "sha256": "471e503a23a06ae099c68b927ff04da844822dca31653fb60de6be07799edf31"
+    },
+    {
+      "path": "pending_runtime/revision03/combined_result_review_template03.json",
+      "original_path": ".campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/combined_binding_revision03/combined_result_review_template03.json",
+      "bytes": 1283,
+      "sha256": "0004fb40a4b202c166bc1138febd5c254c4eeab854c3a22785a63e070a135a04"
+    },
+    {
+      "path": "pending_runtime/revision03/root_commands_template03.json",
+      "original_path": ".campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/combined_binding_revision03/root_commands_template03.json",
+      "bytes": 3344,
+      "sha256": "be20e602cf9fa4224e8e393a7fd44c78a6367d798d77751860a70045958a5d90"
+    },
+    {
+      "path": "pending_runtime/revision03/plan03.md",
+      "original_path": ".campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/combined_binding_revision03/plan03.md",
+      "bytes": 1624,
+      "sha256": "c148025bcb90af1f42ca8b54d25ca6cf5d14e443ce02da43636f14d4bed0b2b0"
+    },
+    {
+      "path": "pending_runtime/revision03/source_checks03.json",
+      "original_path": ".campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/combined_binding_revision03/source_checks03.json",
+      "bytes": 2045,
+      "sha256": "97dc69f42d240501cca44075d11d40416e56f6771fd0d7f8b6f19e842b1381d8"
+    },
+    {
+      "path": "pending_runtime/revision03/binder_delta03.patch",
+      "original_path": ".campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/combined_binding_revision03/binder_delta03.patch",
+      "bytes": 21638,
+      "sha256": "5b5368993c6a2939133dc0d7a5d021fa1e100fd44e72d51fdaffa633de704fdd"
+    },
+    {
+      "path": "pending_runtime/revision03/root_binding_inputs_template03.json",
+      "original_path": ".campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/combined_binding_revision03/root_binding_inputs_template03.json",
+      "bytes": 2287,
+      "sha256": "6fb353c174901cdbb20a9db9f337c4c93c8b88fc8fd6a8144ace73b077d38165"
+    },
+    {
+      "path": "pending_runtime/revision03/combined_root_command_template03.json",
+      "original_path": ".campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/combined_binding_revision03/combined_root_command_template03.json",
+      "bytes": 3074,
+      "sha256": "63dcdc10911c358d7c87dd841b6fae043361bed539f4bbf24b3d4389fdaa0fa8"
+    }
+  ]
+}

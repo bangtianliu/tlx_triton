@@ -3407,6 +3407,8 @@ def test_gqa_oversized_batches_rebase_buffer_offsets_gfx950(causal):
         constexprs={
             "SM_SCALE": 0.125,
             "IS_CAUSAL": causal,
+            "BATCH": 1,
+            "SPLIT_Q": 1,
             "HQ": 520,
             "HK": 520,
             "N": 16384,
@@ -3419,8 +3421,8 @@ def test_gqa_oversized_batches_rebase_buffer_offsets_gfx950(causal):
     ttir = compiled.asm["ttir"]
     ttgir = compiled.asm["ttgir"]
     dummy_clamps = re.findall(r"arith\.maxsi %dq_step, (?P<floor>%[\w_]+)", ttir)
-    assert len(dummy_clamps) == 1
     if causal:
+        assert len(dummy_clamps) == 1
         assert dummy_clamps[0] != "%c0_i32"
         first_active_stride = block_n // block_m
         assert re.search(
@@ -3430,7 +3432,9 @@ def test_gqa_oversized_batches_rebase_buffer_offsets_gfx950(causal):
             re.MULTILINE,
         )
     else:
-        assert dummy_clamps[0] == "%c0_i32"
+        # Full unsplit MHA omits the seeded zero dQ phase. Every remaining
+        # delayed dQ targets a real tile and needs no dummy address clamp.
+        assert not dummy_clamps
     assert ttgir.count("tlx.rematerialize_coordinates_group = 21 : i32") == (9 if causal else 0)
     assert "amdgcn" in compiled.asm
 
@@ -3449,6 +3453,58 @@ def test_gqa_oversized_head_rebases_native_conversion_gfx950():
         },
     )
 
+    assert "amdgcn" in compiled.asm
+
+
+@pytest.mark.parametrize(
+    "hq,hkv,n_ctx,split_q",
+    [
+        pytest.param(520, 520, 16384, 3, id="oversized-partial-buffer"),
+        pytest.param(4096, 1, 4096, 8192, id="partition-product-exceeds-i32"),
+    ],
+)
+def test_gqa_split_query_partial_offsets_gfx950(hq, hkv, n_ctx, split_q):
+    from triton.tlx.ops.kernels.flash_attn.gfx950_bwd import _attn_bwd_dkdv_dq_d128_gqa_kernel
+
+    # Exercise oversized FP32 partial buffers and partition products without
+    # allocating multi-gigabyte tensors. Match normal aligned JIT inputs.
+    kernel = _attn_bwd_dkdv_dq_d128_gqa_kernel
+    signature = {
+        "Q": "*bf16",
+        "K": "*bf16",
+        "V": "*bf16",
+        "DO": "*bf16",
+        "LSE": "*fp32",
+        "Delta": "*fp32",
+        "DQ_ACC": "*bf16",
+        "DK": "*fp32",
+        "DV": "*fp32",
+    }
+    source = ASTSource(
+        fn=kernel,
+        signature=signature,
+        attrs={(kernel.arg_names.index(name), ): [("tt.divisibility", 16)]
+               for name in signature},
+        constexprs={
+            "SM_SCALE": 0.125,
+            "IS_CAUSAL": False,
+            "BATCH": 2,
+            "SPLIT_Q": split_q,
+            "HQ": hq,
+            "HK": hkv,
+            "N": n_ctx,
+            "D": 128,
+            "BLOCK_M": 16,
+            "BLOCK_N": 256,
+        },
+    )
+    compiled = triton_compile(source, target=GFX950)
+    ttir = compiled.asm["ttir"]
+    assert re.search(r"arith\.extsi %split_id(?:_\d+)? : i32 to i64", ttir)
+    for boundary in ("outer_start", "outer_end"):
+        assert re.search(rf"arith\.divsi %{boundary}(?:_\d+)?, %c{split_q}_i64 : i64", ttir)
+    assert re.search(r"tt\.addptr %DK, %partial_base(?:_\d+)? : !tt\.ptr<f32>, i64", ttir)
+    assert re.search(r"tt\.addptr %DV, %partial_base(?:_\d+)? : !tt\.ptr<f32>, i64", ttir)
     assert "amdgcn" in compiled.asm
 
 

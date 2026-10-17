@@ -1,0 +1,39 @@
+{
+  "schema": "PR3993_USER_REQUESTED_PAUSE_V1",
+  "request": "Pause to save tokens. Resume when a GPU is available.",
+  "status": "paused",
+  "timestamp": "2026-10-16T23:02:43.530Z",
+  "prior_checkpoint": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/tlx_redundant_accumulator_pin_recovery01/progress184.json",
+  "production_changes_this_turn": false,
+  "root_tool_sessions_running": [],
+  "gpu_benchmark_started": false,
+  "agents": "No worker remains active. Pending agent initialization was interrupted.",
+  "completed": [
+    "All six MHA constructors passed.",
+    "The saved VMEM closure passed all 81 rows and five negative controls."
+  ],
+  "pending": [
+    "Independently review the replacement combiner and binder03 packet.",
+    "Execute aggregation and finalize exact runtime bindings.",
+    "Verify a fresh quiet window on physical GPU 7 before timing.",
+    "Run the matched MHA1K test and inspect all correctness, ownership, and image gates."
+  ],
+  "replacement_packet_sha256": "5c2a1de84d0ff7e011cf0e3f5d040a9a270df2bb0805ede4c7d9a95e076e313e",
+  "replacement_ready_sha256": "90f19f55b1104d730c6b599bbabcd4046c351b111f16150a4c451a559dadaf13",
+  "replacement_binder_sha256": "ea88a238b6586c8ec1263c77f97b051937868603b9e17196fd980a2169bc6a3e",
+  "replacement_combiner_sha256": "e651e46c86e53b728cd44c3e4d5cb8c19b3a5afe0ebd56d20511064971e1e630",
+  "replacement_contract_sha256": "471e503a23a06ae099c68b927ff04da844822dca31653fb60de6be07799edf31",
+  "source_review": "The original packet failed because the text suffix filter omitted .patch. The replacement remains unreviewed.",
+  "performance_regression_fixed": false,
+  "auto_resume": "No callable automation_update or general automation creation tool is available in this session. No automatic wakeup was configured.",
+  "constraints": [
+    "gfx950",
+    "No LLVM source changes",
+    "Preserve native MFMA",
+    "Preserve existing worktree edits",
+    "Do not edit PR or HTML",
+    "Root alone executes GPU/compiler tools",
+    "Keep agents idle during timing",
+    "Do not repeat the physical audit"
+  ]
+}

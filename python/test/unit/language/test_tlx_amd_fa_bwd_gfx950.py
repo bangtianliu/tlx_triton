@@ -785,31 +785,37 @@ class TestTLXFlashAttentionProvider(unittest.TestCase):
                     self.assertFalse(provider._is_performance_validated(*tensors, 128**-0.5, False))
                     tensor.data_ptr.return_value = 0
 
-    def test_d128_experimental_regalloc_options_are_not_selected(self):
+    def test_d128_unmeasured_regalloc_options_are_not_selected(self):
         from triton.tlx import pytorch as provider
 
         tensors = self._performance_tensors((16, 64, 1024, 128), (16, 8, 1024, 128))
         options = (
-            amd_fa_bwd._D128_SINK_INSTS_ENV,
-            amd_fa_bwd._D128_REGCLASS_PRIORITY_ENV,
-            amd_fa_bwd._D128_REVERSE_LOCAL_ENV,
+            (amd_fa_bwd._D128_SINK_INSTS_ENV, "1"),
+            (amd_fa_bwd._D128_REGCLASS_PRIORITY_ENV, "1"),
+            (amd_fa_bwd._D128_REVERSE_LOCAL_ENV, "0"),
         )
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertTrue(provider._is_performance_validated(*tensors, 128**-0.5, False))
-        for option in options:
-            with self.subTest(option=option), mock.patch.dict(os.environ, {option: "1"}, clear=True):
+        for option, value in options:
+            with self.subTest(option=option), mock.patch.dict(os.environ, {option: value}, clear=True):
                 self.assertFalse(provider._is_performance_validated(*tensors, 128**-0.5, False))
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(provider._is_performance_validated(*tensors, 128**-0.5, True))
+        with mock.patch.dict(os.environ, {amd_fa_bwd._D128_REVERSE_LOCAL_ENV: "1"}, clear=True):
+            self.assertFalse(provider._is_performance_validated(*tensors, 128**-0.5, True))
 
     def test_interleaved_d128_requires_measured_dispatch_config(self):
         from triton.tlx import pytorch as provider
 
         tensors = self._performance_tensors((16, 64, 1024, 128), (16, 8, 1024, 128))
         with mock.patch.dict(os.environ, {}, clear=True):
-            measured = amd_fa_bwd._select_d128_interleaved_dispatch()
+            measured = amd_fa_bwd._select_d128_interleaved_dispatch((16, 64, 8, 1024, 128))
             self.assertTrue(provider._is_performance_validated(*tensors, 128**-0.5, False))
 
         mutations = (
             {"main_entry": object()},
+            {"main_entry": amd_fa_bwd._attn_bwd_dkdv_dq_d128_gqa_bm32_kernel},
             {"block_m": measured.block_m * 2},
             {"block_n": measured.block_n // 2},
             {"num_warps": measured.num_warps // 2},
@@ -821,6 +827,7 @@ class TestTLXFlashAttentionProvider(unittest.TestCase):
             {"sink_insts_to_avoid_spills": not measured.sink_insts_to_avoid_spills},
             {"regclass_priority_trumps_globalness": not measured.regclass_priority_trumps_globalness},
             {"reverse_local_assignment": not measured.reverse_local_assignment},
+            {"split_q": 2},
         )
         for mutation in mutations:
             with self.subTest(mutation=mutation), mock.patch.object(
@@ -2538,6 +2545,514 @@ def test_dense_bwd_gqa_supported_shapes_end_to_end_gfx950(shape, causal):
     for actual, expected in zip(actual_grads, case.grads, strict=True):
         assert torch.isfinite(actual).all()
         assert _snr_db(actual, expected) >= 40.0
+
+
+def test_dense_bwd_mha16k_sink_default_guard(monkeypatch):
+    sink_env = amd_fa_bwd._D128_SINK_INSTS_ENV
+    reverse_env = amd_fa_bwd._D128_REVERSE_LOCAL_ENV
+    for name in (sink_env, reverse_env, amd_fa_bwd._D128_REGCLASS_PRIORITY_ENV):
+        monkeypatch.delenv(name, raising=False)
+
+    target = (16, 16, 16, 16384, 128)
+    cases = (
+        (target, False, None, False, True),
+        (target, False, 1, False, True),
+        (target, True, None, True, False),
+        (target, True, 1, True, False),
+        (target, False, 2, True, True),
+        ((15, 16, 16, 16384, 128), False, None, True, True),
+        ((15, 16, 16, 16384, 128), False, 1, True, True),
+        ((16, 32, 32, 16384, 128), False, None, True, True),
+        ((16, 32, 32, 16384, 128), False, 1, True, True),
+        ((16, 16, 16, 8192, 128), False, None, True, True),
+        ((16, 16, 16, 8192, 128), False, 1, True, True),
+        (None, False, None, True, True),
+        (None, False, 1, True, True),
+        (None, True, None, True, False),
+        ((16, 64, 8, 4096, 128), False, None, False, True),
+        ((16, 64, 8, 4096, 128), False, 1, False, True),
+        ((16, 64, 8, 4096, 128), True, 1, True, False),
+        ((16, 64, 8, 8192, 128), False, None, False, False),
+        ((16, 64, 8, 8192, 128), False, 1, False, False),
+        ((16, 64, 8, 8192, 128), False, 2, True, True),
+        ((16, 64, 8, 8192, 128), True, 1, True, False),
+        ((15, 64, 8, 16384, 128), False, None, True, True),
+        ((15, 64, 8, 16384, 128), False, 1, True, True),
+    )
+    for shape, causal, split_q, expected_sink, expected_reverse in cases:
+        dispatch = amd_fa_bwd._select_d128_interleaved_dispatch(shape, causal, split_q)
+        assert dispatch.sink_insts_to_avoid_spills is expected_sink
+        assert dispatch.reverse_local_assignment is expected_reverse
+        assert dispatch.regclass_priority_trumps_globalness is False
+        for name in (sink_env, reverse_env):
+            for value in ("0", "1"):
+                monkeypatch.setenv(name, value)
+                overridden = amd_fa_bwd._select_d128_interleaved_dispatch(shape, causal, split_q)
+                assert overridden.main_entry is dispatch.main_entry
+                assert overridden.split_q == dispatch.split_q
+                assert overridden.sink_insts_to_avoid_spills is (
+                    value == "1" if name == sink_env else expected_sink)
+                assert overridden.reverse_local_assignment is (
+                    value == "1" if name == reverse_env else expected_reverse)
+                assert overridden.regclass_priority_trumps_globalness is False
+            monkeypatch.delenv(name)
+
+
+@pytest.mark.parametrize(
+    "shape,causal,split_q,expected_block_m,expected_split",
+    [
+        ((16, 64, 8, 7936, 128), False, 1, 16, 1),
+        ((16, 64, 8, 8192, 128), False, None, 32, 1),
+        ((15, 64, 8, 16384, 128), False, 1, 32, 1),
+        ((2, 6, 2, 8448, 128), False, None, 32, 1),
+        ((16, 64, 8, 8192, 128), False, 2, 16, 2),
+        ((1, 4, 2, 8192, 128), False, None, 16, 4),
+        ((16, 64, 8, 8192, 128), True, None, 16, 1),
+        ((16, 16, 16, 8192, 128), False, 1, 16, 1),
+    ],
+)
+def test_dense_bwd_gqa_long_dispatch_guard(shape, causal, split_q, expected_block_m, expected_split, monkeypatch):
+    from triton.tlx import pytorch as provider
+
+    for name in (amd_fa_bwd._D128_SINK_INSTS_ENV, amd_fa_bwd._D128_REVERSE_LOCAL_ENV):
+        monkeypatch.delenv(name, raising=False)
+    dispatch = amd_fa_bwd._select_d128_interleaved_dispatch(shape, causal, split_q)
+    expected_entry = (amd_fa_bwd._attn_bwd_dkdv_dq_d128_gqa_bm32_kernel
+                      if expected_block_m == 32 else amd_fa_bwd._attn_bwd_dkdv_dq_d128_gqa_kernel)
+    assert dispatch.main_entry is expected_entry
+    assert dispatch.block_m == expected_block_m
+    assert dispatch.split_q == expected_split
+    config = provider._d128_interleaved_dispatch_config(dispatch)
+    expected_config_entry = (provider._D128_INTERLEAVED_BM32_ENTRY
+                             if expected_block_m == 32 else provider._D128_INTERLEAVED_ENTRY)
+    assert config[0] == expected_config_entry
+    assert config[1] == expected_block_m
+    # Recording a kernel fingerprint must not admit an unmeasured signature.
+    query_shape = (shape[0], shape[1], shape[3], shape[4])
+    key_shape = (shape[0], shape[2], shape[3], shape[4])
+    assert (query_shape, key_shape, causal) not in provider._PERFORMANCE_VALIDATED_SIGNATURES
+    for value in ("0", "1"):
+        monkeypatch.setenv(amd_fa_bwd._D128_SINK_INSTS_ENV, value)
+        monkeypatch.setenv(amd_fa_bwd._D128_REVERSE_LOCAL_ENV, value)
+        overridden = amd_fa_bwd._select_d128_interleaved_dispatch(shape, causal, split_q)
+        assert overridden.main_entry is expected_entry
+        assert overridden.sink_insts_to_avoid_spills is (value == "1")
+        assert overridden.reverse_local_assignment is (value == "1")
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("shape", [
+    pytest.param((1, 16, 2, 2048, 128), id="bm16-2k-group8"),
+    pytest.param((2, 24, 3, 4096, 128), id="bm16-4k-group8-batch2-heads3"),
+    (1, 4, 2, 8192, 128),
+    (2, 6, 2, 8448, 128),
+])
+def test_dense_bwd_gqa_long_unsplit_end_to_end_gfx950(shape):
+    case = _make_dense_gqa_reference_case(shape, seed=17)
+    # Force the unsplit GQA path even when a sparse grid would automatically split.
+    actual_grads = fa_backward(*case.kernel_args, split_q=1)
+    for actual, expected in zip(actual_grads, case.grads, strict=True):
+        assert torch.isfinite(actual).all()
+        assert _snr_db(actual, expected) >= 40.0
+    # Check every native 16-row dQ group, including the drain.
+    actual_dq = actual_grads[0].float().reshape(shape[0], shape[1], shape[3] // 16, -1)
+    expected_dq = case.grads[0].reshape_as(actual_dq)
+    tile_snr = 20 * torch.log10(torch.linalg.vector_norm(expected_dq, dim=-1) /
+                               torch.linalg.vector_norm(actual_dq - expected_dq, dim=-1))
+    assert torch.all(tile_snr >= 40.0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("n_ctx", [2048, 4096, 8192, 16384])
+@pytest.mark.parametrize("group_size", [3, 8])
+@pytest.mark.parametrize("sm_scale", [1.0 / 16.0, 0.0, -1.0 / 16.0])
+def test_dense_bwd_gqa_long_refill_analytic_gfx950(n_ctx, group_size, sm_scale, monkeypatch):
+    for name in (amd_fa_bwd._D128_SINK_INSTS_ENV, amd_fa_bwd._D128_REVERSE_LOCAL_ENV):
+        monkeypatch.delenv(name, raising=False)
+    batch, kv_heads, head_dim = 2, 2, 128
+    query_heads = group_size * kv_heads
+    q = torch.zeros((batch, query_heads, n_ctx, head_dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros((batch, kv_heads, n_ctx, head_dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.zeros_like(k)
+    do = torch.zeros_like(q)
+    rows = torch.arange(n_ctx, device="cuda")
+    # Vary both 16-row phases and successive 64-row generations. Distinct
+    # batches, grouped query heads, and KV heads expose incorrect reuse.
+    row_factor = 2.0**((rows // 16) % 4 + (rows // 64) % 4)
+    batch_factor = torch.tensor([1.0, 2.0], device="cuda")[:, None, None]
+    group_factors = [1.0, 0.5, 0.25]
+    head_factors = [group_factors[head % len(group_factors)] for head in range(group_size)]
+    head_factor = torch.tensor(head_factors * kv_heads, device="cuda")[None, :, None]
+    kv_factor = torch.tensor([1.0, 2.0], device="cuda")[None, :, None]
+    key_sign = (2 * (rows % 2) - 1).float()[None, None, :]
+    q[..., 0] = batch_factor * head_factor * row_factor
+    do[..., 0] = 16.0 * batch_factor / head_factor * row_factor
+    k[..., 0] = 0.5
+    k[..., 1] = kv_factor * key_sign
+    v[..., 0] = kv_factor * key_sign
+    # Every key has the same score for each query, so P=1/N, O=0, and
+    # Delta=0. The alternating key signs give nonzero closed-form gradients
+    # without allocating an N-by-N forward or backward reference.
+    out = torch.zeros_like(q)
+    lse = torch.log(torch.tensor(float(n_ctx), device="cuda")) + 0.5 * sm_scale * q[..., 0].float()
+    expected_dq = torch.zeros_like(q, dtype=torch.float32)
+    expected_dk = torch.zeros_like(k, dtype=torch.float32)
+    expected_dv = torch.zeros_like(v, dtype=torch.float32)
+    query_kv_factor = kv_factor.repeat_interleave(query_heads // kv_heads, dim=1)
+    expected_dq[..., 1] = sm_scale * do[..., 0].float() * query_kv_factor.square()
+    expected_dk[..., 0] = (
+        sm_scale * 16.0 * batch_factor.square() * kv_factor * key_sign
+        * (query_heads // kv_heads) * row_factor.square().mean()
+    )
+    expected_dv[..., 0] = 16.0 * batch_factor * (1.0 / head_factor[:, :group_size]).sum() * row_factor.mean()
+    actual_grads = fa_backward(q, k, v, out, do, lse, sm_scale, False, split_q=1)
+    for actual, expected in zip(actual_grads, (expected_dq, expected_dk, expected_dv), strict=True):
+        assert torch.isfinite(actual).all()
+        if torch.any(expected != 0):
+            assert _snr_db(actual, expected) >= 40.0
+        torch.testing.assert_close(actual.float(), expected, rtol=0.01, atol=0.0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("shape", [
+    pytest.param((16, 64, 8, 8192, 128), id="fragment-chain-8k-batch16"),
+    pytest.param((15, 64, 8, 16384, 128), id="fragment-chain-16k-batch15"),
+])
+def test_dense_bwd_gqa_exact_fragment_chain_analytic_gfx950(shape, monkeypatch):
+    for name in (
+        amd_fa_bwd._D128_PERSISTENT_ENABLE_ENV,
+        amd_fa_bwd._D128_PERSISTENT_PIPE_ENABLE_ENV,
+        amd_fa_bwd._D128_EXACT_ENABLE_ENV,
+        amd_fa_bwd._D128_SINK_INSTS_ENV,
+        amd_fa_bwd._D128_REGCLASS_PRIORITY_ENV,
+        amd_fa_bwd._D128_REVERSE_LOCAL_ENV,
+    ):
+        monkeypatch.delenv(name, raising=False)
+    dispatch = amd_fa_bwd._select_d128_interleaved_dispatch(shape, causal=False, split_q=1)
+    assert dispatch.main_entry is amd_fa_bwd._attn_bwd_dkdv_dq_d128_gqa_bm32_kernel
+    assert dispatch.block_m == 32
+    assert dispatch.split_q == 1
+    launches = _capture_kernel_with_constexprs(monkeypatch, amd_fa_bwd, "_attn_bwd_dkdv_dq_d128_gqa_bm32_kernel")
+
+    batch, query_heads, kv_heads, n_ctx, head_dim = shape
+    group_size = query_heads // kv_heads
+    sm_scale = 1.0 / 16.0
+    q = torch.zeros((batch, query_heads, n_ctx, head_dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros((batch, kv_heads, n_ctx, head_dim), device=q.device, dtype=q.dtype)
+    v = torch.empty_like(k)
+    do = torch.empty_like(q)
+    out = torch.zeros_like(q)
+    lse = torch.full(q.shape[:-1], float(torch.log(torch.tensor(float(n_ctx)))), device=q.device, dtype=torch.float32)
+    rows = torch.arange(n_ctx, device=q.device)
+    batch_factor = 2.0**-torch.arange(batch, device=q.device, dtype=torch.float32)
+    kv_factor = 2.0**-torch.arange(kv_heads, device=q.device, dtype=torch.float32)
+    head_factor = 2.0**torch.arange(group_size, device=q.device, dtype=torch.float32)
+    row_values = torch.tensor(
+        [1, 2, 4, 8, 16, 32, 64, 128, -2, -4, -8, -16, -32, -64, -128, -256],
+        device=q.device,
+        dtype=torch.float32,
+    )
+    # Distinct rows expose lane swaps within each native 16-row dQ tile.
+    # The tile factors change at 16-, 32-, and 64-row boundaries.
+    row_factor = row_values[rows % 16] * 2.0**((rows // 16) % 4 + (rows // 64) % 3)
+    # Give the final generation a distinct factor to expose stale drain data.
+    row_factor[-64:] *= 2
+    query_head_factor = (kv_factor[:, None] * head_factor[None, :]).reshape(query_heads)
+    query_factor = batch_factor[:, None, None] * query_head_factor[None, :, None] * row_factor[None, None, :]
+    key_sign = (1 - 2 * (rows % 2)).float()
+    key_amplitude = 2.0**((rows // 64) % 4 - 3)
+    key_factor = kv_factor[None, :, None] * (key_sign * key_amplitude)[None, None, :]
+    value_factor = kv_factor[None, :, None] * (key_sign / key_amplitude)[None, None, :]
+    q_direction = torch.zeros(head_dim, device=q.device)
+    k_direction = torch.zeros_like(q_direction)
+    do_direction = torch.empty_like(q_direction)
+    q_feature_weights = (1.0, 2.0, 16.0, 32.0)
+    feature_weights = (1.0, 2.0, 4.0, 8.0)
+    value_weights = (-2.0, -1.0, 1.0, 0.25)
+    fragment_width = 32
+    for band, (q_feature_weight, feature_weight, value_weight) in enumerate(
+            zip(q_feature_weights, feature_weights, value_weights, strict=True)):
+        start = band * fragment_width
+        stop = start + fragment_width
+        q[..., start:stop:2] = query_factor[..., None] * q_feature_weight
+        k[..., start + 1:stop:2] = key_factor[..., None] * feature_weight
+        do[..., start:stop] = query_factor[..., None] * feature_weight
+        v[..., start:stop] = value_factor[..., None] * value_weight
+        q_direction[start:stop:2] = q_feature_weight
+        k_direction[start + 1:stop:2] = feature_weight
+        do_direction[start:stop] = feature_weight
+
+    # Q uses even features and K uses odd features, so every score is zero.
+    # Alternating V signs give O=0 and Delta=0, with P=1/N.
+    # The dense feature directions satisfy dOdir dot Vdir=64.
+    # Inverse K/V amplitudes make each 256-key dQ partial identical.
+    direction_dot = fragment_width * sum(a * b for a, b in zip(feature_weights, value_weights, strict=True))
+    assert direction_dot == 64.0
+    actual_grads = fa_backward(q, k, v, out, do, lse, sm_scale, False, split_q=1)
+    assert len(launches) == 1
+    launch_kwargs, compiled = launches[0]
+    assert {name: launch_kwargs[name] for name in ("BATCH", "HQ", "HK", "N", "BLOCK_M", "SPLIT_Q")} == {
+        "BATCH": batch,
+        "HQ": query_heads,
+        "HK": kv_heads,
+        "N": n_ctx,
+        "BLOCK_M": 32,
+        "SPLIT_Q": 1,
+    }
+    assert launch_kwargs["IS_CAUSAL"] is False
+    # FRAGMENT_CHAIN carries eight dK fragments through the outer loop.
+    loop_headers = [line for line in compiled.asm["ttir"].splitlines() if "scf.for" in line and "iter_args" in line]
+    assert any(line.count("tensor<128x32xf32") == 8 for line in loop_headers), loop_headers
+    assert "amdg.scheduled_mfma" in compiled.asm["ttir"]
+    assert "amdg.mfma_commit" in compiled.asm["ttir"]
+
+    for name, actual_gradient in zip(("dQ", "dK", "dV"), actual_grads, strict=True):
+        signal_energy = torch.zeros((), device=q.device)
+        noise_energy = torch.zeros_like(signal_energy)
+        for batch_idx in range(batch):
+            for kv_head in range(kv_heads):
+                head_start = kv_head * group_size
+                head_stop = head_start + group_size
+                factors = query_factor[batch_idx, head_start:head_stop]
+                if name == "dQ":
+                    actual = actual_gradient[batch_idx, head_start:head_stop].float()
+                    coefficient = sm_scale * direction_dot * kv_factor[kv_head].square()
+                    expected = coefficient * factors[..., None] * k_direction
+                    tile_rows = 16
+                elif name == "dK":
+                    actual = actual_gradient[batch_idx, kv_head].float()
+                    coefficient = sm_scale * direction_dot * kv_factor[kv_head] * factors.square().sum() / n_ctx
+                    expected = coefficient * (key_sign / key_amplitude)[:, None] * q_direction
+                    tile_rows = 64
+                    if batch_idx == 0 and kv_head == 0:
+                        # Copy one analytic group to CPU before checking all fragment swaps.
+                        # The fragment order is c00, c10, c01, c11, c02, c12, c03, c13.
+                        fragment_rows = 128
+                        reference_fragments = torch.stack([
+                            expected[row_start:row_start + fragment_rows,
+                                     feature_start:feature_start + fragment_width]
+                            for feature_start in range(0, head_dim, fragment_width)
+                            for row_start in (0, fragment_rows)
+                        ]).cpu()
+                        for first in range(len(reference_fragments)):
+                            for second in range(first + 1, len(reference_fragments)):
+                                with pytest.raises(AssertionError):
+                                    torch.testing.assert_close(
+                                        reference_fragments[first], reference_fragments[second],
+                                        rtol=0.01, atol=0.0)
+                else:
+                    actual = actual_gradient[batch_idx, kv_head].float()
+                    expected = (factors.sum() / n_ctx * do_direction).expand_as(actual)
+                    tile_rows = None
+                # Check each group before releasing its FP32 reference.
+                assert torch.isfinite(actual).all(), (name, batch_idx, kv_head)
+                torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.0)
+                difference = actual - expected
+                signal_energy += expected.square().sum()
+                noise_energy += difference.square().sum()
+                if tile_rows is not None:
+                    tiles = expected.reshape(-1, tile_rows * head_dim)
+                    tile_noise = difference.reshape_as(tiles)
+                    tile_snr = 20 * torch.log10(
+                        torch.linalg.vector_norm(tiles, dim=-1) / torch.linalg.vector_norm(tile_noise, dim=-1))
+                    assert torch.all(tile_snr >= 40.0), (name, batch_idx, kv_head, tile_snr.min().item())
+        snr = 10 * torch.log10(signal_energy / noise_energy).item()
+        assert snr >= 40.0, (name, shape, snr)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("shape,split_q", [
+    pytest.param((1, 1024, 128, 8192, 128), 1, id="bm32-query-bound"),
+    pytest.param((1, 1024, 128, 8192, 128), 2, id="bm16-split-query-bound"),
+    pytest.param((1, 1024, 1024, 8192, 128), 1, id="bm16-query-kv-bound"),
+    pytest.param((1, 512, 512, 16384, 128), 1, id="bm16-early-v-query-kv-bound"),
+])
+def test_dense_bwd_gqa_exact_buffer_bound_analytic_gfx950(shape, split_q):
+    batch, query_heads, kv_heads, n_ctx, head_dim = shape
+    # The last query feature is at the exact 2-GiB descriptor boundary.
+    # Alternating K/V signs give a closed-form oracle with no N-by-N matrix.
+    q = torch.zeros((batch, query_heads, n_ctx, head_dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros((batch, kv_heads, n_ctx, head_dim), device=q.device, dtype=q.dtype)
+    v = torch.zeros_like(k)
+    out = torch.zeros_like(q)
+    do = torch.zeros_like(q)
+    sm_scale = 1.0 / 16.0
+    mean = torch.tanh(torch.tensor(sm_scale, device=q.device))
+    output_mean = mean.to(q.dtype).float()
+    signs = (1 - 2 * (torch.arange(n_ctx, device=q.device) % 2)).float()
+    q[0, -1, -1, -1] = 1
+    do[0, -1, -1, 0] = 1
+    out[0, -1, -1, 0] = output_mean
+    k[0, -1, :, -1] = signs
+    v[0, -1, :, 0] = signs
+    lse = torch.full(q.shape[:-1], float(torch.log(torch.tensor(float(n_ctx)))),
+                     device=q.device, dtype=torch.float32)
+    lse[0, -1, -1] += torch.log(torch.cosh(torch.tensor(sm_scale, device=q.device)))
+    dq, dk, dv = fa_backward(q, k, v, out, do, lse, sm_scale, False, split_q=split_q)
+    for gradient in (dq, dk, dv):
+        assert torch.isfinite(gradient).all()
+    # Only the last query and last KV head have nonzero derivatives. Checking
+    # the nonzero counts also checks every other output position.
+    assert torch.count_nonzero(dq) == 1
+    assert torch.count_nonzero(dk) == n_ctx
+    assert torch.count_nonzero(dv) == n_ctx
+    expected_dq = sm_scale * (1 - output_mean * mean)
+    probability = (1 + signs * mean) / n_ctx
+    expected_dk = sm_scale * probability * (signs - output_mean)
+    torch.testing.assert_close(dq[0, -1, -1, -1].float(), expected_dq, rtol=0.005, atol=1e-6)
+    torch.testing.assert_close(dk[0, -1, :, -1].float(), expected_dk, rtol=0.005, atol=1e-8)
+    torch.testing.assert_close(dv[0, -1, :, 0].float(), probability, rtol=0.005, atol=1e-8)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_dense_bwd_dq_convert_exact_buffer_bound_gfx950():
+    n_ctx, head_dim, block_m = 1 << 23, 128, 128
+    accumulator = torch.zeros((n_ctx, head_dim), device="cuda", dtype=torch.bfloat16)
+    output = torch.empty_like(accumulator)
+    # A complete native 16-row group is invariant under the converter's
+    # permutation. Its final element exposes the descriptor's exclusive end.
+    accumulator[-16:] = 1
+    amd_fa_bwd._attn_bwd_dq_native_convert_kernel[(n_ctx // block_m, 1)](
+        accumulator, output, N=n_ctx, D=head_dim, BLOCK_M=block_m,
+        num_warps=4, matrix_instr_nonkdim=16,
+    )
+    assert torch.isfinite(output).all()
+    assert torch.count_nonzero(output) == 16 * head_dim
+    torch.testing.assert_close(output[-16:], torch.ones_like(output[-16:]), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("split_q", [0, -1, 1.5, True, False, "2"])
+def test_dense_bwd_split_query_invalid_count(split_q):
+    with pytest.raises(ValueError, match="positive integer"):
+        amd_fa_bwd._validate_split_q(split_q, 4)
+
+
+def test_dense_bwd_split_query_too_many_chunks():
+    with pytest.raises(ValueError, match="outer64 steps"):
+        amd_fa_bwd._validate_split_q(5, 4)
+
+
+@pytest.mark.parametrize(
+    "shape,expected",
+    [
+        ((1, 8, 1, 1024, 128), 32),
+        ((1, 8, 1, 2048, 128), 32),
+        ((1, 8, 1, 4096, 128), 16),
+        ((1, 16, 16, 1024, 128), 4),
+        ((16, 64, 8, 1024, 128), 1),
+        ((16, 64, 8, 4096, 128), 1),
+        ((16, 16, 16, 1024, 128), 1),
+        ((1, 64, 64, 256, 128), 1),
+        ((1, 32, 32, 256, 128), 1),
+        ((1, 1, 1, 256, 128), 1),
+    ],
+)
+def test_dense_bwd_split_query_automatic_selection(shape, expected):
+    dispatch = amd_fa_bwd._select_d128_interleaved_dispatch(shape)
+    assert dispatch.split_q == expected
+    assert amd_fa_bwd._select_d128_interleaved_dispatch(shape, causal=True).split_q == 1
+    assert amd_fa_bwd._select_d128_interleaved_dispatch(shape, split_q=1).split_q == 1
+    if expected > 1:
+        batch, _hq, hkv, n_ctx, head_dim = shape
+        assert 2 * batch * hkv * n_ctx * head_dim * 4 * dispatch.split_q <= 64 * 1024 * 1024
+
+
+def test_dense_bwd_split_query_automatic_workspace_cap():
+    shape = (1, 32, 8, 768, 128)
+    automatic = amd_fa_bwd._select_d128_interleaved_dispatch(shape)
+    # Filling 256 workgroups would need eleven splits and more than 64 MiB.
+    assert automatic.split_q == 10
+    assert amd_fa_bwd._select_d128_interleaved_dispatch(shape, split_q=11).split_q == 11
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(
+    "shape,split_q",
+    [
+        pytest.param((1, 1, 1, 256, 128), 1, id="mha-unsplit"),
+        pytest.param((1, 1, 1, 256, 128), 2, id="mha-even"),
+        pytest.param((1, 1, 1, 256, 128), 3, id="mha-uneven"),
+        pytest.param((1, 1, 1, 256, 128), 4, id="mha-one-outer-tile"),
+        pytest.param((1, 1, 1, 768, 128), 5, id="mha-long-uneven"),
+        pytest.param((1, 2, 1, 256, 128), 3, id="gqa2-uneven"),
+        pytest.param((1, 2, 1, 256, 128), 1, id="gqa2-unsplit"),
+        pytest.param((2, 6, 2, 768, 128), 1, id="gqa3-batch2-heads2-unsplit"),
+        pytest.param((2, 6, 2, 256, 128), 5, id="gqa3-batch2-heads2-uneven"),
+        pytest.param((1, 6, 2, 768, 128), 7, id="gqa3-long-uneven"),
+        pytest.param((1, 4, 1, 256, 128), 16, id="gqa4-one-outer-tile"),
+        pytest.param((1, 8, 1, 512, 128), 7, id="gqa8-two-kv-tiles"),
+        pytest.param((1, 8, 1, 256, 128), 32, id="multiple-reduction-blocks"),
+        pytest.param((1, 6, 2, 768, 128), None, id="automatic-gqa3-uneven"),
+        pytest.param((1, 1, 1, 256, 128), None, id="automatic-mha-one-tile"),
+    ],
+)
+def test_dense_bwd_split_query_end_to_end_gfx950(shape, split_q, monkeypatch):
+    case = _make_dense_gqa_reference_case(shape, seed=17)
+    original_empty = torch.empty
+    original_empty_like = torch.empty_like
+
+    def poison_partial(tensor):
+        # Every partial must be written, including ragged split intervals.
+        if tensor.ndim == 5 and tensor.dtype == torch.float32:
+            tensor.fill_(float("nan"))
+        return tensor
+
+    monkeypatch.setattr(torch, "empty", lambda *args, **kwargs: poison_partial(original_empty(*args, **kwargs)))
+    monkeypatch.setattr(torch, "empty_like",
+                        lambda *args, **kwargs: poison_partial(original_empty_like(*args, **kwargs)))
+    actual_grads = fa_backward(*case.kernel_args, split_q=split_q)
+    for actual, expected in zip(actual_grads, case.grads, strict=True):
+        assert torch.isfinite(actual).all()
+        assert _snr_db(actual, expected) >= 40.0
+    # A missing delayed-dQ drain affects just sixteen rows and can be hidden
+    # by a whole-tensor accuracy check. Check all tiles across split boundaries.
+    actual_dq, expected_dq = actual_grads[0], case.grads[0]
+    for batch in range(shape[0]):
+        for head in range(shape[1]):
+            for row in range(0, shape[3], 16):
+                assert _snr_db(actual_dq[batch, head, row:row + 16], expected_dq[batch, head, row:row + 16]) >= 40.0
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(
+    "shape,causal",
+    [
+        pytest.param((1, 2, 256, 128), True, id="causal-d128"),
+        pytest.param((1, 1, 256, 64), False, id="d64"),
+        pytest.param((16, 27, 200, 128), False, id="short-d128"),
+        pytest.param((32, 1, 2600, 256), False, id="d256"),
+    ],
+)
+def test_dense_bwd_split_query_unsupported_route_gfx950(shape, causal, monkeypatch):
+    q, k, v, out, grad_out = (torch.empty(shape, device="cuda", dtype=torch.bfloat16) for _ in range(5))
+    lse = torch.empty(shape[:-1], device="cuda", dtype=torch.float32)
+
+    def unexpected_launch(*args, **kwargs):
+        pytest.fail("unsupported split must be rejected before launching GPU work")
+
+    monkeypatch.setattr(amd_fa_bwd, "_run_bwd_preprocess", unexpected_launch)
+    monkeypatch.setattr(amd_fa_bwd, "_run_bwd_d64", unexpected_launch)
+    with pytest.raises(ValueError, match="non-causal D128"):
+        fa_backward(q, k, v, out, grad_out, lse, shape[-1]**-0.5, causal, split_q=2)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_dense_bwd_split_query_graph_replay_gfx950():
+    case = _make_dense_gqa_reference_case((1, 6, 2, 256, 128), seed=23)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        fa_backward(*case.kernel_args, split_q=5)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual_grads = fa_backward(*case.kernel_args, split_q=5)
+    for _ in range(3):
+        graph.replay()
+        torch.cuda.synchronize()
+        for actual, expected in zip(actual_grads, case.grads, strict=True):
+            assert torch.isfinite(actual).all()
+            assert _snr_db(actual, expected) >= 40.0
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")

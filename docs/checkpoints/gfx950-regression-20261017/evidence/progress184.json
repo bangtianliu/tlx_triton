@@ -1,0 +1,70 @@
+{
+  "created_UTC": "2026-10-16T22:56:35.492128+00:00",
+  "state": "active; full historical recovery remains incomplete",
+  "MHA_saved_row_closure": {
+    "independent_review": {
+      "path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/physical_plan01/VMEM_saved_row_closure02/independent_review01/review01.json",
+      "bytes": 5125,
+      "sha256": "29f289c980f3c257e4b56854e07fb8f6be7131ca004f26ab7bf105bd6826b5dd"
+    },
+    "execution": {
+      "path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/physical_plan01/VMEM_saved_row_closure02/root_execution01.json",
+      "bytes": 2566,
+      "sha256": "d1963bc335f8a61226e6fa3df0ba7bb6c1eebb2026312fe574d529f13c6e1d29"
+    },
+    "result": {
+      "path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/physical_plan01/VMEM_saved_row_closure02/closure_result01/result01.json",
+      "bytes": 73796,
+      "sha256": "ee834b0514f6b57b49c1bdaeba87c72764101e58db50f956a09b77e9b100ad6d"
+    },
+    "closed_rows": 81,
+    "negative_controls_passed": 5,
+    "combined_counts": {
+      "LDS": [
+        2426,
+        0
+      ],
+      "VMEM": [
+        389,
+        0
+      ]
+    },
+    "audit_count": 1,
+    "audit_rerun": false,
+    "original_failed_physical_result_preserved": true
+  },
+  "MHA_constructors": {
+    "execution": {
+      "path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/root_constructor_execution01.json",
+      "bytes": 1185,
+      "sha256": "a2eb04bebe52f144a0b08049189bca7d3f2a99ced2536168b8f9b1fd5baeeaeb"
+    },
+    "result": {
+      "path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/constructor_smoke_result01.json",
+      "bytes": 21910,
+      "sha256": "584fc5ed75f2ae21cf35c6bbc843169a07263beca20e369d463b8856f8820e3e"
+    },
+    "all_six_passed": true,
+    "GPU_initialization": false,
+    "compiler_pipeline": false
+  },
+  "MHA_next": "Worker mha_vmem_saved_row_closure prepares combine_readiness01.py and finalize_runtime03.py. Review and execute aggregation only. Bind preserved constructor receipts. Then obtain fresh GPU7 quiet samples, finalize, stop all agents, and run five matched pairs. No baseline recompile.",
+  "combined_receipt_schema": "ROOT_MHA_COMBINED_READINESS_EXECUTION_V2; returncode0; command/result pins; aggregation_only=true; physical_audit_count1; audit_performed=false; GPU_admitted=false",
+  "GQA16K3976_next": {
+    "diagnostic": {
+      "path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/partial_completion_validation02/semantic_plan01/unprojected_event_diagnostic01.json",
+      "bytes": 6250,
+      "sha256": "46873e258308493363f19fa030527c9bf7c758be0ce4f85042cc03a81bfee928"
+    },
+    "finding": "Both unprojected streams have2425events. First difference is event2352: fence release at LLVM7936/7939. Only metadata differs. BaselineMMRA748 and candidateMMRA772 contain the same amdgpu-synchronize-as/local leaf.",
+    "next_supported_proof_target": "Canonicalize only the finite MMRA tag leaf by literal value. Preserve alias-scope identities and every other comparison. Retain local-to-global negative control and all25mutations.",
+    "semantic_approval": false,
+    "physical_audit_count": 0,
+    "GPU_admitted": false
+  },
+  "live_root_sessions": [],
+  "GPU_timing_this_continuation": false,
+  "LLVM_source_changes": false,
+  "kernel_source_changes_this_continuation": false,
+  "PR_or_HTML_changes": false
+}

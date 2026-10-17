@@ -1,0 +1,21 @@
+{
+  "GPU_admitted": false,
+  "findings": [
+    "PENDING_ROOT_RESULT_REVIEW"
+  ],
+  "passed": false,
+  "physical_result": null,
+  "raw_physical_result": {
+    "bytes": 9817,
+    "path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/physical_plan01/physical_result01/root_physical_readiness01.json",
+    "sha256": "fd47eeb0048404443347879239b03886161a1a5351da8b797603ce6a12da6660"
+  },
+  "root_execution": null,
+  "saved_row_closure": {
+    "bytes": 73796,
+    "path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/physical_plan01/VMEM_saved_row_closure02/closure_result01/result01.json",
+    "sha256": "ee834b0514f6b57b49c1bdaeba87c72764101e58db50f956a09b77e9b100ad6d"
+  },
+  "schema": "MHA_SINK_COMBINED_PHYSICAL_RESULT_REVIEW_V2",
+  "source_only": false
+}

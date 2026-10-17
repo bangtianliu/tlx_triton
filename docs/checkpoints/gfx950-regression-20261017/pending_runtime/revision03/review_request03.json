@@ -1,0 +1,100 @@
+{
+  "binder_READY": {
+    "bytes": 9356,
+    "path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/combined_binding_revision03/SOURCE_READY_manifest03.json",
+    "sha256": "90f19f55b1104d730c6b599bbabcd4046c351b111f16150a4c451a559dadaf13"
+  },
+  "execution_performed": false,
+  "expected_review_path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/combined_binding_revision03/independent_review01/review01.json",
+  "expected_review_schema": "MHA_SINK_RUNTIME_BINDER_SOURCE_REVIEW_V1",
+  "required_review_checks": [
+    "raw_failure_and_audit_count_preserved",
+    "exact_81_closure_rows_and_five_controls_required",
+    "closure_source_plan_image_and_execution_bound",
+    "aggregation_only_no_audit_parser_or_binary_execution",
+    "old_constructor_provenance_and_review_69147bc9_preserved",
+    "constructor_preparation_AST_identity_checked",
+    "six_constructor_validation_gates_unchanged",
+    "runtime_image_ABI_correctness_seal_ownership_gates_preserved",
+    "fresh_quiet_window_gate_unchanged",
+    "new_combined_result_schema_required",
+    "all_source_pins_match",
+    "reviewed_text_suffixes_supported"
+  ],
+  "required_review_fields": {
+    "GPU_admitted": false,
+    "execution_performed": false,
+    "findings": [],
+    "passed": true,
+    "source_only": true
+  },
+  "reviewed_files": {
+    "binder_delta03.patch": {
+      "bytes": 21638,
+      "path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/combined_binding_revision03/binder_delta03.patch",
+      "sha256": "5b5368993c6a2939133dc0d7a5d021fa1e100fd44e72d51fdaffa633de704fdd"
+    },
+    "binding_contract03.json": {
+      "bytes": 12847,
+      "path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/combined_binding_revision03/binding_contract03.json",
+      "sha256": "471e503a23a06ae099c68b927ff04da844822dca31653fb60de6be07799edf31"
+    },
+    "combination_plan01.json": {
+      "bytes": 11585,
+      "path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/physical_plan01/VMEM_saved_row_closure02/combination_plan01.json",
+      "sha256": "7429424041d48e1559b956a64317c31030c3b07235c78fb33d6072b125c92499"
+    },
+    "combine_readiness01.py": {
+      "bytes": 12984,
+      "path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/physical_plan01/VMEM_saved_row_closure02/combine_readiness01.py",
+      "sha256": "e651e46c86e53b728cd44c3e4d5cb8c19b3a5afe0ebd56d20511064971e1e630"
+    },
+    "combined_result_review_template03.json": {
+      "bytes": 1283,
+      "path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/combined_binding_revision03/combined_result_review_template03.json",
+      "sha256": "0004fb40a4b202c166bc1138febd5c254c4eeab854c3a22785a63e070a135a04"
+    },
+    "combined_root_command_template03.json": {
+      "bytes": 3074,
+      "path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/combined_binding_revision03/combined_root_command_template03.json",
+      "sha256": "63dcdc10911c358d7c87dd841b6fae043361bed539f4bbf24b3d4389fdaa0fa8"
+    },
+    "constructor_smoke_template02.py": {
+      "bytes": 7940,
+      "path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/constructor_smoke_template02.py",
+      "sha256": "8761c763c86b9c387e19cbb8fe2a0190e07af8a1b5eb6dc5dcde3d31d628a809"
+    },
+    "finalize_runtime03.py": {
+      "bytes": 34074,
+      "path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/finalize_runtime03.py",
+      "sha256": "ea88a238b6586c8ec1263c77f97b051937868603b9e17196fd980a2169bc6a3e"
+    },
+    "launch_pair_template02.py": {
+      "bytes": 8568,
+      "path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/launch_pair_template02.py",
+      "sha256": "38e96a4908f2f25c7a8d335dae07fd377a4317aa8e2deb447a1864ce4bdc9777"
+    },
+    "plan03.md": {
+      "bytes": 1624,
+      "path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/combined_binding_revision03/plan03.md",
+      "sha256": "c148025bcb90af1f42ca8b54d25ca6cf5d14e443ce02da43636f14d4bed0b2b0"
+    },
+    "root_binding_inputs_template03.json": {
+      "bytes": 2287,
+      "path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/combined_binding_revision03/root_binding_inputs_template03.json",
+      "sha256": "6fb353c174901cdbb20a9db9f337c4c93c8b88fc8fd6a8144ace73b077d38165"
+    },
+    "root_commands_template03.json": {
+      "bytes": 3344,
+      "path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/combined_binding_revision03/root_commands_template03.json",
+      "sha256": "be20e602cf9fa4224e8e393a7fd44c78a6367d798d77751860a70045958a5d90"
+    },
+    "source_checks03.json": {
+      "bytes": 2045,
+      "path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/combined_binding_revision03/source_checks03.json",
+      "sha256": "97dc69f42d240501cca44075d11d40416e56f6771fd0d7f8b6f19e842b1381d8"
+    }
+  },
+  "schema": "MHA_SINK_COMBINED_BINDER_REVIEW_PACKET_V3",
+  "source_only": true
+}

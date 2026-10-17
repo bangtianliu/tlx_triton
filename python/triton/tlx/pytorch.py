@@ -24,13 +24,31 @@ _D256_ROUTE = "d256"
 _D128_SPLIT_ENTRY = "split"
 _D128_COMBINED_ENTRY = "combined"
 _D128_INTERLEAVED_ENTRY = "interleaved"
+_D128_INTERLEAVED_BM32_ENTRY = "interleaved_bm32"
 _D128_NATIVE_CONVERT_ENTRY = "native_convert"
 _D256_PRODUCER_ENTRY = "producer"
 # (entry, block_m, block_n, num_warps, pipelined, rectangular, exact)
 _D128_NONCAUSAL_SPLIT_CONFIG = (_D128_SPLIT_ENTRY, 32, 64, 4, True, True, False)
 _D128_CAUSAL_SPLIT_CONFIG = (_D128_SPLIT_ENTRY, 32, 32, 2, False, False, False)
 _D128_EXACT_CONFIG = (_D128_COMBINED_ENTRY, 16, 256, 4, False, False, True)
+# The measured MHA schedule uses sinking, reverse assignment, and one split.
 _D128_INTERLEAVED_CONFIG = (
+    _D128_INTERLEAVED_ENTRY,
+    16,
+    256,
+    4,
+    1,
+    16,
+    _D128_NATIVE_CONVERT_ENTRY,
+    128,
+    4,
+    True,
+    False,
+    True,
+    1,
+)
+# Short GQA's continuous IGLP2 schedule is measured without instruction sinking.
+_D128_GQA_INTERLEAVED_CONFIG = (
     _D128_INTERLEAVED_ENTRY,
     16,
     256,
@@ -42,7 +60,24 @@ _D128_INTERLEAVED_CONFIG = (
     4,
     False,
     False,
+    True,
+    1,
+)
+# The causal pipeline retains its original register-allocation order.
+_D128_CAUSAL_INTERLEAVED_CONFIG = (
+    _D128_INTERLEAVED_ENTRY,
+    16,
+    256,
+    4,
+    1,
+    16,
+    _D128_NATIVE_CONVERT_ENTRY,
+    128,
+    4,
+    True,
     False,
+    False,
+    1,
 )
 _D256_NONCAUSAL_CONFIG = (_D256_PRODUCER_ENTRY, 4, False, True)
 _D256_CAUSAL_CONFIG = (_D256_PRODUCER_ENTRY, 4, False, False)
@@ -206,12 +241,12 @@ _PERFORMANCE_VALIDATED_SIGNATURES = {
     (_D128_SHORT_ROUTE, frozenset({_D128_NONCAUSAL_SPLIT_CONFIG, _D128_EXACT_CONFIG})),
     ((16, 27, 200, 128), (16, 27, 200, 128), True):
     (_D128_SHORT_ROUTE, frozenset({_D128_CAUSAL_SPLIT_CONFIG, _D128_EXACT_CONFIG})),
-    ((16, 64, 1024, 128), (16, 8, 1024, 128), False): (_D128_INTERLEAVED_ROUTE, _D128_INTERLEAVED_CONFIG),
-    ((16, 64, 2048, 128), (16, 8, 2048, 128), False): (_D128_INTERLEAVED_ROUTE, _D128_INTERLEAVED_CONFIG),
-    ((16, 64, 4096, 128), (16, 8, 4096, 128), False): (_D128_INTERLEAVED_ROUTE, _D128_INTERLEAVED_CONFIG),
+    ((16, 64, 1024, 128), (16, 8, 1024, 128), False): (_D128_INTERLEAVED_ROUTE, _D128_GQA_INTERLEAVED_CONFIG),
+    ((16, 64, 2048, 128), (16, 8, 2048, 128), False): (_D128_INTERLEAVED_ROUTE, _D128_GQA_INTERLEAVED_CONFIG),
+    ((16, 64, 4096, 128), (16, 8, 4096, 128), False): (_D128_INTERLEAVED_ROUTE, _D128_GQA_INTERLEAVED_CONFIG),
     ((16, 16, 1024, 128), (16, 16, 1024, 128), False): (_D128_INTERLEAVED_ROUTE, _D128_INTERLEAVED_CONFIG),
     ((16, 16, 2048, 128), (16, 16, 2048, 128), False): (_D128_INTERLEAVED_ROUTE, _D128_INTERLEAVED_CONFIG),
-    ((16, 64, 1024, 128), (16, 8, 1024, 128), True): (_D128_INTERLEAVED_ROUTE, _D128_INTERLEAVED_CONFIG),
+    ((16, 64, 1024, 128), (16, 8, 1024, 128), True): (_D128_INTERLEAVED_ROUTE, _D128_CAUSAL_INTERLEAVED_CONFIG),
     ((32, 1, 2600, 256), (32, 1, 2600, 256), False): (_D256_ROUTE, _D256_NONCAUSAL_CONFIG),
     ((32, 1, 2600, 256), (32, 1, 2600, 256), True): (_D256_ROUTE, _D256_CAUSAL_CONFIG),
 }
@@ -245,12 +280,16 @@ def _d128_dispatch_config(dispatch):
 
 
 def _d128_interleaved_dispatch_config(dispatch):
-    if dispatch.main_entry is not gfx950_bwd._attn_bwd_dkdv_dq_d128_gqa_kernel:
+    if dispatch.main_entry is gfx950_bwd._attn_bwd_dkdv_dq_d128_gqa_kernel:
+        entry = _D128_INTERLEAVED_ENTRY
+    elif dispatch.main_entry is gfx950_bwd._attn_bwd_dkdv_dq_d128_gqa_bm32_kernel:
+        entry = _D128_INTERLEAVED_BM32_ENTRY
+    else:
         return None
     if dispatch.convert_entry is not gfx950_bwd._attn_bwd_dq_native_convert_kernel:
         return None
     return (
-        _D128_INTERLEAVED_ENTRY,
+        entry,
         dispatch.block_m,
         dispatch.block_n,
         dispatch.num_warps,
@@ -262,6 +301,7 @@ def _d128_interleaved_dispatch_config(dispatch):
         dispatch.sink_insts_to_avoid_spills,
         dispatch.regclass_priority_trumps_globalness,
         dispatch.reverse_local_assignment,
+        dispatch.split_q,
     )
 
 
@@ -355,7 +395,8 @@ def _is_performance_validated(query, key, value, out, grad_out, logsumexp, scale
         return selected_config in expected_config
     if route_kind == _D128_INTERLEAVED_ROUTE:
         try:
-            dispatch = gfx950_bwd._select_d128_interleaved_dispatch()
+            shape = (query.shape[0], query.shape[1], key.shape[1], query.shape[2], query.shape[3])
+            dispatch = gfx950_bwd._select_d128_interleaved_dispatch(shape, is_causal)
             selected_config = _d128_interleaved_dispatch_config(dispatch)
         except (AssertionError, AttributeError, RuntimeError, TypeError, ValueError):
             return False

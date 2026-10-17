@@ -1,0 +1,57 @@
+{
+  "AST_parse_passed": true,
+  "FROZEN_AST_identity": true,
+  "GPU_admitted": false,
+  "binder": {
+    "bytes": 34074,
+    "path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/finalize_runtime03.py",
+    "sha256": "ea88a238b6586c8ec1263c77f97b051937868603b9e17196fd980a2169bc6a3e"
+  },
+  "combiner": {
+    "bytes": 12984,
+    "path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/physical_plan01/VMEM_saved_row_closure02/combine_readiness01.py",
+    "sha256": "e651e46c86e53b728cd44c3e4d5cb8c19b3a5afe0ebd56d20511064971e1e630"
+  },
+  "compiler_run": false,
+  "constructor_rerun": false,
+  "constructor_validation_tail_AST_identity": true,
+  "dynamic_execution_calls_present": false,
+  "final_binding_tail_AST_identity": true,
+  "framework_imported": false,
+  "imports": {
+    "binder03": [
+      "argparse",
+      "collections",
+      "ast",
+      "hashlib",
+      "json",
+      "pathlib",
+      "re",
+      "time",
+      "sys"
+    ],
+    "combiner01": [
+      "argparse",
+      "hashlib",
+      "json",
+      "pathlib"
+    ]
+  },
+  "native_audit_rerun": false,
+  "native_parser_rerun": false,
+  "reviewed_suffixes_supported": true,
+  "schema": "MHA_SINK_COMBINED_BINDER_SOURCE_CHECKS_V3",
+  "source_execution_performed": false,
+  "standard_library_imports_only": true,
+  "unchanged_function_AST_checks": {
+    "bind_text": true,
+    "check_quiet": true,
+    "check_review": true,
+    "common": true,
+    "pin": true,
+    "prepare": true,
+    "read": true,
+    "require": true,
+    "write": true
+  }
+}

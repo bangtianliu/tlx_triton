@@ -1,0 +1,93 @@
+The measurements do not show full historical recovery.
+Seven saved paired ratios remain below 1. Three are slightly above 1.
+Cases 8 and 9 are close to measured parity. This does not prove statistical equivalence.
+
+Current means frozen accepted source 0e54eeef. Historical means frozen source 82aeae06.
+These measurements exclude later diagnostic candidates.
+
+Case | Shape | Historical median TFLOPS | Current median TFLOPS | Paired ratio | Change | Current wins | Result review
+--- | --- | ---: | ---: | ---: | ---: | ---: | ---
+0 | GQA1K | 745.018 | 734.255 | 0.985203563x | -1.480% | 0/5 | Passed
+1 | GQA2K | 828.515 | 831.576 | 1.003643929x | +0.364% | 5/5 | Passed
+2 | GQA4K | 872.254 | 876.581 | 1.004923844x | +0.492% | 5/5 | Passed
+3 | GQA8K | 832.245 | 823.661 | 0.989933337x | -1.007% | 0/5 | Passed
+4 | GQA16K | 888.317 | 853.806 | 0.961424480x | -3.858% | 0/5 | Passed
+5 | MHA1K | 640.781 | 632.570 | 0.987415858x | -1.258% | 0/5 | Passed
+6 | MHA2K | 754.945 | 751.847 | 0.995395795x | -0.460% | 0/5 | Passed
+7 | MHA4K | 829.216 | 828.479 | 0.998801414x | -0.120% | 0/5 | Passed
+8 | MHA8K | 854.459 | 854.548 | 0.999666087x | -0.033% | 3/5 | Passed
+9 | MHA16K | 859.089 | 859.710 | 1.000546773x | +0.055% | 4/5 | Passed
+
+GQA uses B16/HQ64/HKV8/D128, except GQA16K uses B15.
+MHA uses B16/HQ16/HKV16/D128. All cases use BF16, noncausal, split 1.
+The paired ratio comes directly from the saved matched-pair summary.
+It is not the ratio of the two displayed medians.
+Case 8 has a slightly higher current median and a slightly lower paired ratio.
+
+Main resources use historical -> current values.
+
+Case | Register words | Private bytes | Compiler VGPR spill entries | Loaded spill count | Scratch instructions | SGPR | LDS bytes, both
+--- | ---: | ---: | ---: | ---: | ---: | ---: | ---:
+0 | 510->506 | 0->0 | 0->0 | 0->0 | 0->0 | 60->62 | 153888
+1 | 510->512 | 0->76 | 0->18 | 0->19 | 0->14 | 60->60 | 153888
+2 | 510->512 | 0->76 | 0->18 | 0->19 | 0->14 | 60->60 | 153888
+3 | 505->512 | 0->16 | 0->3 | 0->4 | 0->6 | 57->58 | 134944
+4 | 512->508 | 0->0 | 0->0 | 0->0 | 0->0 | 62->61 | 134944
+5 | 510->512 | 0->16 | 0->3 | 0->4 | 0->12 | 54->57 | 153888
+6 | 510->512 | 0->16 | 0->3 | 0->4 | 0->12 | 54->57 | 153888
+7 | 510->512 | 0->16 | 0->3 | 0->4 | 0->12 | 54->57 | 153888
+8 | 510->512 | 0->16 | 0->3 | 0->4 | 0->12 | 57->59 | 153888
+9 | 510->512 | 0->16 | 0->3 | 0->4 | 0->12 | 53->55 | 153888
+
+Scratch instructions are saved whole-shader static counts. They are not execution counts.
+All historical mains are scratch-free. Current cases 0 and 4 remain scratch-free.
+The declared frozen resource policies allow the listed spills in the other cases.
+Loaded spill count differs from compiler spill entries and scratch instruction count.
+Passing the declared policy does not establish zero scratch or full performance recovery.
+
+Accuracy, identity, and ownership evidence
+
+All ten saved results report passed numerical checks, both public API checks, final shader seals, and unchanged inputs.
+The numerical protocol checks every output against an FP32 reference before and after timing.
+Its saved requirement is 40 dB for each group and each global gradient.
+All ten ownership closures passed with child exit 0 on GPU7, BDF 0000:f5:00.0.
+Ownership samples do not prove continuous exclusivity.
+The table uses only the named successful attempts.
+Earlier interrupted attempts remain excluded, including the first case 8 closure failure.
+
+Independent final-binding reviews passed for all original cases.
+Exact retry or command source reviews passed for new cases 2, 3, 8, and 9.
+Completed-result independent reviews passed for all ten cases.
+The new review binds exact tags s2_06, s3_02, s8_02, and s9_01.
+The new passed review is new_results_review01/review02.json.
+Its SHA is 0f0e0228ceda47ac069bc13558c2d1f21ee43902e84dcca8c937ab7a602bd128.
+This summary reuses its passed checks.
+
+Measurement scope
+
+The timed path includes preprocessing, main, and conversion through the direct frozen runner.
+It excludes allocation, resets, compilation, cache clearing, and reference work.
+Public API calls were checked for correctness. Their host-inclusive latency was not measured here.
+Each run used five matched pairs, 500 ms warmup, and 2500 ms repeat duration.
+The cases ran at different times. This summary defines no weighted workload score.
+Counter evidence is separate from this timing table.
+No profiling duration enters these throughput values.
+
+Priority from measured gaps only
+
+1. Prioritize case 4 (GQA16K): 3.858% below historical throughput.
+2. Prioritize case 0 (GQA1K): 1.480% below historical throughput.
+3. Prioritize case 5 (MHA1K): 1.258% below historical throughput.
+4. Prioritize case 3 (GQA8K): 1.007% below historical throughput.
+5. Prioritize case 6 (MHA2K): 0.460% below historical throughput.
+6. Prioritize case 7 (MHA4K): 0.120% below historical throughput.
+7. Prioritize case 8 (MHA8K): 0.033% below historical throughput.
+
+Cases 1, 2, and 9 have no measured paired deficit in these runs.
+This ordering does not identify a code cause or propose an optimization.
+All completed-result reviews passed. The measured gap ranking remains unchanged.
+
+Exact result, closure, completion, source, resource-policy, and review pins appear in summary02.json.
+No timing arrays or reference arrays are reproduced.
+No GPU, native, compiler, framework, model, numerical enumeration, or audit operation ran.
+No binary was read or hashed. HTML and PR content remain unchanged.

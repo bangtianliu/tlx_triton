@@ -1,0 +1,39 @@
+{
+  "GPU_admission_at_preparation": false,
+  "aggregation_command_output": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/physical_plan01/VMEM_saved_row_closure02/combined_root_command01.json",
+  "aggregation_command_template": {
+    "bytes": 3074,
+    "path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/combined_binding_revision03/combined_root_command_template03.json",
+    "sha256": "63dcdc10911c358d7c87dd841b6fae043361bed539f4bbf24b3d4389fdaa0fa8"
+  },
+  "aggregation_execution_output": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/physical_plan01/VMEM_saved_row_closure02/combined_root_execution01.json",
+  "aggregation_execution_required_fields": {
+    "GPU_admitted": false,
+    "aggregation_only": true,
+    "audit_performed": false,
+    "physical_audit_count": 1,
+    "returncode": 0
+  },
+  "aggregation_execution_schema": "ROOT_MHA_COMBINED_READINESS_EXECUTION_V2",
+  "constructor_rerun_required": false,
+  "cwd": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01",
+  "execution_performed": false,
+  "finalize_argv": [
+    "/usr/bin/python3",
+    "-B",
+    "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/finalize_runtime03.py",
+    "finalize",
+    "--bindings",
+    "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/combined_binding_revision03/root_binding_inputs_finalize03.json",
+    "--bindings-sha256",
+    "PENDING_ROOT_FINAL_BINDINGS_SHA256"
+  ],
+  "finalize_requires": [
+    "The independent source review passes.",
+    "The aggregation result and root execution pass.",
+    "The independent combined result review passes.",
+    "The six frozen constructor results remain unchanged.",
+    "A fresh quiet-window record passes."
+  ],
+  "schema": "ROOT_MHA_COMBINED_BINDER_COMMAND_TEMPLATES_V3"
+}

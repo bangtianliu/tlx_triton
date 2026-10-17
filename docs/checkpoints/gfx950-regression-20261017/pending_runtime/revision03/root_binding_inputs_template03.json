@@ -1,0 +1,30 @@
+{
+  "binder_READY": null,
+  "binder_source_review": null,
+  "constructor_preparation": {
+    "bytes": 3093,
+    "path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/constructor_preparation_receipt01.json",
+    "sha256": "a25fe4aff78cfcc8d8dda6ebeceed483cd00d405545fb17e70fa0185ee13559f"
+  },
+  "constructor_result": {
+    "bytes": 21910,
+    "path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/constructor_smoke_result01.json",
+    "sha256": "584fc5ed75f2ae21cf35c6bbc843169a07263beca20e369d463b8856f8820e3e"
+  },
+  "fresh_quiet_window": null,
+  "physical_SOURCE_READY": {
+    "bytes": 4268,
+    "path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/physical_plan01/SOURCE_READY_manifest01.json",
+    "sha256": "68e4df722fa780707cd4d1111b59131a7c89b5e0761eb2186402eda76af69549"
+  },
+  "physical_command": null,
+  "physical_execution": null,
+  "physical_result": null,
+  "physical_result_review": null,
+  "runtime_source_review": {
+    "bytes": 11530,
+    "path": "/home/bangtliu/meta/tlx_triton/.campaign/pr3993_fragment_spill_validation_20261013_172523/current_pr3993_review_20261014_01/combined_proven_kernel_candidates01/g16_wait_regression_strategy01/paired_Q_coordinate_remat_recovery01/completed_P_Q_dependency_recovery01/mha1_sink_option05/performance_experiment02/runtime_plan01/independent_review01/review01.json",
+    "sha256": "12cc66cca20b2335b129579c92486ee72491b1e7796685139880196caae9ebe4"
+  },
+  "schema": "ROOT_MHA_SINK_FINITE_BINDING_INPUTS_V1"
+}

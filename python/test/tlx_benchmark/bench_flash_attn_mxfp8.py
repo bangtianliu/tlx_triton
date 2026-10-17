@@ -34,6 +34,21 @@ def _close_enough(out, ref) -> tuple[bool, str]:
     return True, ""
 
 
+def _backward_close_enough(tlx_out, ref_out, inputs, do) -> tuple[bool, str]:
+    actual = torch.autograd.grad(tlx_out, inputs, do, retain_graph=True)
+    expected = torch.autograd.grad(ref_out, inputs, do, retain_graph=True)
+    for name, got, ref in zip(("dQ", "dK", "dV"), actual, expected):
+        got, ref = got.float(), ref.float()
+        if not torch.isfinite(got).all() or not torch.isfinite(ref).all():
+            return False, f"{name} or its reference contains nonfinite values"
+        cosine = F.cosine_similarity(got.flatten(), ref.flatten(), dim=0).item()
+        ref_ms = ref.square().mean()
+        relative_rms = ((got - ref).square().mean() / ref_ms.clamp_min(1e-30)).sqrt().item()
+        if (ref_ms > 0 and cosine < 0.98) or relative_rms > 0.2:
+            return False, f"{name} cosine={cosine:.6f}, relative RMS error={relative_rms:.6f}"
+    return True, ""
+
+
 def shapes(synthetic: bool = False, suites=None) -> list:
     return list(SYNTHETIC if synthetic else SHAPE_SUITES.shapes(driver.arch(), suites))
 
@@ -79,7 +94,7 @@ def prepare(case: Case, space: str) -> Prepared:
         ref_fn=lambda: ref_out.backward(do, retain_graph=True),
         flop_count=flops(*case.shape, "bwd"),
         grad_to_none=[q, k, v],
-        check=None,
+        check=lambda: _backward_close_enough(tlx_out, ref_out, (q, k, v), do),
         cap_s=COMPILE_CAP_S,
     )
 

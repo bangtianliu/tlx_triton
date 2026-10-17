@@ -67,6 +67,8 @@ out = tlx_mm(a, b)</code></pre>
 <pre><code>mm/sm100.py
 flash_attn/sm100.py
 flash_attn/gfx950.py
+flash_attn_mxfp8/sm100.py
+flash_attn_mxfp8/gfx950.py
 hstu_attn/sm100.py
 kda/sm100.py</code></pre>
 <p>Current kernel selections for the rest of the catalog:</p>
@@ -75,6 +77,7 @@ kda/sm100.py</code></pre>
     addmm/                gfx942.py
     bmm/                  gfx942.py
     flash_attn/           sm90.py  sm100.py  gfx950.py  (fwd + bwd)
+    flash_attn_mxfp8/     sm100.py  gfx950.py  (fwd + bwd)
     hstu_attn/            sm100.py  gfx942.py
                           _util.py  _stubs.py  _reference.py
     kda/                  sm100.py
@@ -86,7 +89,8 @@ kda/sm100.py</code></pre>
     ikbo_lce/             gfx950.py
     multi_cta_layernorm/  sm100.py
     cross_attention/      sm100.py
-    bmm_shared_a/         gfx950.py</code></pre></article>
+    bmm_shared_a/         gfx950.py</code></pre>
+<p><code>flash_attn_mxfp8</code> accepts contiguous BF16 Q/K/V of identical shape <code>[batch, heads, sequence, 128]</code>, with sequence lengths divisible by 256. On gfx950, each head must also contain fewer than <code>2**31</code> elements. The gfx950 implementation supports causal and non-causal attention. Backward uses native E4M3/E8M0 scaled products, fixed probability scale <code>2**-8</code>, and a shared 32-by-32 dS scale for dQ and dK. Separate Q and KV owners recompute QK and dP (seven executed products, five unique products), accumulate all gradients in FP32, and store BF16 without atomics. Backward supports PyTorch deterministic mode. The gfx950 forward uses 32-by-32 Q/K quantization, whereas the Blackwell public wrapper uses 1-by-32 groups; both use E4M3 data and E8M0 scales.</p></article>
 <footer class="pager"><a href="kernels.html">← Tutorial kernels</a><a class="next" href="testing.html">Testing →</a></footer>
     </main>
   </div>
