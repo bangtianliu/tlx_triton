@@ -1,22 +1,21 @@
 # MI450 attention backward: profiling and optimized PR #2709 port
 
-Measured on 2026-10-17 on **MI450 / gfx1250**. The original
+Measured through 2026-10-18 on **MI450 / gfx1250**. The original
 [PR #2709](https://github.com/facebookexperimental/triton/pull/2709) reports
 **MI350 / gfx950** results; those cross-device numbers remain historical context.
 
 ## Current result
 
-The selected packed-BF16-dQ policy reaches **1.084–1.161× AITER throughput**
-(800–968 vs 689–891 TFLOP/s) on all ten matched MI450 shapes. It combines Q-range splitting, Q-panel reuse,
-two-group ping-pong and wider output conversion. Both providers are timed as
-complete backward calls. AITER accumulates dQ in FP32; the selectable TLX FP32
-path remains slower than AITER and is reported alongside the packed path.
-All 20 shape/precision pairs pass the 1.2% NRMSE guard, and 106 tests pass.
+The default packed-BF16-dQ policy reaches **1.084–1.161× AITER throughput**
+on all ten matched MI450 shapes (17 October table; re-measured on 18 October
+within 0.069%). FP32 dQ, which matches AITER's FP32 dQ accumulation, now
+reaches **1.017–1.071× AITER throughput** on the same shapes. It uses one base
+plus immediate atomic addresses and spreads FP32 atomics through the dK bridge.
 
-See the [final ten-shape table](#2026-10-17-final-ten-shape-comparison) and
-[raw final results](../../../benchmarks/results/mi450_bwd_final_20261017.jsonl).
-The sections below first retain the 16 October full-port measurements, then
-record the 17 October attribution, experiments and final selection.
+All 20 shape/precision pairs pass the 1.2% NRMSE guard, and 125 backward tests
+pass. See the [18 October FP32 comparison](#final-fp32-and-packed-comparison)
+and [raw results](../../../benchmarks/results/mi450_bwd_fp32dq_20261018.jsonl).
+The earlier sections preserve the 16/17 October port and profiling history.
 
 ## Historical full-port result (16 October)
 
@@ -211,14 +210,13 @@ covered. Each query-head group's workspace retains the conservative signed
 2-GiB FP32 buffer-offset bound. Tile/stage combinations must fit hardware LDS.
 
 ```python
-from dataclasses import replace
 from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import (
     select_config, allocate_workspace, fa_backward,
 )
 
 b, hq, n, _ = q.shape
 config = select_config(n, b, hq, k.shape[1])    # measured policy, packed BF16 dQ
-# config = replace(config, packed_dq=False)    # FP32 dQ accumulation
+# config = select_config(n, b, hq, k.shape[1], packed_dq=False)  # FP32 dQ schedule
 workspace = allocate_workspace(q, k, config=config)
 dq, dk, dv = fa_backward(q, k, v, out, grad_out, lse,
                         config=config, workspace=workspace)
@@ -633,3 +631,164 @@ splits; the 113 backward tests and the check shapes (1,4,2,512),
 Kernel source SHA256 after this follow-up:
 `b25543109e228b8dbc4a0156d55ab63f60d7e95d46bf053f18bb2a6793bc9c52`. The ten-shape table above was
 measured on the 17 October source; only the selector and comments changed.
+
+## 2026-10-18: FP32 dQ addressing and issue schedule
+
+This follow-up targets FP32 dQ without changing the packed policy. It starts
+from commit `e30b742ed`, with the earlier layout-conversion compiler fix
+already built. Fresh complete-call baselines reproduce the gap: FP32 takes
+1.0983/3.9933 ms at B=8,Hq=64,Hkv=8,N=1024/2048, versus packed
+0.8584/3.0883 ms. All timings below use three graph trials and the same GPU
+wrapper, with device-scope atomics and unfixed clocks.
+
+### Addressing evidence and fix
+
+The original shuffle combines row/column terms before converting elements
+to bytes. TTGIR pins these offsets to the native WMMA layout, but the
+`test-print-alignment` analysis reports unit contiguity/divisibility/constancy
+for both rematerialized ranges and the final offsets. LLIR has nested
+`or disjoint` terms, with register constants inserted between dynamic terms;
+its per-register shifts do not fold into buffer immediates. The ISA reuses
+an address VGPR by rewriting it and waits for earlier atomics before reuse.
+
+A direct logical-index rewrite alone failed the compile gate. Separating a
+lane base across a whole tensor also failed because each inline-assembly
+identity produced a distinct result. The accepted Python fix computes one
+scalar base per hardware thread from the WMMA lane/warp bases, with additive
+register deltas. A pure, empty identity prevents LLVM from mixing those
+terms again. A 29-bit element mask preserves the existing wrapper's less-than-
+2-GiB FP32 workspace bound and proves that adding a register delta cannot
+wrap the byte offset. The permutation and output conversion are unchanged.
+The largest immediate is 20224 bytes, above the plan's initial 16-KiB
+estimate but within the instruction's unsigned field.
+
+| BM64 BN256, eight waves, three splits | Original FP32 | Phase A | Phase B |
+|---|---:|---:|---:|
+| FP32 atomic instructions per loop | 32 | 32 | 32 |
+| `s_wait_xcnt` per loop | 30 | 0 | 0 |
+| Atomic clauses | two together, then serialized | one group of 32 | eight groups of four |
+| Shared, unchanged address VGPR | No | Yes | Yes |
+| VGPRs | 506 | 510 | 511 |
+| Scratch bytes | 0 | 0 | 0 |
+| Loop LDS reads | 240 | 240 | 240 |
+| Static WMMA instructions | 192 | 192 | 192 |
+| Workgroup barriers per loop | 2 | 2 | 2 |
+
+The packed loop remains instruction-for-instruction identical to the fresh
+baseline: 16 packed atomics in one clause, 506 VGPRs, no scratch, 240 LDS
+reads and 192 static WMMAs. The benchmark now records address registers,
+immediate offsets, clause sizes and the WMMA count at each atomic issue;
+the compile records in the raw results below carry these fields.
+`test_attention_backward_fp32_dq_addressing` asserts the FP32 loop gates.
+
+### Spreading the FP32 atomics
+
+Phase A leaves FP32 about 10% behind packed, triggering Phase B. The optional
+`spread_dq` schedule finishes the delayed dQ at the start of the bridge and
+issues its eight register slices between current dK fragments. Each slice
+selects the three low register-owned row bits, so it preserves lane/warp
+ownership and needs no LDS exchange. Layout pins inside the slice helper
+supply its distributed argument encoding before verification.
+
+The dS ring, TDM refill/completion protocol and conditional barriers retain
+their existing phase ownership. All atomics remain in the bridge, and the
+kernel still has exactly two workgroup barriers per step. The original
+`amd_sched_barrier(0xff6)` matrix ordering remains; compiler-only fences
+retain the VMEM groups between dK updates. The ISA issues them at WMMA
+positions 32–60 in the rotated loop body, versus one burst at position 64.
+There is no new dQ live range across the next front.
+
+| FP32 schedule | B=8,N=1024 ms | B=8,N=2048 ms |
+|---|---:|---:|
+| Original | 1.0983 | 3.9933 |
+| Constant-offset addressing | 0.9482 | 3.3967 |
+| Addressing plus spreading | 0.9310 | 3.3324 |
+| Paired AITER for spreading | 0.9982 | 3.5046 |
+
+### FP32 selection sweep
+
+The sweep covers split counts 1/2/3, ping-pong on/off and BN128/BN256,
+plus spreading on the supported BN256 ping-pong variants. BN128 uses BM32;
+BN256 uses BM64. All valid tile-aligned combinations were compiled: 42 were
+timed with correctness guards and nine failed the scratch/resource gate.
+Best complete-call medians:
+
+| B,Hq,Hkv,N | BN | Q splits | Ping-pong | Spread dQ | FP32 ms |
+|---|---:|---:|---|---|---:|
+| 8,64,8,1024 | 256 | 3 | True | True | 0.9321 |
+| 8,64,8,2048 | 256 | 3 | True | True | 3.3378 |
+| 8,32,8,2048 | 256 | 3 | True | True | 1.7429 |
+| 8,64,8,1152 | 128 | 1 | True | False | 1.7528 |
+
+`select_config(..., packed_dq=False)` uses spreading for BN256, retaining the
+measured split/tile policy. BN128 keeps the one-split policy without spreading.
+The benchmark passes a `packed_dq` override to the selector before applying
+other explicit controls. Literal selector tests cover all four FP32 shapes;
+the packed default and n-only control behavior are retained.
+
+[All baseline, compile, check, sweep and final records](../../../benchmarks/results/mi450_bwd_fp32dq_20261018.jsonl)
+include complete configurations and source hashes. The final ten-shape audit
+is recorded below.
+
+### Final FP32 and packed comparison
+
+Same MI450, B/Hq/Hkv/N as shown, D128 BF16 non-causal inputs. Each point
+uses three graph trials for the new kernel, the saved original `e30b742ed`
+kernel and AITER. Original/new order alternates across trials. Both versions
+share identical inputs and output/workspace addresses; each invocation clears
+its accumulators. Times include the complete backward chain. AITER uses
+B=8 plus B=7 at B=15,N=16384 to avoid its known 4-GiB addressing defect.
+
+| B | N | Original FP32 ms | New FP32 ms | AITER ms | FP32/AITER throughput | Packed ms | Packed latency change |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 1024 | 1.099 | 0.933 | 0.995 | 1.067× | 0.858 | -0.201% |
+| 8 | 2048 | 4.001 | 3.334 | 3.502 | 1.051× | 3.090 | +0.004% |
+| 8 | 4096 | 15.242 | 12.580 | 13.268 | 1.055× | 11.733 | -0.036% |
+| 8 | 8192 | 59.807 | 49.294 | 52.114 | 1.057× | 45.554 | -0.002% |
+| 8 | 16384 | 236.484 | 194.249 | 197.582 | 1.017× | 181.997 | -0.007% |
+| 16 | 1024 | 2.191 | 1.860 | 1.963 | 1.055× | 1.708 | +0.069% |
+| 16 | 2048 | 8.009 | 6.667 | 6.976 | 1.046× | 6.175 | -0.014% |
+| 16 | 4096 | 30.691 | 25.404 | 26.369 | 1.038× | 23.443 | -0.018% |
+| 16 | 8192 | 119.465 | 98.528 | 105.571 | 1.071× | 92.016 | +0.006% |
+| 15 | 16384 | 443.473 | 364.789 | 370.907 | 1.017× | 341.681 | -0.011% |
+
+FP32 reaches **1.017–1.071× AITER throughput** across all ten shapes,
+meeting the >=1.0 target on every shape. Packed's largest measured slowdown
+is **0.069%**, within the 0.3% noise allowance. Its instruction sequence
+and selector policy remain unchanged. The final FP32 and packed paths both
+accumulate dK/dV in FP32; the FP32 path also retains FP32 dQ accumulation.
+All outputs are BF16. Atomics remain relaxed and GPU scope.
+
+All 20 shape/precision pairs pass the 1.2% guard for dQ/dK/dV, including
+workspace reuse. The largest observed NRMSE is 0.993%; FP32 dQ's
+largest difference from AITER is 0.0035%. The final source passes
+**125 backward tests**, including the spreading configurations and literal
+FP32 selector expectations. All selected compilations stay below or at
+512 VGPRs with zero scratch, zero `s_wait_xcnt`, 240 loop LDS reads,
+192 static WMMAs and exactly two workgroup barriers per loop.
+
+Measured kernel SHA256:
+`9b7278dbc35bfaf39448a9441a22db199e1b5f46889dae618e7bcc4c5aa2a4bc`. The committed
+source (`17c9a399f7a39b5e7e79ab7d0646670ada7acdbea868871dc88db3ffaee75bec`) only adds a compile-time
+layout assertion to `_dq_register_bits`; the generated assembly is unchanged.
+Original source SHA256:
+`b25543109e228b8dbc4a0156d55ab63f60d7e95d46bf053f18bb2a6793bc9c52`.
+[Raw results](../../../benchmarks/results/mi450_bwd_fp32dq_20261018.jsonl)
+include both source hashes, full configs, all three providers' individual
+samples, paired ratios, errors and compile metadata. Regenerate the assembly
+with `--mode compile --artifacts <dir>`. Container checks use
+`GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0=safe.directory` and
+`GIT_CONFIG_VALUE_0=/home/bangtliu/tlx_triton` with
+`python -m pre_commit run --all-files`.
+
+Reproduce the selected FP32 path under the documented GPU wrapper:
+
+```sh
+python benchmarks/mi450_fa_bwd.py --mode bench --shape 8,64,8,2048 \
+  --config '{"packed_dq":false}' --repeat-ms 100 \
+  --aiter-library /host-tmp/mi450-aiter-bridge.so \
+  --output /host-tmp/mi450-fp32dq-reproduce.jsonl
+```
+
+Set `spread_dq` explicitly to false to reproduce Phase A while retaining
+constant-offset FP32 addressing. The packed path remains the default.

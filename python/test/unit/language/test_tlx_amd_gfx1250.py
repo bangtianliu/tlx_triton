@@ -901,76 +901,127 @@ def test_grouped_gemm_multicast_correctness(cluster_size, multicast, group_size)
         torch.testing.assert_close(out[group * m:(group + 1) * m], expected, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("batch,hq,hk,n,num_cus,splits,pingpong", [
-    # BN256: ping-pong, analytic splits, at least two for the split epilogue.
-    (8, 64, 8, 1024, 192, 3, True),
-    (8, 64, 8, 2048, 192, 3, True),
-    (15, 64, 8, 16384, 192, 3, True),  # already full: one split would spill
-    (8, 32, 8, 2048, 192, 3, True),  # 512 owners: 3/1, 6/2, 8/3, 11/4 waves
-    (8, 64, 8, 768, 192, 3, True),  # 192 owners already fill the device
-    (1, 1, 1, 256, 192, 4, True),
-    (1, 1, 1, 256, 1, 3, True),
-    # BN128: one split; ping-pong from N=896.
-    (8, 64, 8, 1152, 192, 1, True),
-    (2, 6, 2, 384, 192, 1, False),
+@pytest.mark.parametrize("batch,hq,hk,n,num_cus,packed_dq,splits,pingpong,spread_dq", [
+    (8, 64, 8, 1024, 192, True, 3, True, False),
+    (8, 64, 8, 2048, 192, True, 3, True, False),
+    (15, 64, 8, 16384, 192, True, 3, True, False),
+    (8, 32, 8, 2048, 192, True, 3, True, False),
+    (8, 64, 8, 768, 192, True, 3, True, False),
+    (1, 1, 1, 256, 192, True, 4, True, False),
+    (1, 1, 1, 256, 1, True, 3, True, False),
+    (8, 64, 8, 1152, 192, True, 1, True, False),
+    (2, 6, 2, 384, 192, True, 1, False, False),
+    # Literal expectations from the FP32 split/tile/overlap sweep.
+    (8, 64, 8, 1024, 192, False, 3, True, True),
+    (8, 64, 8, 2048, 192, False, 3, True, True),
+    (8, 32, 8, 2048, 192, False, 3, True, True),
+    (8, 64, 8, 1152, 192, False, 1, True, False),
 ])
-def test_attention_backward_split_selection(batch, hq, hk, n, num_cus, splits, pingpong):
+def test_attention_backward_split_selection(batch, hq, hk, n, num_cus, packed_dq, splits, pingpong, spread_dq):
     from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import select_config
 
-    original = select_config(n)
-    assert original.q_splits == 1 and not original.pingpong
-    config = select_config(n, batch, hq, hk, num_cus=num_cus)
+    original = select_config(n, packed_dq=packed_dq)
+    assert original.q_splits == 1 and not original.pingpong and not original.spread_dq
+    assert original.packed_dq == packed_dq
+    config = select_config(n, batch, hq, hk, num_cus=num_cus, packed_dq=packed_dq)
     assert config.block_n == original.block_n
     assert config.q_splits == splits
     assert config.pingpong == pingpong
+    assert config.spread_dq == spread_dq
+    assert config.packed_dq == packed_dq
     if pingpong:
         assert config.reuse_q and not config.regalloc
         assert config.preprocess_block == 64 and config.convert_block == 4096
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("spread_dq", [False, True])
+def test_attention_backward_fp32_dq_addressing(spread_dq):
+    import dataclasses
+    import re
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import _compiler_options, _delayed_bwd_kernel, select_config
+
+    # FP32 dQ atomics must share one address VGPR with immediate offsets.
+    # Otherwise each atomic rewrites the address and waits on s_wait_xcnt.
+    config = dataclasses.replace(select_config(2048, 8, 64, 8, num_cus=192, packed_dq=False), spread_dq=spread_dq)
+    constants = dict(HQ=64, HK=8, N=2048, SM_SCALE=128**-0.5, BM=config.block_m, BN=config.block_n, NW=config.num_warps,
+                     TDM=config.use_tdm, STAGES=config.stages, DELAYED=config.delayed, UNROLL=config.unroll,
+                     FRAGMENT_FENCES=config.fragment_fences, FRAGMENT_FENCE_MASK=config.fragment_fence_mask,
+                     FRAGMENTED=config.fragmented, RESIDENT_KV=config.resident_kv, ORDERED=config.ordered,
+                     PACKED_DQ=config.packed_dq, REMATERIALIZE=config.rematerialize, OUTER_M=config.outer_m,
+                     ASYNC_STATS=config.async_stats, QUEUE_WMMA=config.queue_wmma, Q_SPLITS=config.q_splits,
+                     REUSE_Q=config.reuse_q, PINGPONG=config.pingpong, SPREAD_DQ=config.spread_dq)
+    signature = {name: "*bf16" for name in ("Q", "K", "V", "DO")}
+    signature.update({name: "*fp32" for name in ("LSE", "Delta", "DQA", "DK", "DV")})
+    attrs = {(_delayed_bwd_kernel.arg_names.index(name), ): [("tt.divisibility", 16)] for name in signature}
+    kernel = triton.compile(ASTSource(_delayed_bwd_kernel, signature, constants, attrs=attrs),
+                            target=GPUTarget("hip", "gfx1250", 32), options=_compiler_options(config))
+    lines = kernel.asm["amdgcn"].splitlines()
+    labels = {}
+    loops = []
+    for index, line in enumerate(lines):
+        label = re.match(r"^([.\w]+):", line)
+        if label:
+            labels[label[1]] = index
+        branch = re.match(r"\s*s_(?:cbranch_\w+|branch)\s+([.\w]+)", line)
+        if branch and labels.get(branch[1], index) < index:
+            loops.append(lines[labels[branch[1]]:index + 1])
+    loop = max(loops, key=lambda body: sum("v_wmma_" in line for line in body))
+    atomics = [line for line in loop if "buffer_atomic_add_f32" in line]
+    assert len(atomics) == 32
+    assert len({re.search(r",\s*(v\d+)(?:\s*/\*v\d+\*/)?\s*,\s*s\[", line)[1] for line in atomics}) == 1
+    assert not any("s_wait_xcnt" in line for line in loop)
+    assert sum("v_wmma_" in line for line in loop) == 160
+    assert int(re.search(r"\.private_segment_fixed_size:\s*(\d+)", kernel.asm["amdgcn"])[1]) == 0
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
 @pytest.mark.parametrize(
-    "num_warps,use_tdm,delayed,bm,bn,stages,fence_mask,q_splits,packed_dq,full_policy,outer_m,pingpong", [
-        *(
-            row + (False, ) for row in [
-                # Keep the ten original controls, then exercise each new split/precision
-                # combination on the selected schedule and its smaller KV fallback.
-                *(row + (1, False, False, 0) for row in [
-                    (2, False, True, 32, 128, 2, None),
-                    (4, False, True, 32, 128, 2, None),
-                    (4, True, True, 32, 128, 2, None),
-                    (8, True, True, 32, 128, 2, None),
-                    (4, True, False, 32, 128, 2, None),
-                    (8, True, True, 64, 256, 2, None),
-                    (8, True, True, 64, 256, 3, None),
-                    (8, True, True, 32, 128, 4, None),
-                    (8, True, True, 64, 256, 2, 0),
-                    (8, True, True, 64, 256, 2, 4086),
+    "num_warps,use_tdm,delayed,bm,bn,stages,fence_mask,q_splits,packed_dq,full_policy,outer_m,pingpong,spread_dq", [
+        row + (False, ) for row in [
+            *(
+                row + (False, ) for row in [
+                    # Keep the ten original controls, then exercise each new split/precision
+                    # combination on the selected schedule and its smaller KV fallback.
+                    *(row + (1, False, False, 0) for row in [
+                        (2, False, True, 32, 128, 2, None),
+                        (4, False, True, 32, 128, 2, None),
+                        (4, True, True, 32, 128, 2, None),
+                        (8, True, True, 32, 128, 2, None),
+                        (4, True, False, 32, 128, 2, None),
+                        (8, True, True, 64, 256, 2, None),
+                        (8, True, True, 64, 256, 3, None),
+                        (8, True, True, 32, 128, 4, None),
+                        (8, True, True, 64, 256, 2, 0),
+                        (8, True, True, 64, 256, 2, 4086),
+                    ]),
+                    *((8, True, True, 64, bn, 2, None, splits, packed, True, 0)
+                      for bn in (128, 256)
+                      for splits in (1, 2, 3)
+                      for packed in (False, True)),
+                    # Current-slot publication needs a cross-wave barrier in immediate mode.
+                    *((4, True, False, 32, 128, 2, None, splits, True, True, 0) for splits in (1, 3)),
+                    # Split boundaries may cut a multi-phase Q/dO load tile.
+                    *((8, True, True, 32, 256, 2, None, splits, True, True, 64) for splits in (2, 3)),
                 ]),
-                *((8, True, True, 64, bn, 2, None, splits, packed, True, 0)
-                  for bn in (128, 256)
-                  for splits in (1, 2, 3)
-                  for packed in (False, True)),
-                # Current-slot publication needs a cross-wave barrier in immediate mode.
-                *((4, True, False, 32, 128, 2, None, splits, True, True, 0) for splits in (1, 3)),
-                # Split boundaries may cut a multi-phase Q/dO load tile.
-                *((8, True, True, 32, 256, 2, None, splits, True, True, 64) for splits in (2, 3)),
-            ]),
-        *((8, True, True, bm, bn, 2, None, splits, packed, True, 0, True)
-          for bm in (32, 64)
-          for bn in (128, 256)
-          for splits in (1, 3)
-          for packed in (False, True)),
-        # Selected BN256 ping-pong with the other split counts it may choose.
-        *((8, True, True, 64, 256, 2, None, splits, True, True, 0, True) for splits in (2, 4)),
-        *((4, True, True, 32, bn, 2, None, splits, packed, True, 0, False)
-          for bn in (128, 256)
-          for splits in (1, 3)
-          for packed in (False, True)),
-    ])
+            *((8, True, True, bm, bn, 2, None, splits, packed, True, 0, True)
+              for bm in (32, 64)
+              for bn in (128, 256)
+              for splits in (1, 3)
+              for packed in (False, True)),
+            # Selected BN256 ping-pong with the other split counts it may choose.
+            *((8, True, True, 64, 256, 2, None, splits, True, True, 0, True) for splits in (2, 4)),
+            *((4, True, True, 32, bn, 2, None, splits, packed, True, 0, False)
+              for bn in (128, 256)
+              for splits in (1, 3)
+              for packed in (False, True)),
+        ]
+    ] + [(8, True, True, bm, 256, 2, None, splits, False, True, 0, True, True) for bm in (32, 64) for splits in (2, 3)])
 @pytest.mark.parametrize("batch,hq,hk,n", [(1, 1, 1, 256), (2, 6, 2, 512)])
 def test_attention_backward_delayed_gqa(num_warps, use_tdm, delayed, bm, bn, stages, fence_mask, batch, hq, hk, n,
-                                        q_splits, packed_dq, full_policy, outer_m, pingpong):
+                                        q_splits, packed_dq, full_policy, outer_m, pingpong, spread_dq):
     from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import BackwardConfig, allocate_workspace, fa_backward
 
     torch.manual_seed(2709)
@@ -988,8 +1039,8 @@ def test_attention_backward_delayed_gqa(num_warps, use_tdm, delayed, bm, bn, sta
                             stages=stages, fragment_fences=fence_mask is not None, fragment_fence_mask=fence_mask or 0,
                             q_splits=q_splits, packed_dq=packed_dq, fragmented=full_policy, ordered=full_policy,
                             async_stats=full_policy and use_tdm, rematerialize=full_policy and not wide_registers,
-                            regalloc=full_policy, waves_per_eu=1 if wide_registers else 0, outer_m=outer_m,
-                            reuse_q=full_policy, pingpong=pingpong)
+                            regalloc=full_policy and not spread_dq, waves_per_eu=1 if wide_registers else 0,
+                            outer_m=outer_m, reuse_q=full_policy, pingpong=pingpong, spread_dq=spread_dq)
     workspace = allocate_workspace(q, k, config=config)
     assert len(workspace) == (7 if q_splits > 1 else 5)
     if q_splits > 1:

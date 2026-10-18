@@ -167,6 +167,12 @@ def inspect_assembly(assembly):
     _, _, start, end = max(branches)
     counts = Counter()
     lds_sources = defaultdict(Counter)
+    atomic_addresses = defaultdict(set)
+    atomic_offsets = defaultdict(list)
+    atomic_wmma_positions = defaultdict(list)
+    wmma_position = 0
+    atomic_clauses = []
+    clause_remaining = 0
     # Inherit the debug location immediately preceding the loop.
     location = "unknown"
     for index, line in enumerate(lines[:end]):
@@ -182,6 +188,22 @@ def inspect_assembly(assembly):
             continue
         opcode = instruction[1]
         counts[opcode] += 1
+        if opcode.startswith("v_wmma_"):
+            wmma_position += 1
+        if opcode == "s_clause":
+            clause_remaining = int(line.split()[1], 0) + 1
+            atomic_clauses.append(0)
+        elif clause_remaining:
+            clause_remaining -= 1
+            if opcode.startswith("buffer_atomic_"):
+                atomic_clauses[-1] += 1
+        if opcode.startswith("buffer_atomic_"):
+            atomic_wmma_positions[opcode].append(wmma_position)
+            address = re.search(r",\s*(v\d+)(?:\s*/\*(v\d+)\*/)?\s*,\s*s\[", line)
+            if address:
+                atomic_addresses[opcode].add(address[2] or address[1])
+            immediate = re.search(r"\boffset:(\d+)", line)
+            atomic_offsets[opcode].append(int(immediate[1]) if immediate else 0)
         if opcode.startswith("ds_load"):
             lds_sources[location][opcode] += 1
     return {
@@ -189,6 +211,11 @@ def inspect_assembly(assembly):
         "loop_start_line": start + 1,
         "loop_end_line": end,
         "loop_instruction_counts": dict(sorted(counts.items())),
+        "loop_atomic_address_registers": {key: sorted(value)
+                                          for key, value in sorted(atomic_addresses.items())},
+        "loop_atomic_immediate_offsets_bytes": dict(sorted(atomic_offsets.items())),
+        "loop_atomic_wmma_positions": dict(sorted(atomic_wmma_positions.items())),
+        "loop_atomic_clause_sizes": [size for size in atomic_clauses if size],
         "loop_lds_loads": sum(value for key, value in counts.items() if key.startswith("ds_load")),
         "loop_lds_loads_by_source": {key: dict(value)
                                      for key, value in sorted(lds_sources.items())},
@@ -204,7 +231,7 @@ def compile_kernel(config, artifacts, shape, *, compile_options=None):
                      RESIDENT_KV=config.resident_kv, ORDERED=config.ordered, PACKED_DQ=config.packed_dq,
                      REMATERIALIZE=config.rematerialize, OUTER_M=config.outer_m, ASYNC_STATS=config.async_stats,
                      QUEUE_WMMA=config.queue_wmma, Q_SPLITS=config.q_splits, REUSE_Q=config.reuse_q,
-                     PINGPONG=config.pingpong)
+                     PINGPONG=config.pingpong, SPREAD_DQ=config.spread_dq)
     signature = {name: "*bf16" for name in ("Q", "K", "V", "DO", "DK", "DV")}
     signature.update({name: "*fp32" for name in ("LSE", "Delta")})
     signature["DQA"] = "*bf16" if config.packed_dq else "*fp32"
@@ -260,9 +287,10 @@ def main():
     parser.add_argument("--num-cus", type=int, default=192, help="CU count for offline compile policy selection")
     args = parser.parse_args()
     shape = tuple(map(int, args.shape.split(",")))
-    config = select_config(shape[-1], *shape[:3], num_cus=args.num_cus if args.mode == "compile" else None)
-    if args.config:
-        config = dataclasses.replace(config, **json.loads(args.config))
+    overrides = json.loads(args.config) if args.config else {}
+    config = select_config(shape[-1], *shape[:3], num_cus=args.num_cus if args.mode == "compile" else None,
+                           packed_dq=overrides.get("packed_dq", True))
+    config = dataclasses.replace(config, **overrides)
     kernel_sha256 = hashlib.sha256(
         Path(__file__).parents[1].joinpath(
             "third_party/tlx/ops/kernels/flash_attn/gfx1250_bwd.py").read_bytes()).hexdigest()

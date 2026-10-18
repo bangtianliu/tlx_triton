@@ -65,15 +65,16 @@ class BackwardConfig:
     convert_block: int = 1024
     reuse_q: bool = False
     pingpong: bool = False
+    spread_dq: bool = False
 
 
-def select_config(n, b=None, hq=None, hk=None, *, num_cus=None):
+def select_config(n, b=None, hq=None, hk=None, *, num_cus=None, packed_dq=True):
     """Select the measured MI450 policy from the sequence length and grid shape.
 
     The n-only call preserves the one-owner policy. Shape-aware callers may
     supply num_cus for an offline/deterministic selection calculation.
     """
-    config = BackwardConfig(fragmented=True, ordered=True, packed_dq=True, async_stats=True, rematerialize=True,
+    config = BackwardConfig(fragmented=True, ordered=True, packed_dq=packed_dq, async_stats=True, rematerialize=True,
                             regalloc=True)
     if n % 256:
         config = dataclasses.replace(config, block_m=32, block_n=128)
@@ -97,7 +98,10 @@ def select_config(n, b=None, hq=None, hk=None, *, num_cus=None):
         # Ping-pong was faster on every measured BN256 shape (GQA 1/4/8,
         # N 768-16384). Its one-split epilogue spills, so grids that are
         # already full still take three splits.
-        return dataclasses.replace(config, q_splits=best if best > 1 else 3, reuse_q=True, **pingpong)
+        # FP32 benefits from constant-offset atomics spread through the dK
+        # bridge. The split/tile sweep retained the packed grid policy.
+        return dataclasses.replace(config, q_splits=best if best > 1 else 3, reuse_q=True, spread_dq=not packed_dq,
+                                   **pingpong)
     # BN128 ping-pong keeps native row-scattered atomics for split partials;
     # extra splits cost more than the grid tail they remove. Ping-pong was
     # slower at N=640 and faster from N=896.
@@ -159,9 +163,18 @@ def _wmma(a, b, acc, ORDERED: tl.constexpr):
     return result
 
 
+@triton.constexpr_function
+def _dq_register_bits(bm, mma):
+    row_warps = sum(16 * basis[0] for basis in mma.warp_bases)
+    col_warps = sum(16 * basis[1] for basis in mma.warp_bases)
+    # The per-thread base swaps column 16 with lane-owned row 8. A register-
+    # owned column 16 would need the swap in its delta, so reject it.
+    assert col_warps & 16, "FP32 dQ addressing requires warp-owned column 16"
+    return ((bm - 1) & ~(8 | row_warps)) * 128 + (127 & ~(15 | col_warps))
+
+
 @triton.jit
-def _dq_atomic(dq, DQA, step, SM_SCALE: tl.constexpr, BM: tl.constexpr, MMA: tl.constexpr, PACKED: tl.constexpr = False,
-               REMAT: tl.constexpr = False):
+def _dq_offsets(step, BM: tl.constexpr, MMA: tl.constexpr, PACKED: tl.constexpr = False, REMAT: tl.constexpr = False):
     if REMAT:
         local_rows = tlx.rematerialized_range(0, BM, 27090, placement=step)
         cols = tlx.rematerialized_range(0, 128, 27091, placement=step)[None, :]
@@ -172,7 +185,6 @@ def _dq_atomic(dq, DQA, step, SM_SCALE: tl.constexpr, BM: tl.constexpr, MMA: tl.
     # Swap the row-8 and column-16 bits inside each 16x32 patch. The
     # WMMA's lane-16 bit then addresses the adjacent 16 columns, giving
     # each wave a contiguous 128-byte atomic segment (aiter's shuffle).
-    offsets = ((rows & ~8) | ((cols & 16) >> 1)) * 128 + ((cols & ~16) | ((rows & 8) << 1))
     if PACKED:
         # Native WMMA registers advance in rows. Make row bit 0 the
         # contiguous BF16 pair, followed by the five lane bits. Merely
@@ -181,12 +193,56 @@ def _dq_atomic(dq, DQA, step, SM_SCALE: tl.constexpr, BM: tl.constexpr, MMA: tl.
         logical = rows * 128 + cols
         offsets = ((logical & ~(15 | 16 | 32 | 128 | 1024)) | ((logical & 15) << 1) | ((logical & 16) << 6) |
                    ((logical & 32) << 2) | ((logical & 128) >> 7) | ((logical & 1024) >> 5))
+    else:
+        # Swap bits 4 (column 16) and 10 (row 8), separating the register
+        # coordinates from the lane/warp base before the permutation.
+        register_bits: tl.constexpr = _dq_register_bits(BM, MMA)
+        logical = rows * 128 + cols
+        thread = tlx.thread_id(0)
+        row_lane = (thread & 16) >> 1
+        col_lane = thread & 15
+        for warp_bit in tl.static_range(len(MMA.warp_bases)):
+            warp = (thread >> (5 + warp_bit)) & 1
+            row_lane += warp * (16 * MMA.warp_bases[warp_bit][0])
+            col_lane += warp * (16 * MMA.warp_bases[warp_bit][1])
+        lane_rows = step * BM + (row_lane & (BM - 1))
+        base = ((lane_rows & ~8) * 128 + ((col_lane & 16) << 6) + (col_lane & ~16) + ((lane_rows & 8) << 1))
+        # Keep LLVM from reassociating the dynamic terms through each
+        # register's constant delta. One scalar identity emits no instruction
+        # and supplies the same base to every register owned by this thread.
+        base = tl.inline_asm_elementwise("", "=v,0", [base], dtype=tl.int32, is_pure=True, pack=1)
+        # fa_backward bounds each query-head group's FP32 workspace below
+        # 2 GiB. Retain that range fact across the opaque identity so adding
+        # the register delta cannot wrap the 32-bit byte offset.
+        base = base & ((1 << 29) - 1)
+        offsets = base + (logical & register_bits)
     offsets = tlx.require_layout(offsets, MMA)
+    return offsets
+
+
+@triton.jit
+def _dq_atomic(dq, DQA, step, SM_SCALE: tl.constexpr, BM: tl.constexpr, MMA: tl.constexpr, PACKED: tl.constexpr = False,
+               REMAT: tl.constexpr = False):
+    offsets = _dq_offsets(step, BM, MMA, PACKED, REMAT)
     dq = tlx.require_layout(dq * SM_SCALE, MMA)
     if PACKED:
         tlx.buffer_atomic_add(DQA, offsets, dq.to(tl.bfloat16), sem="relaxed", scope="gpu", contiguity=2)
     else:
         tlx.buffer_atomic_add(DQA, offsets, dq, sem="relaxed", scope="gpu")
+
+
+@triton.jit
+def _dq_atomic_group(dq_groups, offset_groups, DQA, GROUP: tl.constexpr, BM: tl.constexpr):
+    # The first dimension is the three low row bits, all register-owned.
+    # Slicing it leaves every lane/warp active and emits four FP32 atomics
+    # per thread at BM64 (two at BM32), without an LDS layout conversion.
+    group_layout: tl.constexpr = tlx.layout(shape=((16, 2, 2, 2, 2), (8, BM // 32, 2)),
+                                            stride=((BM // 8, 1, 2 * BM, 4 * BM, 2), (16 * BM, 4, 8 * BM)))
+    dq_groups = tlx.require_layout(dq_groups, group_layout)
+    offset_groups = tlx.require_layout(offset_groups, group_layout)
+    dq = tlx.extract_slice(dq_groups, [1, BM // 8 * 128], [GROUP, 0])
+    offsets = tlx.extract_slice(offset_groups, [1, BM // 8 * 128], [GROUP, 0])
+    tlx.buffer_atomic_add(DQA, offsets, dq, sem="relaxed", scope="gpu")
 
 
 @triton.jit
@@ -197,7 +253,7 @@ def _delayed_bwd_kernel(Q, K, V, DO, LSE, Delta, DQA, DK, DV, HQ: tl.constexpr, 
                         FRAGMENTED: tl.constexpr = False, RESIDENT_KV: tl.constexpr = 0, ORDERED: tl.constexpr = False,
                         PACKED_DQ: tl.constexpr = False, REMATERIALIZE: tl.constexpr = False, OUTER_M: tl.constexpr = 0,
                         ASYNC_STATS: tl.constexpr = False, QUEUE_WMMA: tl.constexpr = False, Q_SPLITS: tl.constexpr = 1,
-                        REUSE_Q: tl.constexpr = False, PINGPONG: tl.constexpr = False):
+                        REUSE_Q: tl.constexpr = False, PINGPONG: tl.constexpr = False, SPREAD_DQ: tl.constexpr = False):
     if QUEUE_WMMA:
         tlx.amd_set_wave_sched_mode(1, offset=2, width=1)
     kv_head = tl.program_id(0)
@@ -396,47 +452,90 @@ def _delayed_bwd_kernel(Q, K, V, DO, LSE, Delta, DQA, DK, DV, HQ: tl.constexpr, 
                         dq_step = step
                         dq_slot = step % DS_SLOTS
                     previous = tlx.local_view(dsb, dq_slot)
-                    # Start delayed-dQ reads before dK, then consume one K=32 band
-                    # between native dK fragments. Independent head-column halves
-                    # supply two dQ accumulator chains.
-                    ds_band = tlx.local_load(tlx.local_slice(previous, [0, 0], [BM, 32]), layout=dq_lhs, relaxed=True)
-                    dq0 = tlx.zeros((BM, 64), tl.float32, layout=dq_mma)
-                    dq1 = tlx.zeros((BM, 64), tl.float32, layout=dq_mma)
-                    for band in tl.static_range(8):
-                        ds_current = tlx.extract_slice(ds, [BN // 2, BM], [(band % 2) * (BN // 2), 0])
-                        if not REUSE_Q or band % 2 == 0:
-                            # The adjacent low/high KV fragments consume the
-                            # same Q panel. Retain it across their dQ band.
-                            q_part = tlx.local_load(
-                                tlx.local_slice(tlx.local_view(qb, outer % STAGES), [phase * BM, (band // 2) * 32],
-                                                [BM, 32]), layout=rhs, relaxed=True)
-                        if band < BN // 32:
-                            if band + 1 < BN // 32:
+                    if SPREAD_DQ:
+                        # Finish the previous dQ before the current dK chain.
+                        # Its eight register slices can then issue between dK
+                        # fragments without carrying dQ into the next front.
+                        dq0 = tlx.zeros((BM, 64), tl.float32, layout=dq_mma)
+                        dq1 = tlx.zeros((BM, 64), tl.float32, layout=dq_mma)
+                        ds_band = tlx.local_load(tlx.local_slice(previous, [0, 0], [BM, 32]), layout=dq_lhs,
+                                                 relaxed=True)
+                        for band in tl.static_range(8):
+                            if band < 7:
                                 next_ds = tlx.local_load(tlx.local_slice(previous, [0, (band + 1) * 32], [BM, 32]),
                                                          layout=dq_lhs, relaxed=True)
-                            if (RESIDENT_KV == 2 or RESIDENT_KV == 3) and band < BN // 64:
-                                k0 = tlx.extract_slice(k_dq_lo, [32, 64], [band * 32, 0])
-                                k1 = tlx.extract_slice(k_dq_lo, [32, 64], [band * 32, 64])
-                            elif (RESIDENT_KV == 2 or RESIDENT_KV == 3) and band < 3 * BN // 128:
-                                k0 = tlx.extract_slice(k_dq_mid, [32, 64], [band * 32 - BN // 2, 0])
-                                k1 = tlx.extract_slice(k_dq_mid, [32, 64], [band * 32 - BN // 2, 64])
-                            elif RESIDENT_KV == 3 and BN == 256 and band == 6:
-                                k0 = tlx.extract_slice(k_dq_band6, [32, 64], [0, 0])
-                                k1 = tlx.extract_slice(k_dq_band6, [32, 64], [0, 64])
-                            else:
-                                k0 = tlx.local_load(tlx.local_slice(tlx.local_view(kb, 0), [band * 32, 0], [32, 64]),
-                                                    layout=dq_rhs, relaxed=True)
-                                k1 = tlx.local_load(tlx.local_slice(tlx.local_view(kb, 0), [band * 32, 64], [32, 64]),
-                                                    layout=dq_rhs, relaxed=True)
-                        updated = _wmma(ds_current, q_part, dks[band], ORDERED)
-                        dks = dks[:band] + (updated, ) + dks[band + 1:]
-                        if band < BN // 32:
+                            k0 = tlx.local_load(tlx.local_slice(tlx.local_view(kb, 0), [band * 32, 0], [32, 64]),
+                                                layout=dq_rhs, relaxed=True)
+                            k1 = tlx.local_load(tlx.local_slice(tlx.local_view(kb, 0), [band * 32, 64], [32, 64]),
+                                                layout=dq_rhs, relaxed=True)
                             dq0 = _wmma(ds_band, k0, dq0, ORDERED)
                             dq1 = _wmma(ds_band, k1, dq1, ORDERED)
-                            if band + 1 < BN // 32:
+                            if band < 7:
                                 ds_band = next_ds
-                    dq = tl.cat(dq0, dq1, dim=1)
-                    _dq_atomic(dq, DQA, dq_step, SM_SCALE, BM, dq_mma, PACKED_DQ, REMATERIALIZE)
+                        atomic_layout: tl.constexpr = tlx.layout(shape=((16, 2, 2, 2, 2), (8, BM // 32, 2)),
+                                                                 stride=((1, 1024, 16, 32, 2048), (128, 4096, 64)))
+                        dq = tlx.require_layout(tl.cat(dq0, dq1, dim=1) * SM_SCALE, atomic_layout)
+                        offsets = tlx.require_layout(_dq_offsets(dq_step, BM, dq_mma, False, REMATERIALIZE),
+                                                     atomic_layout)
+                        dq_groups = tl.trans(tl.reshape(tl.trans(dq), (128 * BM // 8, 8)))
+                        offset_groups = tl.trans(tl.reshape(tl.trans(offsets), (128 * BM // 8, 8)))
+                        for band in tl.static_range(8):
+                            ds_current = tlx.extract_slice(ds, [BN // 2, BM], [(band % 2) * (BN // 2), 0])
+                            if not REUSE_Q or band % 2 == 0:
+                                q_part = tlx.local_load(
+                                    tlx.local_slice(tlx.local_view(qb, outer % STAGES), [phase * BM, (band // 2) * 32],
+                                                    [BM, 32]), layout=rhs, relaxed=True)
+                            updated = _wmma(ds_current, q_part, dks[band], ORDERED)
+                            dks = dks[:band] + (updated, ) + dks[band + 1:]
+                            _dq_atomic_group(dq_groups, offset_groups, DQA, band, BM)
+                            # Compiler-only fence retains each VMEM group next
+                            # to its dK fragment; it emits no workgroup barrier.
+                            tlx.amd_sched_barrier(0)
+                    else:
+                        # Start delayed-dQ reads before dK, then consume one K=32 band
+                        # between native dK fragments. Independent head-column halves
+                        # supply two dQ accumulator chains.
+                        ds_band = tlx.local_load(tlx.local_slice(previous, [0, 0], [BM, 32]), layout=dq_lhs,
+                                                 relaxed=True)
+                        dq0 = tlx.zeros((BM, 64), tl.float32, layout=dq_mma)
+                        dq1 = tlx.zeros((BM, 64), tl.float32, layout=dq_mma)
+                        for band in tl.static_range(8):
+                            ds_current = tlx.extract_slice(ds, [BN // 2, BM], [(band % 2) * (BN // 2), 0])
+                            if not REUSE_Q or band % 2 == 0:
+                                # The adjacent low/high KV fragments consume the
+                                # same Q panel. Retain it across their dQ band.
+                                q_part = tlx.local_load(
+                                    tlx.local_slice(tlx.local_view(qb, outer % STAGES), [phase * BM, (band // 2) * 32],
+                                                    [BM, 32]), layout=rhs, relaxed=True)
+                            if band < BN // 32:
+                                if band + 1 < BN // 32:
+                                    next_ds = tlx.local_load(tlx.local_slice(previous, [0, (band + 1) * 32], [BM, 32]),
+                                                             layout=dq_lhs, relaxed=True)
+                                if (RESIDENT_KV == 2 or RESIDENT_KV == 3) and band < BN // 64:
+                                    k0 = tlx.extract_slice(k_dq_lo, [32, 64], [band * 32, 0])
+                                    k1 = tlx.extract_slice(k_dq_lo, [32, 64], [band * 32, 64])
+                                elif (RESIDENT_KV == 2 or RESIDENT_KV == 3) and band < 3 * BN // 128:
+                                    k0 = tlx.extract_slice(k_dq_mid, [32, 64], [band * 32 - BN // 2, 0])
+                                    k1 = tlx.extract_slice(k_dq_mid, [32, 64], [band * 32 - BN // 2, 64])
+                                elif RESIDENT_KV == 3 and BN == 256 and band == 6:
+                                    k0 = tlx.extract_slice(k_dq_band6, [32, 64], [0, 0])
+                                    k1 = tlx.extract_slice(k_dq_band6, [32, 64], [0, 64])
+                                else:
+                                    k0 = tlx.local_load(
+                                        tlx.local_slice(tlx.local_view(kb, 0), [band * 32, 0], [32, 64]), layout=dq_rhs,
+                                        relaxed=True)
+                                    k1 = tlx.local_load(
+                                        tlx.local_slice(tlx.local_view(kb, 0), [band * 32, 64], [32, 64]),
+                                        layout=dq_rhs, relaxed=True)
+                            updated = _wmma(ds_current, q_part, dks[band], ORDERED)
+                            dks = dks[:band] + (updated, ) + dks[band + 1:]
+                            if band < BN // 32:
+                                dq0 = _wmma(ds_band, k0, dq0, ORDERED)
+                                dq1 = _wmma(ds_band, k1, dq1, ORDERED)
+                                if band + 1 < BN // 32:
+                                    ds_band = next_ds
+                        dq = tl.cat(dq0, dq1, dim=1)
+                        _dq_atomic(dq, DQA, dq_step, SM_SCALE, BM, dq_mma, PACKED_DQ, REMATERIALIZE)
                 else:
                     dq = tlx.zeros((BM, 128), tl.float32, layout=dq_mma)
                     # Fragment current dK and delayed dQ so both WMMA chains are visible
@@ -568,7 +667,8 @@ def _convert_outputs(DQA, DQ, DKA, DVA, DK, DV, SIZE: tl.constexpr, KV_SIZE: tl.
 
 def allocate_workspace(q, k, *, config=None, packed_dq=None):
     """Allocate the five legacy buffers and optional FP32 dK/dV partials."""
-    config = config or select_config(q.shape[-2], q.shape[0], q.shape[1], k.shape[1])
+    config = config or select_config(q.shape[-2], q.shape[0], q.shape[1], k.shape[1],
+                                     packed_dq=True if packed_dq is None else packed_dq)
     if packed_dq is None:
         packed_dq = config.packed_dq
     workspace = (torch.empty(q.shape[:-1], device=q.device, dtype=torch.float32),
@@ -604,6 +704,10 @@ def fa_backward(q, k, v, o, do, lse, sm_scale=None, causal=False, *, config=None
     if config.pingpong and (not config.use_tdm or not config.delayed or not config.fragmented or config.num_warps != 8
                             or config.stages != 2 or outer_m != config.block_m):
         raise ValueError("ping-pong requires delayed fragmented TDM, eight waves, two stages and one compute phase")
+    if config.spread_dq and (config.packed_dq or not config.pingpong or not config.fragmented or not config.delayed
+                             or config.num_warps != 8 or config.block_n != 256 or config.block_m not in (32, 64)
+                             or config.resident_kv != 0):
+        raise ValueError("spread dQ requires FP32 ping-pong, eight waves, BM32/64 BN256 and streamed KV")
     if config.resident_kv not in (0, 1, 2, 3, 4):
         raise ValueError("unsupported resident operand policy")
     if not isinstance(config.q_splits, int) or not 1 <= config.q_splits <= 4:
@@ -648,7 +752,7 @@ def fa_backward(q, k, v, o, do, lse, sm_scale=None, causal=False, *, config=None
         FRAGMENTED=config.fragmented, RESIDENT_KV=config.resident_kv, ORDERED=config.ordered,
         PACKED_DQ=config.packed_dq, REMATERIALIZE=config.rematerialize, OUTER_M=config.outer_m,
         ASYNC_STATS=config.async_stats, QUEUE_WMMA=config.queue_wmma, Q_SPLITS=config.q_splits, REUSE_Q=config.reuse_q,
-        PINGPONG=config.pingpong, **_compiler_options(config))
+        PINGPONG=config.pingpong, SPREAD_DQ=config.spread_dq, **_compiler_options(config))
     _convert_outputs[(triton.cdiv(q.numel(),
                                   config.convert_block), )](dqa, dq, dka if dka is not None else dqa,
                                                             dva if dva is not None else dqa, dk, dv, q.numel(),
