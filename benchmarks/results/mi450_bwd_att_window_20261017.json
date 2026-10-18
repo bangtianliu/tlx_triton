@@ -1,0 +1,19 @@
+{
+  "duration_cycles": 46842,
+  "end_cycle": 263842,
+  "first_iteration": 10,
+  "last_iteration": 14,
+  "marker": {
+    "code_id": 1600,
+    "instruction": "s_barrier_wait 0xffff",
+    "occurrence_offset": 0,
+    "occurrence_stride": 1,
+    "pc": "0x40d0",
+    "raw_occurrences": 256
+  },
+  "numbering": "zero-based",
+  "root": "/tmp/mi450-plan-20261017/att-baseline-rocm101-matched",
+  "start_cycle": 217000,
+  "ui_directory": "ui_output_agent_56660_dispatch_16",
+  "wave": "se0_sm0_sl0_wv0.json"
+}

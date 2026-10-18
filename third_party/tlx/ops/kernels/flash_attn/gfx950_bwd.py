@@ -88,11 +88,16 @@ def _attn_bwd_preprocess_kernel(
     DQ_ACC,
     LSE,
     LSE_LOG2,
+    DK_ACC,
+    DV_ACC,
+    HQ: tl.constexpr,
+    HK: tl.constexpr,
     N: tl.constexpr,
     D: tl.constexpr,
     BLOCK_M: tl.constexpr,
     ZERO_DQ: tl.constexpr,
     SCALE_LSE: tl.constexpr,
+    ZERO_KV: tl.constexpr,
 ):
     batch_head = tl.program_id(1)
     rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -109,6 +114,12 @@ def _attn_bwd_preprocess_kernel(
     tl.store(Delta + delta_base + rows, tl.sum(o * do, axis=1), mask=rows < N)
     if ZERO_DQ:
         tl.store(DQ_ACC + tensor_base + offsets, 0.0, mask=mask)
+    if ZERO_KV:
+        kv_head = batch_head % HQ
+        if kv_head < HK:
+            kv_base = ((batch_head // HQ).to(tl.int64) * HK + kv_head) * N * D
+            tl.store(DK_ACC + kv_base + offsets, 0.0, mask=mask)
+            tl.store(DV_ACC + kv_base + offsets, 0.0, mask=mask)
     if SCALE_LSE:
         lse_values = tl.load(LSE + delta_base + rows, mask=rows < N, other=0.0)
         # Preserve the main kernel's scalar FP32 multiply and rounding boundary.
@@ -124,11 +135,12 @@ def _attn_bwd_preprocess_kernel(
         tl.store(LSE_LOG2 + delta_base + rows, lse_log2, mask=rows < N)
 
 
-def _run_bwd_preprocess(o, do, delta, dq_acc=None, lse=None, lse_log2=None):
+def _run_bwd_preprocess(o, do, delta, dq_acc=None, lse=None, lse_log2=None, *, dk_acc=None, dv_acc=None, block_m=64):
     if (lse is None) != (lse_log2 is None):
         raise ValueError("LSE preprocessing requires both input and output buffers")
+    if (dk_acc is None) != (dv_acc is None):
+        raise ValueError("dK/dV accumulation requires both buffers")
     batch, heads, n_ctx, head_dim = o.shape
-    block_m = 64
     grid = (triton.cdiv(n_ctx, block_m), batch * heads)
     _attn_bwd_preprocess_kernel[grid](
         o,
@@ -137,11 +149,16 @@ def _run_bwd_preprocess(o, do, delta, dq_acc=None, lse=None, lse_log2=None):
         dq_acc if dq_acc is not None else delta,
         lse if lse is not None else delta,
         lse_log2 if lse_log2 is not None else delta,
+        dk_acc if dk_acc is not None else delta,
+        dv_acc if dv_acc is not None else delta,
+        HQ=heads,
+        HK=dk_acc.shape[1] if dk_acc is not None else heads,
         N=n_ctx,
         D=head_dim,
         BLOCK_M=block_m,
         ZERO_DQ=dq_acc is not None,
         SCALE_LSE=lse is not None,
+        ZERO_KV=dk_acc is not None,
         num_warps=4,
     )
 

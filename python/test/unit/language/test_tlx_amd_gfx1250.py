@@ -899,3 +899,104 @@ def test_grouped_gemm_multicast_correctness(cluster_size, multicast, group_size)
     for group in range(group_size):
         expected = (a[group * m:(group + 1) * m].float() @ b[group].float().T).half()
         torch.testing.assert_close(out[group * m:(group + 1) * m], expected, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("batch,hq,hk,n,num_cus,splits,pingpong", [
+    # BN256: ping-pong, analytic splits, at least two for the split epilogue.
+    (8, 64, 8, 1024, 192, 3, True),
+    (8, 64, 8, 2048, 192, 3, True),
+    (15, 64, 8, 16384, 192, 3, True),  # already full: one split would spill
+    (8, 32, 8, 2048, 192, 3, True),  # 512 owners: 3/1, 6/2, 8/3, 11/4 waves
+    (8, 64, 8, 768, 192, 3, True),  # 192 owners already fill the device
+    (1, 1, 1, 256, 192, 4, True),
+    (1, 1, 1, 256, 1, 3, True),
+    # BN128: one split; ping-pong from N=896.
+    (8, 64, 8, 1152, 192, 1, True),
+    (2, 6, 2, 384, 192, 1, False),
+])
+def test_attention_backward_split_selection(batch, hq, hk, n, num_cus, splits, pingpong):
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import select_config
+
+    original = select_config(n)
+    assert original.q_splits == 1 and not original.pingpong
+    config = select_config(n, batch, hq, hk, num_cus=num_cus)
+    assert config.block_n == original.block_n
+    assert config.q_splits == splits
+    assert config.pingpong == pingpong
+    if pingpong:
+        assert config.reuse_q and not config.regalloc
+        assert config.preprocess_block == 64 and config.convert_block == 4096
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize(
+    "num_warps,use_tdm,delayed,bm,bn,stages,fence_mask,q_splits,packed_dq,full_policy,outer_m,pingpong", [
+        *(
+            row + (False, ) for row in [
+                # Keep the ten original controls, then exercise each new split/precision
+                # combination on the selected schedule and its smaller KV fallback.
+                *(row + (1, False, False, 0) for row in [
+                    (2, False, True, 32, 128, 2, None),
+                    (4, False, True, 32, 128, 2, None),
+                    (4, True, True, 32, 128, 2, None),
+                    (8, True, True, 32, 128, 2, None),
+                    (4, True, False, 32, 128, 2, None),
+                    (8, True, True, 64, 256, 2, None),
+                    (8, True, True, 64, 256, 3, None),
+                    (8, True, True, 32, 128, 4, None),
+                    (8, True, True, 64, 256, 2, 0),
+                    (8, True, True, 64, 256, 2, 4086),
+                ]),
+                *((8, True, True, 64, bn, 2, None, splits, packed, True, 0)
+                  for bn in (128, 256)
+                  for splits in (1, 2, 3)
+                  for packed in (False, True)),
+                # Current-slot publication needs a cross-wave barrier in immediate mode.
+                *((4, True, False, 32, 128, 2, None, splits, True, True, 0) for splits in (1, 3)),
+                # Split boundaries may cut a multi-phase Q/dO load tile.
+                *((8, True, True, 32, 256, 2, None, splits, True, True, 64) for splits in (2, 3)),
+            ]),
+        *((8, True, True, bm, bn, 2, None, splits, packed, True, 0, True)
+          for bm in (32, 64)
+          for bn in (128, 256)
+          for splits in (1, 3)
+          for packed in (False, True)),
+        # Selected BN256 ping-pong with the other split counts it may choose.
+        *((8, True, True, 64, 256, 2, None, splits, True, True, 0, True) for splits in (2, 4)),
+        *((4, True, True, 32, bn, 2, None, splits, packed, True, 0, False)
+          for bn in (128, 256)
+          for splits in (1, 3)
+          for packed in (False, True)),
+    ])
+@pytest.mark.parametrize("batch,hq,hk,n", [(1, 1, 1, 256), (2, 6, 2, 512)])
+def test_attention_backward_delayed_gqa(num_warps, use_tdm, delayed, bm, bn, stages, fence_mask, batch, hq, hk, n,
+                                        q_splits, packed_dq, full_policy, outer_m, pingpong):
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import BackwardConfig, allocate_workspace, fa_backward
+
+    torch.manual_seed(2709)
+    q = torch.randn((batch, hq, n, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, hk, n, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    dout = torch.randn_like(q)
+    qr, kr, vr = [t.float().requires_grad_() for t in (q, k, v)]
+    scores = qr @ kr.repeat_interleave(hq // hk, dim=1).transpose(-1, -2) * 128**-0.5
+    out = scores.softmax(-1) @ vr.repeat_interleave(hq // hk, dim=1)
+    expected = torch.autograd.grad(out, (qr, kr, vr), dout.float())
+    lse = scores.detach().logsumexp(-1)
+    wide_registers = full_policy and num_warps == 4 and delayed
+    config = BackwardConfig(block_m=bm, block_n=bn, num_warps=num_warps, use_tdm=use_tdm, delayed=delayed,
+                            stages=stages, fragment_fences=fence_mask is not None, fragment_fence_mask=fence_mask or 0,
+                            q_splits=q_splits, packed_dq=packed_dq, fragmented=full_policy, ordered=full_policy,
+                            async_stats=full_policy and use_tdm, rematerialize=full_policy and not wide_registers,
+                            regalloc=full_policy, waves_per_eu=1 if wide_registers else 0, outer_m=outer_m,
+                            reuse_q=full_policy, pingpong=pingpong)
+    workspace = allocate_workspace(q, k, config=config)
+    assert len(workspace) == (7 if q_splits > 1 else 5)
+    if q_splits > 1:
+        assert all(value.dtype == torch.float32 and value.shape == k.shape for value in workspace[5:])
+    for _ in range(2):
+        actual = fa_backward(q, k, v, out.detach().bfloat16(), dout, lse, config=config, workspace=workspace)
+        for name, value, ref in zip(("dq", "dk", "dv"), actual, expected):
+            assert torch.isfinite(value).all()
+            nrmse = ((value.float() - ref).square().mean() / ref.square().mean()).sqrt()
+            assert nrmse < 0.008, (name, nrmse.item())

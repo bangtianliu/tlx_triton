@@ -429,6 +429,27 @@ class amd_mfma_layout(layout_encoding):
                                                    self.cga_layout, self.tiles_per_warp, self.element_bitwidth)
 
 
+class amd_wmma_layout(layout_encoding):
+    """AMD WMMA layout for explicit accumulator and LDS operand ownership."""
+
+    def __init__(self, warp_bases, reg_bases=(), instr_shape=(16, 16, 32), version=3, transposed=True):
+        super().__init__()
+        self.version = int(version)
+        self.transposed = bool(transposed)
+        self.warp_bases = [list(map(int, basis)) for basis in warp_bases]
+        self.reg_bases = [list(map(int, basis)) for basis in reg_bases]
+        self.instr_shape = list(map(int, instr_shape))
+        assert self.version in (1, 2, 3), "WMMA version must be in [1, 3]"
+        assert all(len(basis) == 2 for basis in self.warp_bases + self.reg_bases), "WMMA bases must have rank two"
+        assert len(self.instr_shape) == 3 and all(dim > 0 for dim in self.instr_shape)
+
+    def to_ir(self, builder: ir.builder, shape=None, element_type=None):
+        del element_type
+        rank = len(shape) if shape is not None else 2
+        return builder.make_amd_wmma_encoding_attr(self.version, self.transposed, self.warp_bases, self.reg_bases,
+                                                   self.instr_shape, rank)
+
+
 class slice_layout(layout_encoding):
     """Rank-reduced view of a distributed parent layout.
 

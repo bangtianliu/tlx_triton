@@ -1,0 +1,4 @@
+Name,Calls,TotalDurationNs,AverageNs,Percentage,MinNs,MaxNs,StdDev
+_delayed_bwd_kernel,20,20556610,1027830.500000,84.33,954311,1294139,80242.382881
+_convert_outputs,20,1011236,50561.800000,4.15,45988,64016,5777.899004
+_attn_bwd_preprocess_kernel,20,861330,43066.500000,3.53,34372,64938,8056.522082

@@ -1,0 +1,50 @@
+[
+  {
+    "group": 0,
+    "simd": 0,
+    "wave_slots": [
+      0,
+      1
+    ],
+    "step_range": [
+      10,
+      239
+    ],
+    "median_cycles": 8836.0,
+    "median_wmma_busy_fraction": 0.2897239163223818,
+    "median_wmma_idle_exp_fraction": 0.10189162123961357,
+    "median_wmma_idle_exp_barrier_fraction": 0.1745036144989927
+  },
+  {
+    "group": 1,
+    "simd": 0,
+    "wave_slots": [
+      0,
+      1
+    ],
+    "step_range": [
+      10,
+      239
+    ],
+    "median_cycles": 8739.5,
+    "median_wmma_busy_fraction": 0.292922937053525,
+    "median_wmma_idle_exp_fraction": 0.09364140613262434,
+    "median_wmma_idle_exp_barrier_fraction": 0.1697837930732343
+  },
+  {
+    "group": 2,
+    "simd": 0,
+    "wave_slots": [
+      0,
+      1
+    ],
+    "step_range": [
+      10,
+      239
+    ],
+    "median_cycles": 8802.5,
+    "median_wmma_busy_fraction": 0.29082647069125467,
+    "median_wmma_idle_exp_fraction": 0.1018927277621976,
+    "median_wmma_idle_exp_barrier_fraction": 0.17095844682855205
+  }
+]
