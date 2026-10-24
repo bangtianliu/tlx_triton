@@ -5776,6 +5776,33 @@ def _select_d128_shape_dispatch(shape=None, causal=False, split_q=None):
     return amd_fa_bwd._select_d128_interleaved_dispatch(query_shape, key_shape, causal, split_q=split_q)
 
 
+@pytest.mark.parametrize("shape,causal,split_q,expected_priority", [
+    ((16, 16, 16, 2048, 128), True, None, True),
+    ((16, 16, 16, 2048, 128), True, 1, True),
+    ((16, 16, 16, 2048, 128), False, 2, False),
+    ((16, 16, 16, 2048, 128), False, None, False),
+    ((16, 16, 16, 2048, 128), False, 1, False),
+    ((15, 16, 16, 2048, 128), True, 1, False),
+    ((16, 32, 32, 2048, 128), True, 1, False),
+    ((16, 64, 8, 2048, 128), True, None, False),
+    ((16, 16, 16, 1024, 128), True, None, False),
+    ((16, 16, 16, 4096, 128), True, None, False),
+    ((16, 16, 16, 8192, 128), True, 1, False),
+    (None, False, None, False),
+    (None, True, None, False),
+])
+def test_dense_bwd_mha2k_priority_default_guard_host(shape, causal, split_q, expected_priority, monkeypatch):
+    priority_env = amd_fa_bwd._D128_REGCLASS_PRIORITY_ENV
+    for name in (priority_env, amd_fa_bwd._D128_SINK_INSTS_ENV, amd_fa_bwd._D128_REVERSE_LOCAL_ENV):
+        monkeypatch.delenv(name, raising=False)
+    dispatch = _select_d128_shape_dispatch(shape, causal, split_q)
+    assert dispatch.regclass_priority_trumps_globalness is expected_priority
+    for value in ("0", "1"):
+        monkeypatch.setenv(priority_env, value)
+        overridden = _select_d128_shape_dispatch(shape, causal, split_q)
+        assert overridden == replace(dispatch, regclass_priority_trumps_globalness=value == "1")
+
+
 def test_dense_bwd_mha16k_sink_default_guard(monkeypatch):
     sink_env = amd_fa_bwd._D128_SINK_INSTS_ENV
     reverse_env = amd_fa_bwd._D128_REVERSE_LOCAL_ENV

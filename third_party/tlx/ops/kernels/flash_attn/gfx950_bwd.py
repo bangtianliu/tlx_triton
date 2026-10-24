@@ -6681,7 +6681,7 @@ def _attn_bwd_opt_gqa_phase(
         k_score_cache=k_score_cache,
         PRUNE_DIAGONAL=(IS_CAUSAL and CACHE_SCORE_K),
         SINGLE_QUERY_HEAD=IS_CAUSAL and CACHE_SCORE_K and HQ == HK and N == 4096,
-        SKIP_FULL_GROUP_MASK=IS_CAUSAL and CACHE_SCORE_K and HQ == HK and (N == 1024 or N == 8192),
+        SKIP_FULL_GROUP_MASK=IS_CAUSAL and CACHE_SCORE_K and HQ == HK and (N == 1024 or N == 2048 or N == 8192),
     )
     if not BRAID_DK_DV:
         dv = _attn_bwd_opt_gqa_dv_fragmented_half(
@@ -10085,6 +10085,10 @@ def _select_optimized_d128_interleaved_dispatch(shape=None, causal=False, split_
     measured_gqa8k = shape == (16, 64, 8, 8192, 128) and not causal and split_q == 1
     precise_mha16k = shape == (16, 16, 16, 16384, 128) and not causal and split_q == 1
     regalloc = _d128_regalloc_options()
+    # The causal MHA2K mask schedule uses priority allocation by default.
+    priority_default = "1" if _is_short_causal_mha(shape, causal, split_q) and shape[3] == 2048 else "0"
+    regalloc["regclass_priority_trumps_globalness"] = os.environ.get(_D128_REGCLASS_PRIORITY_ENV,
+                                                                     priority_default) == "1"
     # Measured BM16 shapes disable instruction sinking. Measured MHA and the
     # BM16 GQA8K/16K shapes also disable reverse assignment, as do unmeasured
     # BM32 GQA8K shapes. Explicit environment overrides remain independent.
