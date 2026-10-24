@@ -7905,10 +7905,14 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
     store_d = tlx.rematerialized_range(0, D, 31)
     key_offsets = kv_offset_base + store_n[:, None] * D + store_d[None, :]
     key_offsets = tlx.require_layout(key_offsets.to(tl.int32), kv_native_layout, pin=False)
-    # Selected MHA shapes use the unused Q/dO LDS for 16-byte row stores.
-    # Native stores write 8 bytes per lane over 32 rows.
-    STAGE_KV_STORE: tl.constexpr = CACHE_SCORE_K and HQ == HK and (N <= 8192 or (IS_CAUSAL and N == 16384))
-    if STAGE_KV_STORE:
+    # Causal MHA1K converts data within each wave for stores of 16 bytes.
+    # Other selected MHA shapes stage stores through the unused Q/dO buffers.
+    WAVE_KV_STORE: tl.constexpr = TUNED_SHORT_MHA and N == 1024
+    STAGE_KV_STORE: tl.constexpr = (CACHE_SCORE_K and HQ == HK and (N <= 8192 or (IS_CAUSAL and N == 16384))
+                                    and not WAVE_KV_STORE)
+    if WAVE_KV_STORE:
+        _attn_bwd_store_kv_wave(dk.to(tl.bfloat16), DK, kv_offset_base + kv_tile_n * D)
+    elif STAGE_KV_STORE:
         _attn_bwd_store_kv_staged(dk.to(tl.bfloat16), DK, kv_offset_base + kv_tile_n * D, q_buffers, do_buffers)
     elif SPLIT_Q == 1:
         tlx.buffer_store(dk.to(tl.bfloat16), DK, key_offsets)
@@ -7935,7 +7939,9 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
     dv = tl.permute(dv, (0, 3, 1, 2, 4, 5))
     dv = tl.reshape(dv, (BLOCK_N, D))
     dv = tlx.require_layout(dv, kv_native_layout, pin=False)
-    if STAGE_KV_STORE:
+    if WAVE_KV_STORE:
+        _attn_bwd_store_kv_wave(dv.to(tl.bfloat16), DV, kv_offset_base + kv_tile_n * D)
+    elif STAGE_KV_STORE:
         _attn_bwd_store_kv_staged(dv.to(tl.bfloat16), DV, kv_offset_base + kv_tile_n * D, q_buffers, do_buffers)
     elif SPLIT_Q == 1:
         tlx.buffer_store(dv.to(tl.bfloat16), DV, key_offsets)
@@ -8021,6 +8027,23 @@ def _attn_bwd_dkdv_dq_d128_gqa_folded_kernel(
                 )
                 # Complete all shared reads before the next tile overwrites these buffers.
                 tl.debug_barrier()
+
+
+@triton.jit
+def _attn_bwd_store_kv_wave(x, PTR, base):
+    """Store eight BF16 values per lane after a conversion within each wave."""
+    tl.static_assert(x.shape[0] == 256 and x.shape[1] == 128)
+    # Exchange the lane and register bits for column offsets 4 and 8.
+    # Keep every value in its source wave.
+    store_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2, 2, 2, 2)),
+        stride=((128, 256, 512, 1024, 8192, 8, 2048, 4096), (1, 2, 4, 16, 32, 64, 16384)),
+    )
+    x = tlx.require_layout(x, store_layout, pin=False)
+    rows = tl.arange(0, 256)
+    cols = tl.arange(0, 128)
+    offsets = tlx.require_layout((rows[:, None] * 128 + cols[None, :]).to(tl.int32), store_layout, pin=False)
+    tlx.buffer_store(x, PTR + base, offsets)
 
 
 @triton.jit
