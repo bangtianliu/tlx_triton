@@ -6681,7 +6681,7 @@ def _attn_bwd_opt_gqa_phase(
         k_score_cache=k_score_cache,
         PRUNE_DIAGONAL=(IS_CAUSAL and CACHE_SCORE_K),
         SINGLE_QUERY_HEAD=IS_CAUSAL and CACHE_SCORE_K and HQ == HK and N == 4096,
-        SKIP_FULL_GROUP_MASK=IS_CAUSAL and CACHE_SCORE_K and HQ == HK and N == 1024,
+        SKIP_FULL_GROUP_MASK=IS_CAUSAL and CACHE_SCORE_K and HQ == HK and (N == 1024 or N == 8192),
     )
     if not BRAID_DK_DV:
         dv = _attn_bwd_opt_gqa_dv_fragmented_half(
